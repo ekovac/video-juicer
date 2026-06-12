@@ -1,0 +1,5 @@
+discs/
+.tmdb_cache/
+__pycache__/
+manifest.json
+debug_frames*/
