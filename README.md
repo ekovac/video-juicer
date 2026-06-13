@@ -18,6 +18,14 @@ matching, then aligns episode candidates against TMDB episode runtimes with
 a monotonic DP alignment (Needleman–Wunsch with two-parter merge moves).
 Peak RSS ≈ 140 MB regardless of image sizes.
 
+`--episode-order dvd` matches against a TMDB *episode group* instead of the
+default aired order — essential for shows whose discs reorder episodes
+(Firefly) or fold specials into seasons. Accepts an alias (`dvd`, `digital`,
+`absolute`, `production`, `story`, `tv`) or an explicit TMDB episode-group
+id; manifest records then carry the aired numbering as an `aired`
+cross-reference. Note the TMDB type enum: DVD order is type 3 (verified on
+live data), digital is 4, production is 6.
+
 `--verify` (or `--verify-all`) rips bounded windows from both ends of
 low-confidence titles (`mencoder` for DVD, `ffmpeg` for Blu-ray), samples
 frames, and reads on-screen title cards with a local Ollama VLM, fuzzy-

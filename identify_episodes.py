@@ -77,6 +77,9 @@ class Episode:
     number: int
     name: str
     runtime: Optional[float]     # seconds, None if TMDB has no runtime
+    # set when an alternate episode ordering (TMDB episode group) is in use
+    aired_season: Optional[int] = None
+    aired_number: Optional[int] = None
 
 
 @dataclass
@@ -293,6 +296,62 @@ class Tmdb:
                 runtime=rt * 60.0 if rt else median,
             ))
         return eps
+
+    def episode_groups(self, tv_id: int) -> list[dict]:
+        return self.get(f"/tv/{tv_id}/episode_groups")["results"]
+
+    def episode_group(self, group_id: str) -> dict:
+        return self.get(f"/tv/episode_group/{group_id}")
+
+
+# TMDB episode-group types. Note: "DVD Order" groups are type 3 (verified on
+# live data for multiple series); type 4 is *Digital* order, 6 is Production.
+GROUP_TYPE_ALIASES = {
+    "absolute": 2, "dvd": 3, "digital": 4, "story": 5, "production": 6, "tv": 7,
+}
+
+
+def grouped_seasons(tmdb: Tmdb, tv_id: int, selector: str,
+                    fallback_rt: Optional[float]
+                    ) -> tuple[dict[int, list[Episode]], list[Episode]]:
+    """Build season pools from a TMDB episode group instead of aired order.
+
+    `selector` is an alias from GROUP_TYPE_ALIASES or an explicit group id.
+    Returns ({season_number: episodes}, specials) where season numbers are
+    the group's own ordering (group order 0 = Specials).
+    """
+    if selector in GROUP_TYPE_ALIASES:
+        wanted = GROUP_TYPE_ALIASES[selector]
+        meta = tmdb.episode_groups(tv_id)
+        hits = [g for g in meta if g["type"] == wanted]
+        if not hits:
+            listing = "; ".join(
+                f"{g['name']!r} (type {g['type']}, id {g['id']})" for g in meta)
+            raise SystemExit(
+                f"TMDB has no episode group of type {selector!r} for this "
+                f"series. Available groups: {listing or 'none'} — pass the "
+                f"group id directly via --episode-order <id>.")
+        group_id = hits[0]["id"]
+        log.info("using episode group %r (%s)", hits[0]["name"], group_id)
+    else:
+        group_id = selector
+    detail = tmdb.episode_group(group_id)
+    pools: dict[int, list[Episode]] = {}
+    for g in detail["groups"]:
+        rts = [e["runtime"] for e in g["episodes"] if e.get("runtime")]
+        median = sorted(rts)[len(rts) // 2] * 60.0 if rts else fallback_rt
+        eps = []
+        for e in sorted(g["episodes"], key=lambda e: e["order"]):
+            rt = e.get("runtime")
+            eps.append(Episode(
+                season=g["order"], number=e["order"] + 1, name=e["name"],
+                runtime=rt * 60.0 if rt else median,
+                aired_season=e["season_number"],
+                aired_number=e["episode_number"],
+            ))
+        pools[g["order"]] = eps
+    specials = pools.pop(0, [])
+    return pools, specials
 
 
 # ---------------------------------------------------------------------------
@@ -681,7 +740,15 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--tmdb-api-key", default=os.environ.get("TMDB_API_KEY"))
     ap.add_argument("--out", type=Path, default=Path("manifest.json"))
     ap.add_argument("--cache-dir", type=Path, default=Path(".tmdb_cache"))
+    ap.add_argument("--episode-order", default="aired", metavar="ORDER",
+                    help="episode ordering to match against: 'aired' "
+                         "(default), an alias (dvd, digital, absolute, "
+                         "production, story, tv), or an explicit TMDB "
+                         "episode-group id")
     ap.add_argument("--emit-rip-commands", action="store_true")
+    ap.add_argument("--handbrake-preset", default="Fast 1080p30",
+                    metavar="PRESET",
+                    help='HandBrake preset for --emit-rip-commands (default: "Fast 1080p30")')
     ap.add_argument("--verify", action="store_true",
                     help="OCR title cards of low-confidence matches via Ollama")
     ap.add_argument("--verify-all", action="store_true",
@@ -705,12 +772,16 @@ def main(argv: Optional[list[str]] = None) -> int:
     show = series["name"]
     series_rt = series.get("episode_run_time") or []
     fallback_rt = series_rt[0] * 60.0 if series_rt else None
-    season_numbers = [s["season_number"] for s in series["seasons"]
-                      if s["season_number"] > 0]
-    seasons = {n: tmdb.season_episodes(args.tv_id, n, fallback_rt)
-               for n in season_numbers}
-    specials = (tmdb.season_episodes(args.tv_id, 0, fallback_rt)
-                if any(s["season_number"] == 0 for s in series["seasons"]) else [])
+    if args.episode_order != "aired":
+        seasons, specials = grouped_seasons(tmdb, args.tv_id,
+                                            args.episode_order, fallback_rt)
+    else:
+        season_numbers = [s["season_number"] for s in series["seasons"]
+                          if s["season_number"] > 0]
+        seasons = {n: tmdb.season_episodes(args.tv_id, n, fallback_rt)
+                   for n in season_numbers}
+        specials = (tmdb.season_episodes(args.tv_id, 0, fallback_rt)
+                    if any(s["season_number"] == 0 for s in series["seasons"]) else [])
     log.info("%s: %d seasons, %d episodes", show, len(seasons),
              sum(len(v) for v in seasons.values()))
 
@@ -786,6 +857,9 @@ def main(argv: Optional[list[str]] = None) -> int:
             "verified_by_titlecard": a.verified_name is not None,
             "suggested_filename": suggested_filename(show, a.episodes),
         })
+        if e0.aired_season is not None:
+            records[-1]["aired"] = [
+                f"S{e.aired_season:02d}E{e.aired_number:02d}" for e in a.episodes]
     for idx, (d, t) in enumerate(all_leftovers):
         records.append({
             "image": str(d.path), "title": t.id, "kind": "extra",
@@ -827,7 +901,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             if r["kind"] != "episode":
                 continue
             print(f'HandBrakeCLI -i "{r["image"]}" -t {r["title"]} '
-                  f'--preset "Fast 1080p30" -o "{r["suggested_filename"]}"')
+                  f'--preset "{args.handbrake_preset}" -o "{r["suggested_filename"]}"')
 
     # validation summary
     by_season: dict[int, int] = {}

@@ -202,6 +202,43 @@ class MplsTest(unittest.TestCase):
         self.assertIsNone(ie.parse_mpls(b""))
 
 
+class EpisodeGroupTest(unittest.TestCase):
+    class StubTmdb:
+        def episode_groups(self, tv_id):
+            return [{"name": "DVD Order", "type": 3, "id": "abc123"},
+                    {"name": "Digital Order", "type": 4, "id": "def456"}]
+
+        def episode_group(self, group_id):
+            assert group_id == "abc123"
+            return {"groups": [
+                {"order": 0, "name": "Specials", "episodes": [
+                    {"order": 0, "name": "Pilot Special", "runtime": 22,
+                     "season_number": 0, "episode_number": 1}]},
+                {"order": 1, "name": "Season 1", "episodes": [
+                    # DVD order swaps the aired order of these two
+                    {"order": 0, "name": "B", "runtime": 22,
+                     "season_number": 1, "episode_number": 2},
+                    {"order": 1, "name": "A", "runtime": None,
+                     "season_number": 1, "episode_number": 1}]},
+            ]}
+
+    def test_dvd_alias_resolves_type_3(self):
+        pools, specials = ie.grouped_seasons(self.StubTmdb(), 99, "dvd", None)
+        self.assertEqual(list(pools), [1])
+        self.assertEqual([e.name for e in pools[1]], ["B", "A"])
+        # group-relative numbering, aired numbering preserved as x-ref
+        self.assertEqual([(e.number, e.aired_number) for e in pools[1]],
+                         [(1, 2), (2, 1)])
+        # null runtime falls back to the group median
+        self.assertEqual(pools[1][1].runtime, 22 * 60.0)
+        self.assertEqual([e.name for e in specials], ["Pilot Special"])
+
+    def test_missing_group_type_errors_with_listing(self):
+        with self.assertRaises(SystemExit) as ctx:
+            ie.grouped_seasons(self.StubTmdb(), 99, "production", None)
+        self.assertIn("DVD Order", str(ctx.exception))
+
+
 class HintTest(unittest.TestCase):
     def test_filename_pattern(self):
         d = disc([], name="VENTURE_BROS_S3D2.iso")
