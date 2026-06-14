@@ -680,12 +680,16 @@ def extract_frames(video: Path, workdir: Path, interval: float = 1.5) -> list[Pa
 
 def verify_title(disc: Disc, title: Title, episodes: list[Episode],
                  model: str, host: str, workdir: Path,
-                 window: float = 150.0, accept: float = 0.8
-                 ) -> tuple[Optional[Episode], float]:
+                 window: float = 150.0, front_window: float = 480.0,
+                 accept: float = 0.8) -> tuple[Optional[Episode], float]:
     """OCR a title's both-end windows against the season's episode names."""
-    # Title cards can be at the start or the end (Venture Bros: end) —
-    # overshoot the end window so post-credits cards aren't cut off.
-    windows = [(max(0.0, title.duration - window), window + 60.0), (0.0, window)]
+    # Title cards sit either near the start or near the end. The front window
+    # must be generous: shows with cold opens (Star Trek: Enterprise) push the
+    # post-credits title caption several minutes in (observed up to ~4:10, and
+    # a long teaser can push it further), so a tight 150 s front window misses
+    # it. The end window overshoots so post-credits cards aren't cut off.
+    windows = [(0.0, front_window),
+               (max(0.0, title.duration - window), window + 60.0)]
     best_ep, best_score = None, 0.0
     for start, length in windows:
         video = rip_window(disc, title, start, length, workdir)

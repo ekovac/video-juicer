@@ -57,6 +57,13 @@ needed).
   titles. (It cost a wrong conclusion that Venture Bros. S3 had no on-screen
   titles; they were there at ~21:40, missed by an 8 s back-window stride.)
   `extract_frames` defaults to 1.5 s.
+- **Title-card position varies by show; scan a wide front window.** Venture
+  Bros. cards are at the end; Star Trek: Enterprise captions the title after
+  the opening sequence, but a variable-length cold open floats it several
+  minutes in (observed 2:38 and 4:10 on adjacent episodes). `verify_title`
+  scans the first 8 min plus the tail. For all-same-runtime shows (every
+  Enterprise episode is ~44 min), runtime can't order episodes within a
+  disc — OCR is the way to confirm the playlist/title sequence is right.
 - Ollama has a known memory leak and may be OOM-killed mid-request; VLM
   calls retry with backoff and a generous timeout to ride out the daemon
   restart and model reload.
