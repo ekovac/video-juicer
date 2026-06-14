@@ -51,6 +51,12 @@ needed).
 - **Title cards may be at the end** of the episode (all Venture Bros.
   seasons), sometimes as an `EPISODE: <name>` line inside the credits.
   Scan both ends, and let the end window run all the way to the last frame.
+- **Sample frames at <=2 s.** A title card is only on screen ~2-4 s, so a
+  coarse stride (4-8 s) phase-skips straight over it — producing confident
+  "no title found" misses that look like the show simply doesn't display
+  titles. (It cost a wrong conclusion that Venture Bros. S3 had no on-screen
+  titles; they were there at ~21:40, missed by an 8 s back-window stride.)
+  `extract_frames` defaults to 1.5 s.
 - Ollama has a known memory leak and may be OOM-killed mid-request; VLM
   calls retry with backoff and a generous timeout to ride out the daemon
   restart and model reload.

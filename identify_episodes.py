@@ -665,8 +665,11 @@ def rip_window(disc: Disc, title: Title, start: float, length: float,
     return out if out.exists() and out.stat().st_size > 0 else None
 
 
-def extract_frames(video: Path, workdir: Path, interval: float = 4.0) -> list[Path]:
-    pattern = workdir / "frame_%03d.jpg"
+def extract_frames(video: Path, workdir: Path, interval: float = 1.5) -> list[Path]:
+    # Title cards are only on screen ~2-4 s; a coarse stride (4+ s) phase-skips
+    # right over them. Sample at <=2 s. The windows verify_title rips are
+    # bounded, so the extra frames are cheap.
+    pattern = workdir / "frame_%04d.jpg"
     for f in workdir.glob("frame_*.jpg"):
         f.unlink()
     run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(video),
