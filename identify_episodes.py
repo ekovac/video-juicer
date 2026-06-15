@@ -689,15 +689,32 @@ def normalize_text(s: str) -> str:
     return re.sub(r"[^a-z0-9 ]+", " ", s.lower()).strip()
 
 
+_PARTNUM = {"one": "1", "two": "2", "three": "3", "four": "4", "five": "5",
+            "six": "6", "i": "1", "ii": "2", "iii": "3", "iv": "4", "v": "5",
+            "vi": "6"}
+
+
+def canon_parts(norm: str) -> str:
+    """Canonicalize part markers so a card's wording matches TMDB's.
+
+    TMDB writes two-parters as "Storm Front (1)" -> normalizes to
+    "storm front 1", but the on-screen card may read "PART ONE" / "PART I" /
+    "PART 1". Collapse all of those to the digit so the part still aligns
+    (and still discriminates part 1 from part 2)."""
+    return re.sub(
+        r"\bpart\s+(one|two|three|four|five|six|i{1,3}|iv|vi?|\d+)\b",
+        lambda m: _PARTNUM.get(m.group(1), m.group(1)), norm)
+
+
 def fuzzy_best(text: str, episodes: list[Episode]) -> tuple[Optional[Episode], float]:
     """Best episode-name match for transcribed frame text (closed set)."""
     import difflib
-    norm = normalize_text(text)
+    norm = canon_parts(normalize_text(text))
     if not norm:
         return None, 0.0
     best, best_score = None, 0.0
     for ep in episodes:
-        name = normalize_text(ep.name)
+        name = canon_parts(normalize_text(ep.name))
         if not name:
             continue
         # Word-boundary substring: a real title card is dominated by the title
@@ -764,37 +781,61 @@ def extract_frames(video: Path, workdir: Path, interval: float = 1.5) -> list[Pa
 
 def verify_title(disc: Disc, title: Title, episodes: list[Episode],
                  model: str, host: str, workdir: Path,
-                 window: float = 150.0, front_window: float = 480.0,
+                 window: float = 150.0, front_window: float = 280.0,
+                 fallback_window: float = 720.0,
                  accept: float = 0.8) -> tuple[Optional[Episode], float]:
-    """OCR a title's both-end windows against the season's episode names."""
-    # Title cards sit either near the start or near the end. The front window
-    # must be generous: shows with cold opens (Star Trek: Enterprise) push the
-    # post-credits title caption several minutes in (observed up to ~4:10, and
-    # a long teaser can push it further), so a tight 150 s front window misses
-    # it. The end window overshoots so post-credits cards aren't cut off.
-    windows = [(0.0, front_window),
-               (max(0.0, title.duration - window), window + 60.0)]
-    best_ep, best_score = None, 0.0
-    for start, length in windows:
+    """OCR a title's title-card window against the season's episode names.
+
+    Two-stage to keep the common case cheap: the primary pass covers the
+    front (0..front_window, where most cards land once the cold open is past)
+    and the end (Venture Bros. style, post-credits). Only if that finds no
+    card does the NO-CARD fallback widen the front out to fallback_window —
+    recaps on premieres/continuations (Star Trek: Enterprise) push the title
+    caption to ~5-6 min, past the primary band. Paying for the wide scan only
+    on a miss saves most of the VLM calls without a blind spot."""
+    state = {"ep": None, "score": 0.0}
+
+    def scan(start, length):
         video = rip_window(disc, title, start, length, workdir)
         if not video:
-            continue
-        for frame in extract_frames(video, workdir):
-            try:
-                text = ollama_chat(model, VLM_PROMPT, frame, host)
-            except Exception as e:  # noqa: BLE001
-                log.error("VLM permanently failed on %s: %s", frame.name, e)
-                continue
-            ep, score = fuzzy_best(text, episodes)
-            if score > best_score:
-                best_ep, best_score = ep, score
-            if score >= accept:
-                log.info("%s title %d: verified %r -> S%02dE%02d (%.2f)",
-                         disc.path.name, title.id, text.splitlines()[0][:60]
-                         if text else "", ep.season, ep.number, score)
-                return ep, score
-        video.unlink(missing_ok=True)
-    return best_ep, best_score
+            return None
+        try:
+            for frame in extract_frames(video, workdir):
+                try:
+                    text = ollama_chat(model, VLM_PROMPT, frame, host)
+                except Exception as e:  # noqa: BLE001
+                    log.error("VLM permanently failed on %s: %s", frame.name, e)
+                    continue
+                ep, score = fuzzy_best(text, episodes)
+                if score > state["score"]:
+                    state["ep"], state["score"] = ep, score
+                if score >= accept:
+                    log.info("%s title %d: verified %r -> S%02dE%02d (%.2f)",
+                             disc.path.name, title.id,
+                             text.splitlines()[0][:60] if text else "",
+                             ep.season, ep.number, score)
+                    return ep, score
+        finally:
+            video.unlink(missing_ok=True)
+        return None
+
+    primary = [(0.0, front_window),
+               (max(0.0, title.duration - window), window + 60.0)]
+    for start, length in primary:
+        hit = scan(start, length)
+        if hit:
+            return hit
+    # NO-CARD fallback: nothing in the primary band — widen the front.
+    if title.duration > front_window + 5:
+        extra = min(fallback_window, title.duration) - front_window
+        if extra > 0:
+            log.info("%s title %d: no card in primary band; widening front "
+                     "scan to %.0fs", disc.path.name, title.id,
+                     min(fallback_window, title.duration))
+            hit = scan(front_window, extra)
+            if hit:
+                return hit
+    return state["ep"], state["score"]
 
 
 # ---------------------------------------------------------------------------

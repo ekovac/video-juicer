@@ -64,13 +64,22 @@ needed).
   titles. (It cost a wrong conclusion that Venture Bros. S3 had no on-screen
   titles; they were there at ~21:40, missed by an 8 s back-window stride.)
   `extract_frames` defaults to 1.5 s.
-- **Title-card position varies by show; scan a wide front window.** Venture
-  Bros. cards are at the end; Star Trek: Enterprise captions the title after
-  the opening sequence, but a variable-length cold open floats it several
-  minutes in (observed 2:38 and 4:10 on adjacent episodes). `verify_title`
-  scans the first 8 min plus the tail. For all-same-runtime shows (every
-  Enterprise episode is ~44 min), runtime can't order episodes within a
-  disc — OCR is the way to confirm the playlist/title sequence is right.
+- **Title-card position varies by show; scan primary band, widen on miss.**
+  Venture Bros. cards are at the end; Star Trek: Enterprise captions the
+  title after the opening sequence, but a variable-length cold open floats it
+  minutes in (140-274 s on normal episodes; **306-374 s on premieres/
+  continuations**, where a "Previously on…" recap precedes the teaser).
+  `verify_title` runs a cheap primary pass (front 0-280 s + the tail), and
+  only on a NO-CARD result widens the front out to 720 s — so the common case
+  stays cheap but recap-delayed cards aren't missed. For all-same-runtime
+  shows (every Enterprise episode is ~44 min), runtime can't order episodes
+  within a disc, so OCR is the way to confirm the playlist/title sequence.
+- **Match part numbers flexibly.** TMDB writes two-parters "Storm Front (1)"
+  but the card may read "PART ONE" / "PART I" / "PART 1". `canon_parts`
+  collapses all of those to the digit before matching, so the part still
+  aligns *and* still discriminates part 1 from part 2 (a bare-base card like
+  "SHOCKWAVE" against "Shockwave (2)" still clears via ratio when it's the
+  only Shockwave in that season's pool).
 - Ollama has a known memory leak and may be OOM-killed mid-request; VLM
   calls retry with backoff and a generous timeout to ride out the daemon
   restart and model reload.

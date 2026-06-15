@@ -163,6 +163,33 @@ class FuzzyTest(unittest.TestCase):
         ep, score = ie.fuzzy_best("", self.EPS)
         self.assertIsNone(ep)
 
+    # Two-parters: TMDB writes "(1)/(2)"; cards say "PART ONE/I/1".
+    PARTS = [ie.Episode(4, 1, "Storm Front (1)", 2640),
+             ie.Episode(4, 2, "Storm Front (2)", 2640),
+             ie.Episode(2, 1, "Shockwave (2)", 2640)]
+
+    def test_part_word_matches_paren_number(self):
+        ep, score = ie.fuzzy_best('"Storm Front" PART ONE', self.PARTS)
+        self.assertEqual((ep.season, ep.number), (4, 1))
+        self.assertGreaterEqual(score, 0.85)
+
+    def test_part_roman_matches_and_discriminates(self):
+        # "PART II" must pick (2), not (1)
+        ep, score = ie.fuzzy_best('STORM FRONT, PART II', self.PARTS)
+        self.assertEqual((ep.season, ep.number), (4, 2))
+        self.assertGreaterEqual(score, 0.85)
+
+    def test_part_digit_matches(self):
+        ep, score = ie.fuzzy_best('"Shockwave" Part 2', self.PARTS)
+        self.assertEqual((ep.season, ep.number), (2, 1))
+        self.assertGreaterEqual(score, 0.85)
+
+    def test_canon_parts_helper(self):
+        self.assertEqual(ie.canon_parts("storm front part one"), "storm front 1")
+        self.assertEqual(ie.canon_parts("a part ii b"), "a 2 b")
+        # only number-words after "part" convert; ordinary words untouched
+        self.assertEqual(ie.canon_parts("part of the crew"), "part of the crew")
+
     # Short single-word titles collide with credits/readouts/reasoning text in
     # the opening-credits window (observed on Star Trek: Enterprise S2).
     SHORT = [ie.Episode(2, 13, "Dawn", 2640),
