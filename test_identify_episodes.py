@@ -265,6 +265,32 @@ class MplsTest(unittest.TestCase):
         self.assertIsNone(ie.parse_mpls(b""))
 
 
+class SubsetDedupTest(unittest.TestCase):
+    def _t(self, id, dur, clips):
+        return ie.Title(id=id, duration=float(dur), chapters=[], clips=clips,
+                        order_key=id)
+
+    def test_body_only_dropped_for_with_recap(self):
+        # Avatar pattern: (body,) is a subset of (intro, recap, body)
+        ts = [self._t(601, 1421, ("01100", "01062")),
+              self._t(1601, 1420, ("01062",))]
+        kept = ie.dedup_subset_playlists(ts)
+        self.assertEqual([t.id for t in kept], [601])  # keep the fuller one
+
+    def test_playall_not_swallow_episodes(self):
+        # a long play-all is a superset of episode clips but ~Nx longer;
+        # the 1.5x guard keeps the episodes
+        ep1 = self._t(1, 1400, ("A",))
+        ep2 = self._t(2, 1400, ("B",))
+        playall = self._t(99, 2810, ("A", "B"))
+        kept = ie.dedup_subset_playlists([ep1, ep2, playall])
+        self.assertEqual(sorted(t.id for t in kept), [1, 2, 99])
+
+    def test_distinct_episodes_kept(self):
+        ts = [self._t(1, 1400, ("intro", "a")), self._t(2, 1400, ("intro", "b"))]
+        self.assertEqual(len(ie.dedup_subset_playlists(ts)), 2)
+
+
 class EpisodeGroupTest(unittest.TestCase):
     class StubTmdb:
         def episode_groups(self, tv_id):
@@ -350,6 +376,16 @@ class HintTest(unittest.TestCase):
         d.label = "VENTURE_BROS_VOL_1_DISC_2"
         ie.parse_hints(d)
         self.assertEqual((d.season_hint, d.disc_hint), (1, 2))
+
+    def test_book_disc_pattern(self):
+        d = disc([], name="Avatar_Book_2_Disc_3")
+        ie.parse_hints(d)
+        self.assertEqual((d.season_hint, d.disc_hint), (2, 3))
+
+    def test_bare_book_label(self):
+        d = disc([], name="Korra Book 4")
+        ie.parse_hints(d)
+        self.assertEqual((d.season_hint, d.disc_hint), (4, None))
 
 
 if __name__ == "__main__":

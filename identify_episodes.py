@@ -55,6 +55,7 @@ class Title:
     n_audio: int = 0
     n_sub: int = 0
     cells: int = 0               # DVD cells / BD play items
+    clips: tuple = ()            # BD: referenced .m2ts clip ids (for dedup)
     # classification results
     kind: str = "unknown"        # episode-candidate | play-all | extra | junk
     evidence: float = 0.0        # [-1, 1]; >0 favors episode
@@ -200,6 +201,31 @@ def parse_mpls(buf: bytes) -> Optional[dict]:
             "n_audio": n_audio, "n_sub": n_sub, "n_items": n_items}
 
 
+def dedup_subset_playlists(titles: list[Title]) -> list[Title]:
+    """Drop playlists that are a near-duplicate of a fuller one.
+
+    TV Blu-rays often author each episode as two playlists: the body alone,
+    and the body with a logo/recap clip prepended (e.g. Avatar: clips
+    (01094,) vs (01100, 01088, 01094)). The first is a strict subset of the
+    second and the same episode. Drop the subset, keep the fuller version
+    (which carries the title/recap). The 1.5x length guard stops a long
+    play-all (a superset of many episodes) from swallowing the episodes it
+    contains."""
+    drop = set()
+    for a in titles:
+        if not a.clips or id(a) in drop:
+            continue
+        sa = set(a.clips)
+        for b in titles:
+            if a is b or not b.clips:
+                continue
+            sb = set(b.clips)
+            if sa < sb and b.duration <= a.duration * 1.5:
+                drop.add(id(a))     # a is the subset (shorter); b is fuller
+                break
+    return [t for t in titles if id(t) not in drop]
+
+
 def scan_bluray(path: Path) -> Disc:
     """Read playlists from BDMV/PLAYLIST. Only the small .mpls files are read."""
     playlists: dict[int, bytes] = {}
@@ -228,8 +254,9 @@ def scan_bluray(path: Path) -> Disc:
         titles.append(Title(
             id=num, duration=info["duration"], chapters=info["chapters"],
             n_audio=info["n_audio"], n_sub=info["n_sub"],
-            cells=info["n_items"], order_key=num,
+            cells=info["n_items"], clips=info["clips"], order_key=num,
         ))
+    titles = dedup_subset_playlists(titles)
     disc = Disc(path=path, format="bluray", label=label, titles=titles)
     disc.hb_map = handbrake_title_map(path)
     return disc
@@ -305,10 +332,14 @@ def rip_title_number(disc: Disc, title: Title) -> int:
     return title.id
 
 
+_SEASON_WORD = r"(?:season|book|vol(?:ume)?|part|series|chapter)"
 SEASON_DISC_RE = [
     re.compile(r"[Ss](?:eason[ ._]?)?(\d{1,2})[ ._-]?[Dd](?:isc)?[ ._]?(\d{1,2})"),
-    re.compile(r"VOL(?:UME)?[ ._]?(\d{1,2}).*?DIS[CK][ ._]?(\d{1,2})", re.I),
+    # season-word N ... disc N — e.g. Avatar "Book_1_Disc_1", "VOLUME 2 DISC 3"
+    re.compile(_SEASON_WORD + r"[ ._]?(\d{1,2}).*?dis[ck][ ._]?(\d{1,2})", re.I),
     re.compile(r"[Ss](?:eason)?[ ._]?(\d{1,2})"),
+    # bare season-word N label, no disc number
+    re.compile(_SEASON_WORD + r"[ ._]?(\d{1,2})", re.I),
 ]
 
 
