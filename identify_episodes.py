@@ -869,6 +869,71 @@ def verify_title(disc: Disc, title: Title, episodes: list[Episode],
     return state["ep"], state["score"]
 
 
+def ocr_identify(discs: list[Disc], seasons: dict[int, list[Episode]],
+                 args, workdir: Path
+                 ) -> tuple[list[Assignment], list[tuple[Disc, Title]], list[Episode]]:
+    """Identify episode-band playlists by OCRing their title cards directly.
+
+    For discs whose metadata ordering can't be trusted — multiple playlists
+    per episode, combined two-parters, alternate intro clips (Avatar) — this
+    bypasses the DP alignment: every episode-length candidate is OCR-matched
+    to the season pool, so each playlist's identity comes from its on-screen
+    title, not its position. Slower (a rip + VLM pass per candidate) but
+    robust to irregular authoring."""
+    raw: list[Assignment] = []
+    leftovers: list[tuple[Disc, Title]] = []
+    for season, group in group_discs(discs):
+        pool = (seasons.get(season) or
+                [e for n in sorted(seasons) for e in seasons[n]])
+        runtimes = sorted(e.runtime for e in pool if e.runtime)
+        expected = runtimes[len(runtimes) // 2] if runtimes else 1320.0
+        lo, hi = expected * 0.6, expected * 2.6   # singles through doubles
+        for d in group:
+            cands = sorted((t for t in d.titles if lo <= t.duration <= hi),
+                           key=lambda t: t.order_key)
+            log.info("%s: OCR-identifying %d candidate playlist(s)",
+                     d.path.name, len(cands))
+            for t in cands:
+                ep, score = verify_title(d, t, pool, args.vlm_model,
+                                         args.ollama_host, workdir,
+                                         accept=args.ocr_accept)
+                if not ep or score < args.ocr_accept:
+                    leftovers.append((d, t))
+                    log.info("%s pl %d: unmatched (best %.2f)",
+                             d.path.name, t.id, score)
+                    continue
+                eps = [ep]
+                # combined two-parter playlist (~2x runtime): claim next too
+                if ep.runtime and t.duration >= ep.runtime * 1.6:
+                    nxt = next((e for e in pool if e.number == ep.number + 1), None)
+                    if nxt:
+                        eps.append(nxt)
+                delta = abs(t.duration - sum(e.runtime or 0 for e in eps))
+                raw.append(Assignment(d, t, eps, delta, "high", ep.name))
+
+    # Resolve collisions: each episode claimed once. Prefer single-episode
+    # assignments over doubles, then the longest (most complete) playlist.
+    final: list[Assignment] = []
+    claimed: dict[tuple, Assignment] = {}
+    for a in sorted(raw, key=lambda a: (len(a.episodes), -a.title.duration)):
+        keys = [(e.season, e.number) for e in a.episodes]
+        if any(k in claimed for k in keys):
+            leftovers.append((a.disc, a.title))
+            log.warning("%s pl %d (%r) duplicates an already-identified "
+                        "episode; treating as extra", a.disc.path.name,
+                        a.title.id, a.episodes[0].name)
+            continue
+        for k in keys:
+            claimed[k] = a
+        final.append(a)
+
+    hinted = {d.season_hint for d in discs if d.season_hint}
+    missed = [e for n in sorted(seasons) for e in seasons[n]
+              if (e.season, e.number) not in claimed
+              and (not hinted or e.season in hinted)]
+    return final, leftovers, missed
+
+
 # ---------------------------------------------------------------------------
 # Stage 4: orchestration + reporting
 # ---------------------------------------------------------------------------
@@ -916,6 +981,15 @@ def main(argv: Optional[list[str]] = None) -> int:
                     help="OCR title cards of low-confidence matches via Ollama")
     ap.add_argument("--verify-all", action="store_true",
                     help="OCR every matched title, not just low-confidence ones")
+    ap.add_argument("--ocr-identify", action="store_true",
+                    help="identify every candidate playlist by OCRing its "
+                         "title card instead of metadata alignment — for "
+                         "irregular discs (duplicate/combined playlists)")
+    ap.add_argument("--ocr-accept", type=float, default=0.8,
+                    help="min fuzzy score to accept an OCR title match (0-1)")
+    ap.add_argument("--scratch-dir", type=Path, default=None,
+                    help="directory for temporary rips/frames (put on disk, "
+                         "not tmpfs, for large OCR runs)")
     ap.add_argument("--vlm-model", default="qwen3-vl:2B")
     ap.add_argument("--ollama-host",
                     default=os.environ.get("OLLAMA_HOST", "http://localhost:11434"))
@@ -953,19 +1027,27 @@ def main(argv: Optional[list[str]] = None) -> int:
     all_assignments: list[Assignment] = []
     all_leftovers: list[tuple[Disc, Title]] = []
     all_missed: list[Episode] = []
-    for season, group in group_discs(discs):
-        pool = (seasons.get(season) or
-                [e for n in sorted(seasons) for e in seasons[n]])
-        runtimes = sorted(e.runtime for e in pool if e.runtime)
-        expected = runtimes[len(runtimes) // 2] if runtimes else 1320.0
-        cands: list[tuple[Disc, Title]] = []
-        for d in group:
-            for t in classify_disc(d, expected):
-                cands.append((d, t))
-        assignments, leftovers, missed = align(cands, pool)
-        all_assignments += assignments
-        all_leftovers += leftovers
-        all_missed += missed
+    if args.ocr_identify:
+        log.info("OCR-identify mode: matching each candidate playlist by its "
+                 "on-screen title card via %s", args.vlm_model)
+        with tempfile.TemporaryDirectory(prefix="identify-eps-ocr-",
+                                         dir=args.scratch_dir) as tmp:
+            all_assignments, all_leftovers, all_missed = ocr_identify(
+                discs, seasons, args, Path(tmp))
+    else:
+        for season, group in group_discs(discs):
+            pool = (seasons.get(season) or
+                    [e for n in sorted(seasons) for e in seasons[n]])
+            runtimes = sorted(e.runtime for e in pool if e.runtime)
+            expected = runtimes[len(runtimes) // 2] if runtimes else 1320.0
+            cands: list[tuple[Disc, Title]] = []
+            for d in group:
+                for t in classify_disc(d, expected):
+                    cands.append((d, t))
+            assignments, leftovers, missed = align(cands, pool)
+            all_assignments += assignments
+            all_leftovers += leftovers
+            all_missed += missed
 
     # leftovers may be TMDB specials: best-effort runtime match against S0
     special_notes: dict[int, str] = {}
@@ -975,12 +1057,13 @@ def main(argv: Optional[list[str]] = None) -> int:
         if len(hits) == 1:
             special_notes[idx] = f"possible special S00E{hits[0].number:02d} {hits[0].name!r}"
 
-    # optional VLM verification of weak matches
-    if args.verify or args.verify_all:
+    # optional VLM verification of weak matches (already done in ocr-identify)
+    if (args.verify or args.verify_all) and not args.ocr_identify:
         targets = [a for a in all_assignments
                    if args.verify_all or a.confidence == "low"]
         log.info("verifying %d title(s) via %s", len(targets), args.vlm_model)
-        with tempfile.TemporaryDirectory(prefix="identify-eps-") as tmp:
+        with tempfile.TemporaryDirectory(prefix="identify-eps-",
+                                         dir=args.scratch_dir) as tmp:
             for a in targets:
                 season_pool = seasons.get(a.episodes[0].season, [])
                 ep, score = verify_title(a.disc, a.title, season_pool,
