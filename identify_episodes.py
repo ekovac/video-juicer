@@ -625,16 +625,25 @@ def fuzzy_best(text: str, episodes: list[Episode]) -> tuple[Optional[Episode], f
         name = normalize_text(ep.name)
         if not name:
             continue
-        # substring hit beats ratio: frames carry extra text around the title
-        if name in norm:
-            return ep, 1.0
-        score = difflib.SequenceMatcher(None, name, norm).ratio()
-        # also try the best window of the transcription
-        words = norm.split()
-        target_len = len(name.split())
-        for k in range(max(1, len(words) - target_len + 1)):
-            window = " ".join(words[k:k + target_len + 1])
-            score = max(score, difflib.SequenceMatcher(None, name, window).ratio())
+        # Word-boundary substring: a real title card is dominated by the title
+        # text. A distinctive multi-word/long title appearing verbatim is
+        # conclusive (1.0) even with show branding around it. A short
+        # single-word title (Dawn, Horizon) appearing as a substring is NOT
+        # conclusive — it collides with crew names in the opening credits
+        # ("PRODUCER DAWN ..."), with the VLM's own reasoning text, and with
+        # longer words ("horizon" in "horizontal", excluded by \b). For those
+        # we score by coverage, so the title must actually dominate the frame.
+        if re.search(rf"\b{re.escape(name)}\b", norm):
+            distinctive = len(name.split()) >= 2 or len(name.replace(" ", "")) >= 10
+            score = 1.0 if distinctive else len(name) / len(norm)
+        else:
+            score = difflib.SequenceMatcher(None, name, norm).ratio()
+            # also try the best window of the transcription
+            words = norm.split()
+            target_len = len(name.split())
+            for k in range(max(1, len(words) - target_len + 1)):
+                window = " ".join(words[k:k + target_len + 1])
+                score = max(score, difflib.SequenceMatcher(None, name, window).ratio())
         if score > best_score:
             best, best_score = ep, score
     return best, best_score

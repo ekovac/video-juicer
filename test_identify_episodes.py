@@ -163,6 +163,42 @@ class FuzzyTest(unittest.TestCase):
         ep, score = ie.fuzzy_best("", self.EPS)
         self.assertIsNone(ep)
 
+    # Short single-word titles collide with credits/readouts/reasoning text in
+    # the opening-credits window (observed on Star Trek: Enterprise S2).
+    SHORT = [ie.Episode(2, 13, "Dawn", 2640),
+             ie.Episode(2, 20, "Horizon", 2640),
+             ie.Episode(2, 15, "Cease Fire", 2640)]
+
+    def test_short_title_not_matched_in_credit_name(self):
+        # "Dawn" must not match the producer's first name
+        ep, score = ie.fuzzy_best("PRODUCER\nDAWN VELAZQUEZ", self.SHORT)
+        self.assertLess(score, 0.8)
+
+    def test_short_title_not_matched_as_subword(self):
+        # "Horizon" must not match inside "horizontal"
+        _, score = ie.fuzzy_best("three horizontal lines on the emblem", self.SHORT)
+        self.assertLess(score, 0.8)
+
+    def test_short_title_not_matched_in_reasoning(self):
+        # the VLM's own reasoning enumerating words must not trip a match
+        _, score = ie.fuzzy_best(
+            "let's look at the image. words like tropics, equinoctials, "
+            "horizon, etc. wait, let me check each part", self.SHORT)
+        self.assertLess(score, 0.8)
+
+    def test_short_title_clean_card_matches(self):
+        # a real title card (title dominates the frame) still matches
+        ep, score = ie.fuzzy_best('"Horizon"', self.SHORT)
+        self.assertEqual(ep.number, 20)
+        self.assertGreaterEqual(score, 0.8)
+
+    def test_multiword_title_matches_with_branding(self):
+        # distinctive multi-word title verbatim amid branding stays conclusive
+        ep, score = ie.fuzzy_best(
+            'STAR TREK ENTERPRISE "Cease Fire" act one', self.SHORT)
+        self.assertEqual(ep.number, 15)
+        self.assertGreaterEqual(score, 0.8)
+
 
 def build_mpls(playitems, marks):
     """Minimal valid MPLS: playitems=[(clip, in_t, out_t)], marks=[(type, ref, tick)]."""
