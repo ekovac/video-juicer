@@ -69,6 +69,9 @@ class Disc:
     titles: list[Title] = field(default_factory=list)
     season_hint: Optional[int] = None
     disc_hint: Optional[int] = None
+    # Blu-ray only: maps a playlist's .mpls id (Title.id, used internally by
+    # ffmpeg --playlist) to the HandBrake title index the user rips with.
+    hb_map: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -227,7 +230,79 @@ def scan_bluray(path: Path) -> Disc:
             n_audio=info["n_audio"], n_sub=info["n_sub"],
             cells=info["n_items"], order_key=num,
         ))
-    return Disc(path=path, format="bluray", label=label, titles=titles)
+    disc = Disc(path=path, format="bluray", label=label, titles=titles)
+    disc.hb_map = handbrake_title_map(path)
+    return disc
+
+
+def _parse_hb_titles(stdout: str) -> dict[int, int]:
+    """Extract {playlist_id: handbrake_title_index} from HandBrakeCLI --json."""
+    i = stdout.find("JSON Title Set:")
+    if i < 0:
+        return {}
+    start = stdout.find("{", i)
+    depth, end = 0, -1
+    for j in range(start, len(stdout)):
+        if stdout[j] == "{":
+            depth += 1
+        elif stdout[j] == "}":
+            depth -= 1
+            if depth == 0:
+                end = j + 1
+                break
+    if end < 0:
+        return {}
+    try:
+        data = json.loads(stdout[start:end])
+    except json.JSONDecodeError:
+        return {}
+    mapping = {}
+    for t in data.get("TitleList", []):
+        pl, idx = t.get("Playlist"), t.get("Index")
+        if pl is None or idx is None:
+            continue
+        try:
+            mapping[int(pl)] = int(idx)
+        except (ValueError, TypeError):
+            continue
+    return mapping
+
+
+def handbrake_title_map(path: Path) -> dict[int, int]:
+    """Map BD playlist .mpls id -> HandBrake title index (the `-t N` to rip).
+
+    HandBrake enumerates relevant playlists; that numbering differs from raw
+    .mpls ids and from a player's title-object list (e.g. VLC). Best-effort:
+    returns {} (callers warn and fall back) if HandBrakeCLI is missing or the
+    scan fails.
+    """
+    if not shutil.which("HandBrakeCLI"):
+        log.warning("HandBrakeCLI not on PATH; Blu-ray output will use raw "
+                    ".mpls ids, which do NOT match HandBrake's -t numbers")
+        return {}
+    try:
+        proc = run(["HandBrakeCLI", "-i", str(path), "-t", "0", "--scan",
+                    "--json"], timeout=300)
+    except subprocess.TimeoutExpired:
+        log.warning("HandBrake scan timed out on %s", path.name)
+        return {}
+    mapping = _parse_hb_titles(proc.stdout)
+    if not mapping:
+        log.warning("HandBrake scan yielded no titles for %s", path.name)
+    return mapping
+
+
+def rip_title_number(disc: Disc, title: Title) -> int:
+    """The title number to pass to a ripper. For Blu-ray, translate the
+    internal .mpls id to HandBrake's title index; for DVD the id already is
+    the rip title."""
+    if disc.format == "bluray" and disc.hb_map:
+        hb = disc.hb_map.get(title.id)
+        if hb is not None:
+            return hb
+        log.warning("no HandBrake title for playlist %d on %s; using .mpls id",
+                    title.id, disc.path.name)
+    return title.id
 
 
 SEASON_DISC_RE = [
@@ -862,7 +937,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                     key=lambda a: (a.episodes[0].season, a.episodes[0].number)):
         e0 = a.episodes[0]
         records.append({
-            "image": str(a.disc.path), "title": a.title.id, "kind": "episode",
+            "image": str(a.disc.path),
+            "title": rip_title_number(a.disc, a.title), "kind": "episode",
             "season": e0.season,
             "episodes": [e.number for e in a.episodes],
             "episode_name": " & ".join(e.name for e in a.episodes),
@@ -878,14 +954,16 @@ def main(argv: Optional[list[str]] = None) -> int:
                 f"S{e.aired_season:02d}E{e.aired_number:02d}" for e in a.episodes]
     for idx, (d, t) in enumerate(all_leftovers):
         records.append({
-            "image": str(d.path), "title": t.id, "kind": "extra",
+            "image": str(d.path), "title": rip_title_number(d, t),
+            "kind": "extra",
             "title_seconds": round(t.duration, 1),
             "note": special_notes.get(idx, ""),
         })
     for d in discs:
         for t in d.titles:
             if t.kind == "play-all":
-                records.append({"image": str(d.path), "title": t.id,
+                records.append({"image": str(d.path),
+                                "title": rip_title_number(d, t),
                                 "kind": "play_all",
                                 "title_seconds": round(t.duration, 1)})
     args.out.write_text(json.dumps(records, indent=2))
@@ -899,7 +977,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         nums = "".join(f"E{e.number:02d}" for e in a.episodes)
         flag = {"high": " ", "medium": " ", "low": "?"}[a.confidence]
         ver = " [verified]" if a.verified_name else ""
-        print(f"  S{e0.season:02d}{nums} {flag} {a.disc.path.name} title {a.title.id:>2} "
+        print(f"  S{e0.season:02d}{nums} {flag} {a.disc.path.name} "
+              f"title {rip_title_number(a.disc, a.title):>2} "
               f"Δ{a.delta:5.1f}s  {' & '.join(e.name for e in a.episodes)}{ver}")
     if all_missed:
         print("\nMISSING EPISODES (not found on any disc):")
@@ -909,7 +988,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(f"\nExtras / unmatched titles: {len(all_leftovers)}")
         for idx, (d, t) in enumerate(all_leftovers):
             note = f"  ({special_notes[idx]})" if idx in special_notes else ""
-            print(f"  {d.path.name} title {t.id:>2} {t.duration/60:6.1f} min{note}")
+            print(f"  {d.path.name} title {rip_title_number(d, t):>2} "
+                  f"{t.duration/60:6.1f} min{note}")
 
     if args.emit_rip_commands:
         print("\n# rip commands")

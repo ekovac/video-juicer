@@ -12,6 +12,13 @@ Outputs `manifest.json` (one record per title: episode mapping, runtime
 delta, confidence, suggested Plex-style filename) plus a human-readable
 table. `--emit-rip-commands` prints ready-to-run HandBrakeCLI lines.
 
+The `title` field is the number to pass to your ripper (`HandBrakeCLI -t N`).
+For DVD it's the lsdvd/HandBrake title number directly. For **Blu-ray** the
+tool runs a HandBrake scan per disc and reports HandBrake's title index —
+**not** the raw `.mpls` id and **not** a player's title number, which differ
+(see notes below). This adds ~8 s per Blu-ray disc; needs `HandBrakeCLI` on
+PATH (without it, Blu-ray falls back to raw `.mpls` ids with a warning).
+
 How it works: reads only disc metadata (DVD IFO via `lsdvd`, Blu-ray
 `.mpls` playlists via `7z`), detects play-all titles by chapter-duration
 matching, then aligns episode candidates against TMDB episode runtimes with
@@ -67,3 +74,13 @@ needed).
 - Ollama has a known memory leak and may be OOM-killed mid-request; VLM
   calls retry with backoff and a generous timeout to ride out the daemon
   restart and model reload.
+- **Blu-ray "title number" is not universal across tools.** Three schemes
+  coexist: the raw `.mpls` playlist id (what `ffmpeg -playlist` uses),
+  HandBrake's filtered-playlist title index (what you rip with), and a
+  player's HDMV *title-object* list from `index.bdmv` (what VLC shows). On a
+  Star Trek: Enterprise disc, one episode was `.mpls` 1 = HandBrake title 2
+  = VLC title 19 — because `index.bdmv` defined 78 title objects (VLC counts
+  those) while HandBrake lists 24 relevant playlists. They only coincide on
+  simple discs with ~one title each. The tool identifies by `.mpls` (and
+  `ffmpeg` to OCR-verify) but **emits HandBrake's number**, since that's the
+  one you rip with.

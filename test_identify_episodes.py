@@ -275,6 +275,43 @@ class EpisodeGroupTest(unittest.TestCase):
         self.assertIn("DVD Order", str(ctx.exception))
 
 
+class HandBrakeTitleTest(unittest.TestCase):
+    # abbreviated HandBrakeCLI --json output (logs + the JSON Title Set block)
+    HB_OUT = (
+        'Version: {"Name":"HandBrake"}\n'
+        '[12:00:00] scanning\n'
+        'JSON Title Set: {\n'
+        '  "MainFeature": 2,\n'
+        '  "TitleList": [\n'
+        '    {"Index": 1, "Playlist": "0", "Name": "preroll"},\n'
+        '    {"Index": 2, "Playlist": "1", "Name": "ep"},\n'
+        '    {"Index": 9, "Playlist": "10", "Name": "ep"}\n'
+        '  ]\n'
+        '}\n')
+
+    def test_parse_playlist_to_title_index(self):
+        m = ie._parse_hb_titles(self.HB_OUT)
+        self.assertEqual(m, {0: 1, 1: 2, 10: 9})
+
+    def test_parse_garbage(self):
+        self.assertEqual(ie._parse_hb_titles("no json here"), {})
+        self.assertEqual(ie._parse_hb_titles("JSON Title Set: {bad"), {})
+
+    def test_rip_title_bluray_translates(self):
+        d = disc([title(1, 2640)], fmt="bluray")
+        d.hb_map = {1: 2, 10: 9}
+        self.assertEqual(ie.rip_title_number(d, d.titles[0]), 2)  # mpls 1 -> t2
+
+    def test_rip_title_bluray_missing_falls_back(self):
+        d = disc([title(7, 2640)], fmt="bluray")
+        d.hb_map = {1: 2}  # playlist 7 absent
+        self.assertEqual(ie.rip_title_number(d, d.titles[0]), 7)
+
+    def test_rip_title_dvd_is_identity(self):
+        d = disc([title(3, 1320)], fmt="dvd")
+        self.assertEqual(ie.rip_title_number(d, d.titles[0]), 3)
+
+
 class HintTest(unittest.TestCase):
     def test_filename_pattern(self):
         d = disc([], name="VENTURE_BROS_S3D2.iso")
