@@ -213,6 +213,14 @@ class FuzzyTest(unittest.TestCase):
             "horizon, etc. wait, let me check each part", self.SHORT)
         self.assertLess(score, 0.8)
 
+    def test_short_title_on_structured_card_matches(self):
+        # Avatar: "CHAPTER TEN: JET" — short title, no credit/reasoning noise
+        eps = [ie.Episode(1, 10, "Jet", 1440),
+               ie.Episode(1, 1, "The Boy in the Iceberg", 1440)]
+        ep, score = ie.fuzzy_best("BOOK ONE: WATER  CHAPTER TEN: JET", eps)
+        self.assertEqual(ep.number, 10)
+        self.assertGreaterEqual(score, 0.85)
+
     def test_short_title_clean_card_matches(self):
         # a real title card (title dominates the frame) still matches
         ep, score = ie.fuzzy_best('"Horizon"', self.SHORT)
@@ -363,6 +371,28 @@ class HandBrakeTitleTest(unittest.TestCase):
     def test_rip_title_dvd_is_identity(self):
         d = disc([title(3, 1320)], fmt="dvd")
         self.assertEqual(ie.rip_title_number(d, d.titles[0]), 3)
+
+
+class MergeTest(unittest.TestCase):
+    def test_merge_replaces_only_reprocessed_discs(self):
+        existing = [
+            {"image": "discA", "kind": "episode", "season": 1, "episodes": [1]},
+            {"image": "discB", "kind": "episode", "season": 1, "episodes": [2]},
+            {"image": "discB", "kind": "extra", "season": 1, "episodes": []},
+        ]
+        # re-ran discB only; it now yields a corrected record + a new episode
+        new = [
+            {"image": "discB", "kind": "episode", "season": 1, "episodes": [2]},
+            {"image": "discB", "kind": "episode", "season": 1, "episodes": [3]},
+        ]
+        merged = ie.merge_records(existing, new, [Path("discB")])
+        imgs_eps = [(r["image"], r["episodes"]) for r in merged
+                    if r["kind"] == "episode"]
+        self.assertIn(("discA", [1]), imgs_eps)          # untouched disc kept
+        self.assertIn(("discB", [3]), imgs_eps)          # new episode added
+        self.assertEqual(sum(1 for r in merged if r["image"] == "discB"), 2)
+        # the stale discB extra was dropped (discB replaced wholesale)
+        self.assertFalse(any(r["kind"] == "extra" for r in merged))
 
 
 class HintTest(unittest.TestCase):

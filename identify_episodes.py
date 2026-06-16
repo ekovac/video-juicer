@@ -737,28 +737,41 @@ def canon_parts(norm: str) -> str:
         lambda m: _PARTNUM.get(m.group(1), m.group(1)), norm)
 
 
+# Text that means a short word-boundary hit is probably incidental, not a
+# title: opening-credits roles, and the VLM's own reasoning preamble.
+_INCIDENTAL_MARKERS = (
+    "producer", "directed", "director", "written", "writer", "teleplay",
+    "story by", "music", "edited", "editor", "starring", "executive",
+    "casting", "narrat",
+    "got it", "let s", "the image", "i need", "looking at", "transcribe",
+)
+
+
 def fuzzy_best(text: str, episodes: list[Episode]) -> tuple[Optional[Episode], float]:
     """Best episode-name match for transcribed frame text (closed set)."""
     import difflib
     norm = canon_parts(normalize_text(text))
     if not norm:
         return None, 0.0
+    incidental = any(m in norm for m in _INCIDENTAL_MARKERS)
     best, best_score = None, 0.0
     for ep in episodes:
         name = canon_parts(normalize_text(ep.name))
         if not name:
             continue
-        # Word-boundary substring: a real title card is dominated by the title
-        # text. A distinctive multi-word/long title appearing verbatim is
-        # conclusive (1.0) even with show branding around it. A short
-        # single-word title (Dawn, Horizon) appearing as a substring is NOT
-        # conclusive — it collides with crew names in the opening credits
-        # ("PRODUCER DAWN ..."), with the VLM's own reasoning text, and with
-        # longer words ("horizon" in "horizontal", excluded by \b). For those
-        # we score by coverage, so the title must actually dominate the frame.
+        # Word-boundary substring: a real title card is dominated by the title.
+        # A distinctive multi-word/long title appearing verbatim is conclusive
+        # (1.0) even amid branding. A short single-word title (Dawn, Jet) is
+        # conclusive ONLY when the rest of the frame looks like a title card,
+        # not credits/reasoning: "CHAPTER TEN: JET" matches Jet, but "PRODUCER
+        # DAWN ..." or a VLM reasoning dump must not. When the frame carries
+        # incidental markers we fall back to coverage (title must dominate).
         if re.search(rf"\b{re.escape(name)}\b", norm):
             distinctive = len(name.split()) >= 2 or len(name.replace(" ", "")) >= 10
-            score = 1.0 if distinctive else len(name) / len(norm)
+            if distinctive or not incidental:
+                score = 1.0
+            else:
+                score = len(name) / len(norm)
         else:
             score = difflib.SequenceMatcher(None, name, norm).ratio()
             # also try the best window of the transcription
@@ -912,18 +925,22 @@ def ocr_identify(discs: list[Disc], seasons: dict[int, list[Episode]],
                 raw.append(Assignment(d, t, eps, delta, "high", ep.name))
 
     # Resolve collisions: each episode claimed once. Prefer single-episode
-    # assignments over doubles, then the longest (most complete) playlist.
+    # assignments over doubles, then the longest (most complete) playlist. A
+    # combined double is kept if it carries at least one *unclaimed* episode
+    # (e.g. a finale where E19 exists only inside the E19+E20 double while E20
+    # also has a single) — only dropped when fully redundant.
     final: list[Assignment] = []
     claimed: dict[tuple, Assignment] = {}
     for a in sorted(raw, key=lambda a: (len(a.episodes), -a.title.duration)):
         keys = [(e.season, e.number) for e in a.episodes]
-        if any(k in claimed for k in keys):
+        unclaimed = [k for k in keys if k not in claimed]
+        if not unclaimed:
             leftovers.append((a.disc, a.title))
-            log.warning("%s pl %d (%r) duplicates an already-identified "
-                        "episode; treating as extra", a.disc.path.name,
+            log.warning("%s pl %d (%r) fully duplicates already-identified "
+                        "episode(s); treating as extra", a.disc.path.name,
                         a.title.id, a.episodes[0].name)
             continue
-        for k in keys:
+        for k in unclaimed:
             claimed[k] = a
         final.append(a)
 
@@ -960,11 +977,35 @@ def group_discs(discs: list[Disc]) -> list[tuple[Optional[int], list[Disc]]]:
     return [(None, sorted(discs, key=lambda d: d.path.name))]
 
 
+def emit_rip_commands(records: list[dict], preset: str) -> None:
+    """Print a HandBrakeCLI line per episode record."""
+    for r in records:
+        if r.get("kind") != "episode":
+            continue
+        print(f'HandBrakeCLI -i "{r["image"]}" -t {r["title"]} '
+              f'--preset "{preset}" -o "{r["suggested_filename"]}"')
+
+
+def merge_records(existing: list[dict], new: list[dict],
+                  images: list[Path]) -> list[dict]:
+    """Merge a fresh run's records into an existing manifest.
+
+    Records for the discs processed this run (matched by `image`) are
+    replaced wholesale by the new ones; records for every other disc are
+    kept. This lets a re-run of a few discs refine the manifest in place."""
+    touched = {str(p) for p in images}
+    kept = [r for r in existing if r.get("image") not in touched]
+    merged = kept + new
+    merged.sort(key=lambda r: (r.get("season", 99), r.get("episodes", [999]),
+                               r.get("image", ""), r.get("kind", "")))
+    return merged
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("images", nargs="+", type=Path,
+    ap.add_argument("images", nargs="*", type=Path,
                     help="disc images (.iso) or backup directories")
-    ap.add_argument("--tv-id", type=int, required=True, help="TMDB series id")
+    ap.add_argument("--tv-id", type=int, help="TMDB series id")
     ap.add_argument("--tmdb-api-key", default=os.environ.get("TMDB_API_KEY"))
     ap.add_argument("--out", type=Path, default=Path("manifest.json"))
     ap.add_argument("--cache-dir", type=Path, default=Path(".tmdb_cache"))
@@ -974,9 +1015,15 @@ def main(argv: Optional[list[str]] = None) -> int:
                          "production, story, tv), or an explicit TMDB "
                          "episode-group id")
     ap.add_argument("--emit-rip-commands", action="store_true")
+    ap.add_argument("--from-manifest", type=Path, metavar="FILE",
+                    help="emit rip commands from an existing manifest and "
+                         "exit — no disc scanning or OCR")
+    ap.add_argument("--merge", action="store_true",
+                    help="merge this run's results into the existing --out "
+                         "manifest (replace only the discs processed now)")
     ap.add_argument("--handbrake-preset", default="Fast 1080p30",
                     metavar="PRESET",
-                    help='HandBrake preset for --emit-rip-commands (default: "Fast 1080p30")')
+                    help='HandBrake preset for rip commands (default: "Fast 1080p30")')
     ap.add_argument("--verify", action="store_true",
                     help="OCR title cards of low-confidence matches via Ollama")
     ap.add_argument("--verify-all", action="store_true",
@@ -998,6 +1045,17 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(levelname)s %(message)s")
+
+    # Pure transform: emit rip commands from a saved manifest, no scanning.
+    if args.from_manifest:
+        records = json.loads(args.from_manifest.read_text())
+        emit_rip_commands(records, args.handbrake_preset)
+        return 0
+
+    if not args.images:
+        ap.error("no disc images given (required unless --from-manifest)")
+    if not args.tv_id:
+        ap.error("--tv-id is required")
     if not args.tmdb_api_key:
         ap.error("TMDB_API_KEY not set and --tmdb-api-key not given")
     for tool in ("lsdvd", "7z"):
@@ -1121,6 +1179,12 @@ def main(argv: Optional[list[str]] = None) -> int:
                                 "title": rip_title_number(d, t),
                                 "kind": "play_all",
                                 "title_seconds": round(t.duration, 1)})
+    if args.merge and args.out.exists():
+        existing = json.loads(args.out.read_text())
+        before = len(records)
+        records = merge_records(existing, records, args.images)
+        log.info("merged %d new record(s) into %s (%d total)",
+                 before, args.out, len(records))
     args.out.write_text(json.dumps(records, indent=2))
     log.info("wrote %s (%d records)", args.out, len(records))
 
@@ -1148,22 +1212,20 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     if args.emit_rip_commands:
         print("\n# rip commands")
-        for r in records:
-            if r["kind"] != "episode":
-                continue
-            print(f'HandBrakeCLI -i "{r["image"]}" -t {r["title"]} '
-                  f'--preset "{args.handbrake_preset}" -o "{r["suggested_filename"]}"')
+        emit_rip_commands(records, args.handbrake_preset)
 
-    # validation summary
+    # validation summary — count from the written manifest (so a --merge run
+    # reflects total coverage across all discs, not just the ones re-run)
     by_season: dict[int, int] = {}
-    for a in all_assignments:
-        for e in a.episodes:
-            by_season[e.season] = by_season.get(e.season, 0) + 1
+    for r in records:
+        if r.get("kind") == "episode":
+            for n in r.get("episodes", []):
+                by_season[r["season"]] = by_season.get(r["season"], 0) + 1
+    covered_seasons = {r["season"] for r in records if r.get("kind") == "episode"}
     problems = [f"S{s:02d}: matched {by_season.get(s, 0)}/{len(eps)}"
                 for s, eps in sorted(seasons.items())
-                if by_season.get(s, 0) != len(eps)
-                and any(d.season_hint == s for d in discs)]
-    if problems or all_missed:
+                if by_season.get(s, 0) != len(eps) and s in covered_seasons]
+    if problems:
         print("\nWARNING: incomplete coverage: " + "; ".join(problems))
         return 1
     return 0
