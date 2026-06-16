@@ -810,7 +810,11 @@ def rip_window(disc: Disc, title: Title, start: float, length: float,
     return out if out.exists() and out.stat().st_size > 0 else None
 
 
-def extract_frames(video: Path, workdir: Path, interval: float = 1.5) -> list[Path]:
+FRAME_INTERVAL = 1.5   # seconds between sampled frames (cards show ~2-4 s)
+
+
+def extract_frames(video: Path, workdir: Path,
+                   interval: float = FRAME_INTERVAL) -> list[Path]:
     # Title cards are only on screen ~2-4 s; a coarse stride (4+ s) phase-skips
     # right over them. Sample at <=2 s. The windows verify_title rips are
     # bounded, so the extra frames are cheap.
@@ -823,28 +827,44 @@ def extract_frames(video: Path, workdir: Path, interval: float = 1.5) -> list[Pa
     return sorted(workdir.glob("frame_*.jpg"))
 
 
+ANCHOR_RADIUS = 90.0   # seconds either side of a learned card location
+
+
 def verify_title(disc: Disc, title: Title, episodes: list[Episode],
                  model: str, host: str, workdir: Path,
                  window: float = 150.0, front_window: float = 280.0,
-                 fallback_window: float = 720.0,
-                 accept: float = 0.8) -> tuple[Optional[Episode], float]:
+                 fallback_window: float = 720.0, accept: float = 0.8,
+                 anchor: Optional[float] = None
+                 ) -> tuple[Optional[Episode], float, Optional[float]]:
     """OCR a title's title-card window against the season's episode names.
 
-    Two-stage to keep the common case cheap: the primary pass covers the
-    front (0..front_window, where most cards land once the cold open is past)
-    and the end (Venture Bros. style, post-credits). Only if that finds no
-    card does the NO-CARD fallback widen the front out to fallback_window —
-    recaps on premieres/continuations (Star Trek: Enterprise) push the title
-    caption to ~5-6 min, past the primary band. Paying for the wide scan only
-    on a miss saves most of the VLM calls without a blind spot."""
-    state = {"ep": None, "score": 0.0}
+    Returns (episode, score, card_seconds) — card_seconds is where the
+    matching card was found, so a caller can learn the per-disc location.
 
-    def scan(start, length):
+    Scanning is cheap-first. If `anchor` (an absolute second offset, learned
+    from earlier episodes on the same disc) is given, a tight window around it
+    is scanned first, frames ordered outward from the anchor so the card is
+    usually the first few tried. On a miss it falls back to a broad pass — the
+    front (0..front_window, cold-open shows) and the end (window before the
+    end, Venture Bros. style) — and finally the NO-CARD widen of the front to
+    fallback_window for recap-delayed premieres. So the first episode or two
+    on a disc pay full cost; once the location is known the rest are cheap."""
+    state = {"ep": None, "score": 0.0, "time": None}
+
+    def scan(start, length, anchor_time=None):
+        start = max(0.0, start)
+        length = min(length, title.duration - start)
+        if length <= 0:
+            return None
         video = rip_window(disc, title, start, length, workdir)
         if not video:
             return None
         try:
-            for frame in extract_frames(video, workdir):
+            frames = extract_frames(video, workdir)
+            timed = [(f, start + i * FRAME_INTERVAL) for i, f in enumerate(frames)]
+            if anchor_time is not None:   # try frames nearest the anchor first
+                timed.sort(key=lambda ft: abs(ft[1] - anchor_time))
+            for frame, ts in timed:
                 try:
                     text = ollama_chat(model, VLM_PROMPT, frame, host)
                 except Exception as e:  # noqa: BLE001
@@ -852,34 +872,36 @@ def verify_title(disc: Disc, title: Title, episodes: list[Episode],
                     continue
                 ep, score = fuzzy_best(text, episodes)
                 if score > state["score"]:
-                    state["ep"], state["score"] = ep, score
+                    state["ep"], state["score"], state["time"] = ep, score, ts
                 if score >= accept:
-                    log.info("%s title %d: verified %r -> S%02dE%02d (%.2f)",
+                    log.info("%s title %d: verified %r -> S%02dE%02d (%.2f) @%.0fs",
                              disc.path.name, title.id,
                              text.splitlines()[0][:60] if text else "",
-                             ep.season, ep.number, score)
+                             ep.season, ep.number, score, ts)
                     return ep, score
         finally:
             video.unlink(missing_ok=True)
         return None
 
-    primary = [(0.0, front_window),
-               (max(0.0, title.duration - window), window + 60.0)]
-    for start, length in primary:
-        hit = scan(start, length)
-        if hit:
-            return hit
+    result = lambda: (state["ep"], state["score"], state["time"])
+
+    if anchor is not None:
+        if scan(anchor - ANCHOR_RADIUS, 2 * ANCHOR_RADIUS, anchor_time=anchor):
+            return result()
+        log.info("%s title %d: anchor @%.0fs missed; broad scan",
+                 disc.path.name, title.id, anchor)
+
+    for start, length in [(0.0, front_window),
+                          (title.duration - window, window + 60.0)]:
+        if scan(start, length):
+            return result()
     # NO-CARD fallback: nothing in the primary band — widen the front.
     if title.duration > front_window + 5:
-        extra = min(fallback_window, title.duration) - front_window
-        if extra > 0:
-            log.info("%s title %d: no card in primary band; widening front "
-                     "scan to %.0fs", disc.path.name, title.id,
-                     min(fallback_window, title.duration))
-            hit = scan(front_window, extra)
-            if hit:
-                return hit
-    return state["ep"], state["score"]
+        log.info("%s title %d: no card in primary band; widening front scan",
+                 disc.path.name, title.id)
+        if scan(front_window, min(fallback_window, title.duration) - front_window):
+            return result()
+    return result()
 
 
 def ocr_identify(discs: list[Disc], seasons: dict[int, list[Episode]],
@@ -906,10 +928,23 @@ def ocr_identify(discs: list[Disc], seasons: dict[int, list[Episode]],
                            key=lambda t: t.order_key)
             log.info("%s: OCR-identifying %d candidate playlist(s)",
                      d.path.name, len(cands))
+            # learn where this disc puts its card; anchor later episodes there
+            card_ends: list[bool] = []
+            card_offsets: list[float] = []
             for t in cands:
-                ep, score = verify_title(d, t, pool, args.vlm_model,
-                                         args.ollama_host, workdir,
-                                         accept=args.ocr_accept)
+                anchor = None
+                if card_offsets:
+                    from_end = sum(card_ends) * 2 >= len(card_ends)  # majority
+                    off = sorted(card_offsets)[len(card_offsets) // 2]  # median
+                    anchor = (t.duration - off) if from_end else off
+                ep, score, card_time = verify_title(
+                    d, t, pool, args.vlm_model, args.ollama_host, workdir,
+                    accept=args.ocr_accept, anchor=anchor)
+                if card_time is not None and ep and score >= args.ocr_accept:
+                    from_end = card_time > t.duration / 2
+                    card_ends.append(from_end)
+                    card_offsets.append(t.duration - card_time if from_end
+                                        else card_time)
                 if not ep or score < args.ocr_accept:
                     leftovers.append((d, t))
                     log.info("%s pl %d: unmatched (best %.2f)",
@@ -1124,9 +1159,9 @@ def main(argv: Optional[list[str]] = None) -> int:
                                          dir=args.scratch_dir) as tmp:
             for a in targets:
                 season_pool = seasons.get(a.episodes[0].season, [])
-                ep, score = verify_title(a.disc, a.title, season_pool,
-                                         args.vlm_model, args.ollama_host,
-                                         Path(tmp))
+                ep, score, _ = verify_title(a.disc, a.title, season_pool,
+                                            args.vlm_model, args.ollama_host,
+                                            Path(tmp))
                 if ep and score >= 0.8:
                     a.verified_name = ep.name
                     if [ep.number] != [e.number for e in a.episodes]:
