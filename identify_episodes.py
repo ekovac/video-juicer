@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import ast
 import base64
+import fcntl
 import json
 import logging
 import os
@@ -1036,6 +1037,25 @@ def merge_records(existing: list[dict], new: list[dict],
     return merged
 
 
+def write_manifest(out: Path, records: list[dict], merge: bool,
+                   images: list[Path]) -> int:
+    """Write the manifest under an exclusive lock, atomically.
+
+    The lock serializes the read-merge-write so two runs targeting the same
+    --out can't interleave and corrupt it (a concurrent --merge race once
+    silently dropped already-identified episodes). The temp+rename makes the
+    final file appear atomically. Returns the record count written."""
+    lock = out.with_suffix(out.suffix + ".lock")
+    with open(lock, "w") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        if merge and out.exists():
+            records = merge_records(json.loads(out.read_text()), records, images)
+        tmp = out.with_suffix(out.suffix + ".tmp")
+        tmp.write_text(json.dumps(records, indent=2))
+        os.replace(tmp, out)
+    return len(records)
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("images", nargs="*", type=Path,
@@ -1214,14 +1234,15 @@ def main(argv: Optional[list[str]] = None) -> int:
                                 "title": rip_title_number(d, t),
                                 "kind": "play_all",
                                 "title_seconds": round(t.duration, 1)})
-    if args.merge and args.out.exists():
-        existing = json.loads(args.out.read_text())
-        before = len(records)
-        records = merge_records(existing, records, args.images)
+    before = len(records)
+    total = write_manifest(args.out, records, args.merge, args.images)
+    if args.merge:
         log.info("merged %d new record(s) into %s (%d total)",
-                 before, args.out, len(records))
-    args.out.write_text(json.dumps(records, indent=2))
-    log.info("wrote %s (%d records)", args.out, len(records))
+                 before, args.out, total)
+    else:
+        log.info("wrote %s (%d records)", args.out, total)
+    # re-read for the validation summary so it reflects the merged file
+    records = json.loads(args.out.read_text())
 
     # human-readable table
     print(f"\n{show} — {len(all_assignments)} titles matched")
@@ -1260,10 +1281,26 @@ def main(argv: Optional[list[str]] = None) -> int:
     problems = [f"S{s:02d}: matched {by_season.get(s, 0)}/{len(eps)}"
                 for s, eps in sorted(seasons.items())
                 if by_season.get(s, 0) != len(eps) and s in covered_seasons]
+
+    # Cross-disc duplicates: the same episode claimed by records on different
+    # discs. (A single + its combined double live on one disc, so same image —
+    # those are fine.) Per-run collision resolution can't see across discs, so
+    # a --merge can leave two discs both claiming an episode; flag it.
+    ep_imgs: dict[tuple, set] = {}
+    for r in records:
+        if r.get("kind") == "episode":
+            for n in r.get("episodes", []):
+                ep_imgs.setdefault((r["season"], n), set()).add(r["image"])
+    crossdisc = {k: v for k, v in ep_imgs.items() if len(v) > 1}
+
     if problems:
         print("\nWARNING: incomplete coverage: " + "; ".join(problems))
-        return 1
-    return 0
+    if crossdisc:
+        print("\nWARNING: episode claimed on multiple discs (pick one):")
+        for (s, n), imgs in sorted(crossdisc.items()):
+            print(f"  S{s:02d}E{n:02d}: " + ", ".join(
+                Path(i).name for i in sorted(imgs)))
+    return 1 if (problems or crossdisc) else 0
 
 
 if __name__ == "__main__":
