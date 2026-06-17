@@ -550,6 +550,43 @@ def classify_disc(disc: Disc, expected_runtime: float) -> list[Title]:
     return ordered
 
 
+def assess_ordering(disc: Disc, assignments: list["Assignment"],
+                    tol: float = CLEAN_MATCH_TOL) -> tuple[bool, str]:
+    """Whether a disc's episode ORDER can be trusted from the metadata path.
+
+    Identity there rests on title/playlist position plus a runtime match,
+    aligned monotonically (the aligner can't reorder). Reliable for DVD
+    (lsdvd title order) but not Blu-ray, where .mpls order has been scrambled
+    vs broadcast (Avatar, MOTU). Signals, in order:
+      - DVD, or a play-all whose chapters matched the titles, or multi-part
+        "(1)/(2)" names in sequence  -> order corroborated;
+      - episodes ~all one length     -> runtime can't order them at all;
+      - large alignment deltas        -> the monotonic order conflicts with
+        the TMDB runtimes, i.e. the playlist order is likely scrambled;
+      - otherwise the runtimes fit the order -> trust it.
+    Returns (verifiable, reason)."""
+    if len(assignments) <= 1:
+        return True, "single title"
+    if disc.format == "dvd":
+        return True, "DVD title order"
+    if any(t.kind == "play-all" for t in disc.titles):
+        return True, "play-all corroborates order"
+    eps = [e for a in assignments for e in a.episodes]
+    if sum(1 for e in eps if re.search(r"\(\d+\)\s*$", e.name)) >= 2:
+        return True, "multi-part titles corroborate order"
+    rts = sorted(e.runtime for e in eps if e.runtime)
+    min_gap = min((rts[i + 1] - rts[i] for i in range(len(rts) - 1)),
+                  default=tol + 1)
+    if min_gap <= tol:                 # two episodes runtime-indistinguishable
+        return False, (f"Blu-ray, episodes not runtime-separable (two within "
+                       f"{min_gap:.0f}s) — order can't be verified")
+    worst = max((a.delta for a in assignments), default=0.0)
+    if worst > 1.5 * tol:              # monotonic order fights the runtimes
+        return False, (f"Blu-ray playlist order conflicts with TMDB runtimes "
+                       f"(worst delta {worst:.0f}s) — likely scrambled")
+    return True, f"runtimes uniquely fit the order (worst delta {worst:.0f}s)"
+
+
 # ---------------------------------------------------------------------------
 # Stage 3c: monotonic DP alignment (Needleman-Wunsch with merge moves)
 # ---------------------------------------------------------------------------
@@ -1300,6 +1337,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             "delta_seconds": round(a.delta, 1),
             "confidence": a.confidence,
             "verified_by_titlecard": a.verified_name is not None,
+            "identified_by": "title-card" if args.ocr_identify else "runtime-align",
             "suggested_filename": suggested_filename(show, a.episodes),
         })
         if e0.aired_season is not None:
@@ -1378,6 +1416,20 @@ def main(argv: Optional[list[str]] = None) -> int:
                 ep_imgs.setdefault((r["season"], n), set()).add(r["image"])
     crossdisc = {k: v for k, v in ep_imgs.items() if len(v) > 1}
 
+    # Orderability: in the metadata path, can each disc's episode ORDER be
+    # trusted, or does identity rest on an unreliable playlist position?
+    # (OCR-identify pins identity by content, so it's exempt.)
+    unverifiable = []
+    if not args.ocr_identify:
+        per_disc: dict[Path, list[Assignment]] = {}
+        for a in all_assignments:
+            per_disc.setdefault(a.disc.path, []).append(a)
+        for path, asgs in per_disc.items():
+            asgs.sort(key=lambda a: a.title.order_key)
+            ok, reason = assess_ordering(asgs[0].disc, asgs)
+            if not ok:
+                unverifiable.append((path.name, reason))
+
     if problems:
         print("\nWARNING: incomplete coverage: " + "; ".join(problems))
     if crossdisc:
@@ -1385,7 +1437,13 @@ def main(argv: Optional[list[str]] = None) -> int:
         for (s, n), imgs in sorted(crossdisc.items()):
             print(f"  S{s:02d}E{n:02d}: " + ", ".join(
                 Path(i).name for i in sorted(imgs)))
-    return 1 if (problems or crossdisc) else 0
+    if unverifiable:
+        print("\nWARNING: episode ORDER unverifiable from metadata — the "
+              "mapping below is a guess. Re-run with --ocr-identify to pin "
+              "identities by title card:")
+        for name, reason in unverifiable:
+            print(f"  {name}: {reason}")
+    return 1 if (problems or crossdisc or unverifiable) else 0
 
 
 if __name__ == "__main__":

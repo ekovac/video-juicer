@@ -373,6 +373,66 @@ class HandBrakeTitleTest(unittest.TestCase):
         self.assertEqual(ie.rip_title_number(d, d.titles[0]), 3)
 
 
+class OrderabilityTest(unittest.TestCase):
+    def _asgs(self, d, specs, names=None):
+        # specs: list of (runtime, delta); names optional
+        names = names or [f"E{i+1}" for i in range(len(specs))]
+        out = []
+        for i, (rt, delta) in enumerate(specs):
+            ep = ie.Episode(1, i + 1, names[i], rt)
+            t = title(i + 1, rt)
+            out.append(ie.Assignment(d, t, [ep], delta, "high"))
+        return out
+
+    def test_dvd_always_orderable(self):
+        d = disc([], fmt="dvd")
+        ok, _ = ie.assess_ordering(d, self._asgs(d, [(1440, 5)] * 5))
+        self.assertTrue(ok)
+
+    def test_bluray_same_runtime_unverifiable(self):
+        d = disc([], fmt="bluray")
+        ok, why = ie.assess_ordering(d, self._asgs(d, [(1500, 8)] * 5))
+        self.assertFalse(ok)
+        self.assertIn("runtime-separable", why)
+
+    def test_bluray_near_equal_runtimes_unverifiable(self):
+        # MOTU D1 case: 25-27min episodes, small deltas, but two are equal
+        d = disc([], fmt="bluray")
+        ok, why = ie.assess_ordering(
+            d, self._asgs(d, [(1500, 40), (1500, 70), (1560, 70), (1560, 20), (1620, 120)]))
+        self.assertFalse(ok)
+        self.assertIn("runtime-separable", why)
+
+    def test_bluray_scrambled_large_deltas_unverifiable(self):
+        # varied runtimes but big deltas => monotonic order conflicts => scramble
+        d = disc([], fmt="bluray")
+        ok, why = ie.assess_ordering(
+            d, self._asgs(d, [(1400, 40), (1500, 300), (1900, 370), (1300, 130)]))
+        self.assertFalse(ok)
+        self.assertIn("scrambled", why)
+
+    def test_bluray_runtimes_fit_orderable(self):
+        # varied runtimes, small deltas => order fits the runtimes
+        d = disc([], fmt="bluray")
+        ok, _ = ie.assess_ordering(
+            d, self._asgs(d, [(1200, 10), (1500, 12), (1800, 8), (2100, 15)]))
+        self.assertTrue(ok)
+
+    def test_bluray_multipart_corroborates(self):
+        d = disc([], fmt="bluray")
+        names = ["Storm Front (1)", "Storm Front (2)", "Home", "Borderland (1)"]
+        ok, why = ie.assess_ordering(d, self._asgs(d, [(2640, 300)] * 4, names))
+        self.assertTrue(ok)
+        self.assertIn("multi-part", why)
+
+    def test_bluray_play_all_corroborates(self):
+        d = disc([title(1, 7200, [1440]*5)], fmt="bluray")
+        d.titles[0].kind = "play-all"
+        ok, why = ie.assess_ordering(d, self._asgs(d, [(1440, 200)] * 5))
+        self.assertTrue(ok)
+        self.assertIn("play-all", why)
+
+
 class LengthFilterTest(unittest.TestCase):
     def _pool(self, runtimes):
         return [ie.Episode(1, i + 1, f"E{i+1}", rt)
