@@ -95,6 +95,7 @@ class Assignment:
     delta: float
     confidence: str              # high | medium | low
     verified_name: Optional[str] = None
+    method: str = ""             # provenance, e.g. "elimination"
 
 
 def run(cmd: list[str], timeout: int = 300, **kw) -> subprocess.CompletedProcess:
@@ -1062,7 +1063,59 @@ def ocr_identify(discs: list[Disc], seasons: dict[int, list[Episode]],
     missed = [e for n in sorted(seasons) for e in seasons[n]
               if (e.season, e.number) not in claimed
               and (not hinted or e.season in hinted)]
-    return final, leftovers, missed
+    return recover_by_elimination(final, leftovers, missed)
+
+
+def recover_by_elimination(final: list[Assignment],
+                           leftovers: list[tuple[Disc, Title]],
+                           missed: list[Episode]
+                           ) -> tuple[list[Assignment], list[tuple[Disc, Title]], list[Episode]]:
+    """Pin an unmatched candidate to the one episode it must be.
+
+    Some episodes show no on-screen title (a premiere whose card is the
+    series-logo sequence, e.g. MOTU E01/E06), so OCR leaves them as leftovers.
+    But when a disc has exactly one unmatched candidate and exactly one of the
+    still-missing episodes is adjacent to that disc's matched run, the leftover
+    must be that episode. Constraint-propagate so a disc with only one option
+    (D2: only E06 borders E07-E10) resolves first and frees the ambiguous one
+    (D1: E01 or E06 -> E01 once E06 is taken)."""
+    missing = {(e.season, e.number): e for e in missed}
+    left_by_disc: dict[Path, list[tuple[Disc, Title]]] = {}
+    for d, t in leftovers:
+        left_by_disc.setdefault(d.path, []).append((d, t))
+    matched_by_disc: dict[Path, set] = {}
+    for a in final:
+        s = matched_by_disc.setdefault(a.disc.path, set())
+        s.update((e.season, e.number) for e in a.episodes)
+
+    recovered: list[tuple[Disc, Title, Episode]] = []
+    changed = True
+    while changed and missing:
+        changed = False
+        for path, lefts in left_by_disc.items():
+            if len(lefts) != 1:           # only unambiguous single-leftover discs
+                continue
+            matched = matched_by_disc.get(path, set())
+            opts = [k for k in missing
+                    if (k[0], k[1] - 1) in matched or (k[0], k[1] + 1) in matched]
+            if len(opts) == 1:
+                d, t = lefts[0]
+                ep = missing.pop(opts[0])
+                matched.add(opts[0])
+                left_by_disc[path] = []
+                recovered.append((d, t, ep))
+                changed = True
+
+    consumed = set()
+    for d, t, ep in recovered:
+        delta = abs(t.duration - (ep.runtime or t.duration))
+        final.append(Assignment(d, t, [ep], delta, "medium", method="elimination"))
+        consumed.add((str(d.path), t.id))
+        log.info("%s pl %d: no title card — recovered S%02dE%02d %r by "
+                 "elimination", d.path.name, t.id, ep.season, ep.number, ep.name)
+    leftovers = [(d, t) for d, t in leftovers
+                 if (str(d.path), t.id) not in consumed]
+    return final, leftovers, list(missing.values())
 
 
 def vlm_available(model: str, host: str) -> bool:
@@ -1413,7 +1466,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             "delta_seconds": round(a.delta, 1),
             "confidence": a.confidence,
             "verified_by_titlecard": a.verified_name is not None,
-            "identified_by": "title-card" if args.ocr_identify else "runtime-align",
+            "identified_by": a.method or (
+                "title-card" if args.ocr_identify else "runtime-align"),
             "suggested_filename": suggested_filename(show, a.episodes),
         })
         if e0.aired_season is not None:

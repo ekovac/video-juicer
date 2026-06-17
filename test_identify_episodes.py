@@ -433,6 +433,34 @@ class OrderabilityTest(unittest.TestCase):
         self.assertIn("play-all", why)
 
 
+class EliminationTest(unittest.TestCase):
+    def test_premiere_recovered_by_elimination(self):
+        # MOTU: D1 has E02-E05 + one unmatched (E01, no title card);
+        # D2 has E07-E10 + one unmatched (E06). Constraint-propagate.
+        d1 = ie.Disc(path=Path("D1"), format="bluray", label="")
+        d2 = ie.Disc(path=Path("D2"), format="bluray", label="")
+        ep = lambda n: ie.Episode(1, n, f"E{n}", 1500)
+        asg = lambda d, n: ie.Assignment(d, title(n, 1500), [ep(n)], 5.0, "high")
+        final = [asg(d1, n) for n in (2, 3, 4, 5)] + [asg(d2, n) for n in (7, 8, 9, 10)]
+        leftovers = [(d1, title(91, 1500)), (d2, title(92, 1500))]
+        f2, l2, m2 = ie.recover_by_elimination(final, leftovers, [ep(1), ep(6)])
+        self.assertEqual(m2, [])
+        self.assertEqual(l2, [])
+        elim = {a.episodes[0].number: a.disc.path for a in f2 if a.method == "elimination"}
+        self.assertEqual(elim, {1: Path("D1"), 6: Path("D2")})
+
+    def test_ambiguous_left_alone(self):
+        # two unmatched on one disc -> can't disambiguate -> leave them
+        d = ie.Disc(path=Path("D"), format="bluray", label="")
+        ep = lambda n: ie.Episode(1, n, f"E{n}", 1500)
+        final = [ie.Assignment(d, title(n, 1500), [ep(n)], 5.0, "high")
+                 for n in (2, 3)]
+        f2, l2, m2 = ie.recover_by_elimination(
+            final, [(d, title(91, 1500)), (d, title(92, 1500))], [ep(1), ep(4)])
+        self.assertEqual(len(l2), 2)
+        self.assertEqual(len(m2), 2)
+
+
 class LengthFilterTest(unittest.TestCase):
     def _pool(self, runtimes):
         return [ie.Episode(1, i + 1, f"E{i+1}", rt)
