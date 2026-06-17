@@ -228,6 +228,45 @@ def dedup_subset_playlists(titles: list[Title]) -> list[Title]:
     return [t for t in titles if id(t) not in drop]
 
 
+def order_by_playall(titles: list[Title]) -> Optional[Title]:
+    """Use a play-all's clip sequence to set episode order_keys exactly.
+
+    A Blu-ray "play all" is one playlist whose clips are the ordered union of
+    the episode clips. Its clip order IS broadcast order — so it pins the
+    episodes' sequence even when they're all the same runtime and the .mpls
+    numbering is scrambled (Avatar), the one case duration-based ordering and
+    the .mpls order both fail. Sets each covered episode's order_key to its
+    rank in the play-all and marks the play-all kind="play-all" (so
+    assess_ordering trusts the order). Returns the play-all, or None.
+
+    Robust to shared intro/outro clips: a clip in >1 covered episode is shared,
+    so episodes are ranked by their *distinguishing* clip's position."""
+    from collections import Counter
+    if len(titles) < 4:
+        return None
+    cands = []
+    for pa in titles:
+        clipset = set(pa.clips)
+        cov = [t for t in titles if t is not pa and t.clips
+               and t.duration > 600 and set(t.clips) <= clipset]
+        if len(cov) >= 3:
+            cands.append((pa, cov))
+    if not cands:
+        return None
+    pa, cov = max(cands, key=lambda pc: (len(pc[1]), -pc[0].duration))
+    pos = {c: i for i, c in enumerate(pa.clips)}
+    freq = Counter(c for t in cov for c in set(t.clips))
+    def rank(t):
+        uniq = [pos[c] for c in t.clips if freq[c] == 1 and c in pos]
+        return min(uniq) if uniq else min(pos[c] for c in t.clips if c in pos)
+    for k, t in enumerate(sorted(cov, key=rank)):
+        t.order_key = k
+    pa.kind = "play-all"
+    log.info("play-all clip order: %d episodes ordered from playlist %d",
+             len(cov), pa.id)
+    return pa
+
+
 def scan_bluray(path: Path) -> Disc:
     """Read playlists from BDMV/PLAYLIST. Only the small .mpls files are read."""
     playlists: dict[int, bytes] = {}
@@ -259,6 +298,7 @@ def scan_bluray(path: Path) -> Disc:
             cells=info["n_items"], clips=info["clips"], order_key=num,
         ))
     titles = dedup_subset_playlists(titles)
+    order_by_playall(titles)   # exact ordering when a play-all is present
     disc = Disc(path=path, format="bluray", label=label, titles=titles)
     disc.hb_map = handbrake_title_map(path)
     return disc

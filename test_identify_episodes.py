@@ -273,6 +273,27 @@ class MplsTest(unittest.TestCase):
         self.assertIsNone(ie.parse_mpls(b""))
 
 
+class PlayAllOrderTest(unittest.TestCase):
+    def _t(self, id, dur, clips):
+        return ie.Title(id=id, duration=float(dur), chapters=[],
+                        clips=tuple(clips), order_key=id)
+
+    def test_clip_order_overrides_scrambled_mpls(self):
+        # play-all clips give broadcast order a,b,c; .mpls ids are scrambled
+        pa = self._t(100, 4500, ("intro", "a", "b", "c"))
+        e_c = self._t(5, 1500, ("intro", "c"))   # mpls5 but plays last
+        e_a = self._t(3, 1500, ("intro", "a"))   # mpls3 but plays first
+        e_b = self._t(4, 1500, ("intro", "b"))
+        found = ie.order_by_playall([pa, e_c, e_a, e_b])
+        self.assertIs(found, pa)
+        self.assertEqual(found.kind, "play-all")
+        self.assertEqual((e_a.order_key, e_b.order_key, e_c.order_key), (0, 1, 2))
+
+    def test_no_playall_returns_none(self):
+        ts = [self._t(i, 1500, (c,)) for i, c in enumerate("abcd")]
+        self.assertIsNone(ie.order_by_playall(ts))
+
+
 class SubsetDedupTest(unittest.TestCase):
     def _t(self, id, dur, clips):
         return ie.Title(id=id, duration=float(dur), chapters=[], clips=clips,
