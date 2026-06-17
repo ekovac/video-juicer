@@ -1,24 +1,16 @@
 """Episode matching: metadata alignment, title-card OCR, and manifest output."""
 from __future__ import annotations
 
-import argparse
-import ast
 import base64
 import fcntl
 import json
-import logging
 import os
 import re
-import shutil
-import struct
 import subprocess
-import sys
-import tempfile
 import time
 import unicodedata
 import urllib.error
 import urllib.request
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 

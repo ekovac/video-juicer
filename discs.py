@@ -1,21 +1,13 @@
 """Disc scanning (DVD/Blu-ray), TMDB metadata, and the shared data model."""
 from __future__ import annotations
 
-import argparse
 import ast
-import base64
-import fcntl
 import json
 import logging
-import os
 import re
 import shutil
 import struct
 import subprocess
-import sys
-import tempfile
-import time
-import unicodedata
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field

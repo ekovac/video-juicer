@@ -7,9 +7,19 @@ granular VLM notes; this file is the *why* and the traps. Keep it current.
 
 ## What this is
 
-One script: maps the playable titles on DVD/Blu-ray disc images (or BDMV/VIDEO_TS
-backup dirs) to TMDB episodes. Metadata-first; escalates to local-VLM title-card
-OCR only when metadata can't be trusted. Reads disc *metadata* only (IFO via
+Maps the playable titles on DVD/Blu-ray disc images (or BDMV/VIDEO_TS backup
+dirs) to TMDB episodes. Metadata-first; escalates to local-VLM title-card OCR
+only when metadata can't be trusted.
+
+Layout (split from one 1600-line script):
+- `discs.py` — data model (Title/Disc/Episode/Assignment), disc scanning
+  (DVD/Blu-ray, MPLS, dedup, play-all clip ordering, HandBrake titles, hints),
+  TMDB client. `log` and `run()` live here.
+- `identify.py` — matching: metadata alignment + orderability, title-card OCR
+  (verify_title/ocr_identify/probe/elimination), manifest output. Imports the
+  model from `discs`.
+- `identify_episodes.py` — CLI/`main`; re-exports both modules, so
+  `import identify_episodes` and `python3 identify_episodes.py` are unchanged. Reads disc *metadata* only (IFO via
 `lsdvd`, `.mpls` playlists via `7z`/parse) — never the multi-GB payload, so peak
 RSS stays ~140 MB. Output: `manifest.json` (one record per title) + Plex-style
 filenames + `HandBrakeCLI` rip commands.
