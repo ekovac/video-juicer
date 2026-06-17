@@ -971,6 +971,22 @@ def valid_episode_lengths(pool: list[Episode], max_parts: int = 4
     return sorted(lengths), max(120.0, 0.1 * median)
 
 
+def episode_candidates(disc: Disc, pool: list[Episode]) -> list[Title]:
+    """Episode-length playlists on a disc, in play order — the candidates an
+    OCR pass should consider. Uses the TMDB runtime set when available, else a
+    wide band around the median."""
+    bands = valid_episode_lengths(pool)
+    if bands:
+        lengths, tol = bands
+        ok = lambda dur: min(abs(dur - v) for v in lengths) <= tol
+    else:
+        rts = [e.runtime for e in pool if e.runtime]
+        expected = sorted(rts)[len(rts) // 2] if rts else 1320.0
+        ok = lambda dur: expected * 0.6 <= dur <= expected * 2.6
+    return sorted([t for t in disc.titles if ok(t.duration)],
+                  key=lambda t: t.order_key)
+
+
 def ocr_identify(discs: list[Disc], seasons: dict[int, list[Episode]],
                  args, workdir: Path
                  ) -> tuple[list[Assignment], list[tuple[Disc, Title]], list[Episode]]:
@@ -987,17 +1003,8 @@ def ocr_identify(discs: list[Disc], seasons: dict[int, list[Episode]],
     for season, group in group_discs(discs):
         pool = (seasons.get(season) or
                 [e for n in sorted(seasons) for e in seasons[n]])
-        runtimes = sorted(e.runtime for e in pool if e.runtime)
-        expected = runtimes[len(runtimes) // 2] if runtimes else 1320.0
-        bands = valid_episode_lengths(pool)
-        if bands:
-            lengths, tol = bands
-            in_band = lambda dur: min(abs(dur - v) for v in lengths) <= tol
-        else:                                      # no TMDB runtimes: wide band
-            in_band = lambda dur: expected * 0.6 <= dur <= expected * 2.6
         for d in group:
-            cands = sorted((t for t in d.titles if in_band(t.duration)),
-                           key=lambda t: t.order_key)
+            cands = episode_candidates(d, pool)
             log.info("%s: OCR-identifying %d candidate playlist(s)",
                      d.path.name, len(cands))
             # learn where this disc puts its card; anchor later episodes there
@@ -1056,6 +1063,43 @@ def ocr_identify(discs: list[Disc], seasons: dict[int, list[Episode]],
               if (e.season, e.number) not in claimed
               and (not hinted or e.season in hinted)]
     return final, leftovers, missed
+
+
+def vlm_available(model: str, host: str) -> bool:
+    """Is the Ollama VLM reachable and the model pulled?"""
+    try:
+        with urllib.request.urlopen(f"{host}/api/tags", timeout=10) as r:
+            names = {m.get("name", "") for m in json.loads(r.read()).get("models", [])}
+    except Exception:  # noqa: BLE001 — daemon down / network / bad JSON
+        return False
+    base = model.split(":")[0]
+    return model in names or any(n.split(":")[0] == base for n in names)
+
+
+def probe_card_presence(discs: list[Disc], seasons: dict[int, list[Episode]],
+                        args, workdir: Path, n: int = 2) -> bool:
+    """Cheap gate before a full OCR escalation: do episodes caption their
+    titles on screen at all? OCR up to n candidate playlists (skipping each
+    disc's first/last to dodge premiere/finale intro quirks) and return True
+    as soon as one matches an episode title."""
+    probed = 0
+    for season, group in group_discs(discs):
+        pool = (seasons.get(season) or
+                [e for s in sorted(seasons) for e in seasons[s]])
+        for d in group:
+            cands = episode_candidates(d, pool)
+            mids = cands[1:-1] or cands          # avoid first/last
+            for t in mids:
+                ep, score, _ = verify_title(d, t, pool, args.vlm_model,
+                                            args.ollama_host, workdir,
+                                            accept=args.ocr_accept)
+                probed += 1
+                log.info("card probe: %s pl %d -> %.2f", d.path.name, t.id, score)
+                if ep and score >= args.ocr_accept:
+                    return True
+                if probed >= n:
+                    return False
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -1209,6 +1253,11 @@ def main(argv: Optional[list[str]] = None) -> int:
                     help="identify every candidate playlist by OCRing its "
                          "title card instead of metadata alignment — for "
                          "irregular discs (duplicate/combined playlists)")
+    ap.add_argument("--auto", action="store_true",
+                    help="run the metadata path, and if a disc's episode order "
+                         "is unverifiable, auto-escalate to --ocr-identify "
+                         "(gated on a 2-playlist card-presence probe + an "
+                         "available VLM)")
     ap.add_argument("--ocr-accept", type=float, default=0.8,
                     help="min fuzzy score to accept an OCR title match (0-1)")
     ap.add_argument("--scratch-dir", type=Path, default=None,
@@ -1283,6 +1332,33 @@ def main(argv: Optional[list[str]] = None) -> int:
             all_assignments += assignments
             all_leftovers += leftovers
             all_missed += missed
+
+        # --auto: if any disc's order is unverifiable, escalate to OCR — but
+        # only if a VLM is up and a quick probe shows the show captions titles.
+        per_disc: dict[Path, list[Assignment]] = {}
+        for a in all_assignments:
+            per_disc.setdefault(a.disc.path, []).append(a)
+        unverifiable = [
+            asgs[0].disc for asgs in per_disc.values()
+            if not assess_ordering(asgs[0].disc,
+                                   sorted(asgs, key=lambda a: a.title.order_key))[0]]
+        if args.auto and unverifiable:
+            with tempfile.TemporaryDirectory(prefix="identify-eps-auto-",
+                                             dir=args.scratch_dir) as tmp:
+                if not vlm_available(args.vlm_model, args.ollama_host):
+                    log.warning("%d disc(s) unverifiable but no VLM at %s — "
+                                "keeping the metadata mapping (flagged)",
+                                len(unverifiable), args.ollama_host)
+                elif probe_card_presence(discs, seasons, args, Path(tmp)):
+                    log.warning("episode order unverifiable; on-screen titles "
+                                "present — escalating to OCR-identify")
+                    args.ocr_identify = True   # records get title-card provenance
+                    all_assignments, all_leftovers, all_missed = ocr_identify(
+                        discs, seasons, args, Path(tmp))
+                else:
+                    log.warning("episode order unverifiable and no on-screen "
+                                "titles found — keeping the metadata mapping "
+                                "(flagged); neither path can confirm it")
 
     # leftovers may be TMDB specials: best-effort runtime match against S0
     special_notes: dict[int, str] = {}
