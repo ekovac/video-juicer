@@ -20,10 +20,22 @@ Needs `lsdvd`,`7z`; OCR also needs `ffmpeg`/`mencoder` + Ollama; `TMDB_API_KEY` 
 
 ## Core idea: trust metadata, escalate to OCR only when ambiguous
 
+Three sources of canonical episode ORDER, cheapest first:
+1. **DVD (lsdvd) title order** — reliable.
+2. **A Blu-ray play-all's clip sequence** (`order_by_playall`) — a play-all's
+   clips are the ordered union of the episode clips, so its order IS broadcast
+   order, *exact even for same-runtime scrambled discs*. Free, no OCR. Avatar
+   has one; MOTU does not. Sets `order_key` + marks `kind="play-all"`.
+3. **Title-card OCR** — when neither of the above is available.
+
 `assess_ordering` decides per disc whether the episode ORDER can be trusted:
 - **DVD (lsdvd) title order is reliable.**
 - **Blu-ray `.mpls` playlist order is NOT broadcast order** — scrambled on Avatar
-  and MOTU (verified by OCR). Never trust it without corroboration.
+  and MOTU (verified by OCR). Trust it only via a play-all, multi-part names,
+  or runtime-separability; else escalate to OCR.
+- Caveat: a play-all fixes ORDER, not identity — on a disc that also has the
+  dup/double/featurette mess (Avatar), it makes the order trustworthy but the
+  candidate set may still need OCR; `--ocr-identify` is the override.
 - Verifiable iff: DVD, OR a play-all whose chapters matched the titles, OR
   multi-part "(1)/(2)" names appear in sequence, OR runtimes are uniquely
   separable (min pairwise gap > tol) with small alignment deltas. Else
