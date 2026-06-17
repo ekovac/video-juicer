@@ -3,3 +3,5 @@ discs/
 __pycache__/
 manifest.json
 debug_frames*/
+*.json.lock
+*.json.tmp
