@@ -905,6 +905,35 @@ def verify_title(disc: Disc, title: Title, episodes: list[Episode],
     return result()
 
 
+def valid_episode_lengths(pool: list[Episode], max_parts: int = 4
+                          ) -> Optional[tuple[list[float], float]]:
+    """Plausible playlist durations (seconds) for episode candidates.
+
+    Instead of a wide multiplier band around the median (which admits
+    gap-length extras like a 35-min featurette on a 24-min show), build a
+    discrete set of real lengths:
+      - each TMDB per-episode runtime (handles a feature-length pilot/finale
+        that TMDB reports correctly, e.g. Broken Bow = 86 min);
+      - small integer multiples of the median runtime — robust to TMDB
+        reporting a wrong/null runtime for a long episode, since a 2x-length
+        episode still lands on 2*median;
+      - sums of consecutive episodes, for combined multi-part playlists.
+    Returns (sorted_lengths, tolerance), or None when TMDB gives no runtimes
+    at all (caller falls back to the wide band)."""
+    rts = [e.runtime for e in pool if e.runtime]
+    if not rts:
+        return None
+    median = sorted(rts)[len(rts) // 2]
+    lengths = set(rts)
+    lengths |= {k * median for k in range(1, max_parts + 1)}
+    for n in range(2, max_parts + 1):       # combined multi-parters
+        for i in range(len(pool) - n + 1):
+            seg = [pool[i + j].runtime for j in range(n)]
+            if all(seg):
+                lengths.add(sum(seg))
+    return sorted(lengths), max(120.0, 0.1 * median)
+
+
 def ocr_identify(discs: list[Disc], seasons: dict[int, list[Episode]],
                  args, workdir: Path
                  ) -> tuple[list[Assignment], list[tuple[Disc, Title]], list[Episode]]:
@@ -923,9 +952,14 @@ def ocr_identify(discs: list[Disc], seasons: dict[int, list[Episode]],
                 [e for n in sorted(seasons) for e in seasons[n]])
         runtimes = sorted(e.runtime for e in pool if e.runtime)
         expected = runtimes[len(runtimes) // 2] if runtimes else 1320.0
-        lo, hi = expected * 0.6, expected * 2.6   # singles through doubles
+        bands = valid_episode_lengths(pool)
+        if bands:
+            lengths, tol = bands
+            in_band = lambda dur: min(abs(dur - v) for v in lengths) <= tol
+        else:                                      # no TMDB runtimes: wide band
+            in_band = lambda dur: expected * 0.6 <= dur <= expected * 2.6
         for d in group:
-            cands = sorted((t for t in d.titles if lo <= t.duration <= hi),
+            cands = sorted((t for t in d.titles if in_band(t.duration)),
                            key=lambda t: t.order_key)
             log.info("%s: OCR-identifying %d candidate playlist(s)",
                      d.path.name, len(cands))
@@ -1037,6 +1071,56 @@ def merge_records(existing: list[dict], new: list[dict],
     return merged
 
 
+def resolve_cross_disc(records: list[dict]) -> list[dict]:
+    """Demote cross-disc duplicate episode claims to extras.
+
+    The same episode claimed by records on different discs (a featurette that
+    names an episode, a recap, a redundant playlist) can't be caught by length
+    or per-disc collision resolution. Keep the claim on the disc with the most
+    of that episode's neighbours present — the real home sits in a contiguous
+    run; an impostor is alone amid a different stretch — and demote the others.
+    Ties (no clear contiguous winner) are left for the validation warning."""
+    eps = [r for r in records if r.get("kind") == "episode"]
+    disc_eps: dict[str, set] = {}
+    for r in eps:
+        for n in r.get("episodes", []):
+            disc_eps.setdefault(r["image"], set()).add((r["season"], n))
+
+    claims: dict[tuple, list] = {}
+    for r in eps:
+        for n in r.get("episodes", []):
+            claims.setdefault((r["season"], n), []).append(r)
+
+    def neighbours(r, s, n):
+        return sum((s, n + dd) in disc_eps[r["image"]] for dd in (-2, -1, 1, 2))
+
+    demote: set = set()
+    for (s, n), rs in claims.items():
+        if len({r["image"] for r in rs}) <= 1:
+            continue                       # same disc (single+double) is fine
+        ranked = sorted(rs, key=lambda r: (neighbours(r, s, n), -len(r["episodes"])),
+                        reverse=True)
+        if neighbours(ranked[0], s, n) == neighbours(ranked[1], s, n):
+            continue                       # tie -> leave for the warning
+        for r in ranked[1:]:
+            if r["image"] != ranked[0]["image"]:
+                demote.add(id(r))
+
+    out = []
+    for r in records:
+        if id(r) in demote:
+            log.warning("demoting cross-disc duplicate to extra: %s title %s "
+                        "(S%02dE%02d %r) — kept the disc with the contiguous run",
+                        Path(r["image"]).name, r["title"], r["season"],
+                        r["episodes"][0], r["episode_name"])
+            r = {"image": r["image"], "title": r["title"], "kind": "extra",
+                 "title_seconds": r.get("title_seconds"),
+                 "note": f"cross-disc duplicate of S{r['season']:02d}"
+                         f"E{r['episodes'][0]:02d} {r['episode_name']!r}"}
+        out.append(r)
+    return out
+
+
 def write_manifest(out: Path, records: list[dict], merge: bool,
                    images: list[Path]) -> int:
     """Write the manifest under an exclusive lock, atomically.
@@ -1050,6 +1134,7 @@ def write_manifest(out: Path, records: list[dict], merge: bool,
         fcntl.flock(lf, fcntl.LOCK_EX)
         if merge and out.exists():
             records = merge_records(json.loads(out.read_text()), records, images)
+        records = resolve_cross_disc(records)
         tmp = out.with_suffix(out.suffix + ".tmp")
         tmp.write_text(json.dumps(records, indent=2))
         os.replace(tmp, out)

@@ -373,6 +373,61 @@ class HandBrakeTitleTest(unittest.TestCase):
         self.assertEqual(ie.rip_title_number(d, d.titles[0]), 3)
 
 
+class LengthFilterTest(unittest.TestCase):
+    def _pool(self, runtimes):
+        return [ie.Episode(1, i + 1, f"E{i+1}", rt)
+                for i, rt in enumerate(runtimes)]
+
+    def test_featurette_near_real_runtime_admitted(self):
+        # Avatar: 24/25/26-min episodes -> 25.9-min featurette is a valid len
+        lengths, tol = ie.valid_episode_lengths(self._pool([1440, 1500, 1560] * 5))
+        self.assertLessEqual(min(abs(1554 - v) for v in lengths), tol)
+
+    def test_gap_length_excluded(self):
+        # a 35-min item on a 24-min show matches no single/double/multiple
+        lengths, tol = ie.valid_episode_lengths(self._pool([1440] * 20))
+        self.assertGreater(min(abs(2100 - v) for v in lengths), tol)
+
+    def test_combined_double_admitted(self):
+        lengths, tol = ie.valid_episode_lengths(self._pool([1440] * 20))
+        self.assertLessEqual(min(abs(2880 - v) for v in lengths), tol)  # 2 eps
+
+    def test_long_episode_robust_to_missing_runtime(self):
+        # no TMDB entry near 47 min, but 2*median catches it
+        lengths, tol = ie.valid_episode_lengths(self._pool([1440] * 20))
+        self.assertLessEqual(min(abs(2820 - v) for v in lengths), tol)
+
+    def test_no_runtimes_returns_none(self):
+        self.assertIsNone(ie.valid_episode_lengths(
+            [ie.Episode(1, 1, "x", None)]))
+
+
+class CrossDiscTest(unittest.TestCase):
+    def test_contiguous_run_wins(self):
+        def ep(img, n):
+            return {"image": img, "title": n, "kind": "episode", "season": 1,
+                    "episodes": [n], "episode_name": f"E{n}", "title_seconds": 1440}
+        # B1D2 owns the E12-16 run; B1D3 owns E17-20 but also claims E14
+        recs = ([ep("B1D2", n) for n in (12, 13, 14, 15, 16)]
+                + [ep("B1D3", n) for n in (14, 17, 18, 19, 20)])
+        out = ie.resolve_cross_disc(recs)
+        e14 = [r for r in out if r.get("episodes") == [14]]
+        self.assertEqual(len(e14), 1)                       # one claim left
+        self.assertEqual(e14[0]["image"], "B1D2")           # contiguous disc won
+        demoted = [r for r in out if r["image"] == "B1D3" and r["kind"] == "extra"]
+        self.assertEqual(len(demoted), 1)
+        self.assertIn("cross-disc", demoted[0]["note"])
+
+    def test_same_disc_double_not_demoted(self):
+        # a single + its combined double on one disc is fine, not cross-disc
+        recs = [{"image": "D", "title": 1, "kind": "episode", "season": 1,
+                 "episodes": [12], "episode_name": "A", "title_seconds": 1440},
+                {"image": "D", "title": 2, "kind": "episode", "season": 1,
+                 "episodes": [12, 13], "episode_name": "A & B", "title_seconds": 2880}]
+        out = ie.resolve_cross_disc(recs)
+        self.assertEqual(sum(r["kind"] == "episode" for r in out), 2)
+
+
 class MergeTest(unittest.TestCase):
     def test_merge_replaces_only_reprocessed_discs(self):
         existing = [
