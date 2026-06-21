@@ -6,6 +6,7 @@ import fcntl
 import json
 import os
 import re
+import shlex
 import subprocess
 import time
 import unicodedata
@@ -718,19 +719,69 @@ def sanitize_filename(s: str) -> str:
     return re.sub(r'[<>:"/\\|?*]', "", s).strip()
 
 
-def suggested_filename(show: str, eps: list[Episode]) -> str:
-    nums = "".join(f"E{e.number:02d}" for e in eps)
+def _episode_tag(eps: list[Episode]) -> str:
+    """SxxEyy for a single episode; SxxEyy-Ezz for a multi-episode title.
+
+    The hyphen-joined range is the form Plex and Jellyfin both parse as one
+    file covering several episodes (vs the old E01E02 run, which neither does)."""
+    s = eps[0].season
+    if len(eps) == 1:
+        return f"S{s:02d}E{eps[0].number:02d}"
+    return f"S{s:02d}E{eps[0].number:02d}-E{eps[-1].number:02d}"
+
+
+def suggested_filename(show: str, eps: list[Episode],
+                       year: Optional[int] = None,
+                       tmdb_id: Optional[int] = None) -> str:
+    """Relative library path in the Plex/Jellyfin preferred layout:
+
+        <Show (Year) {tmdb-ID}>/<Season NN>/<Show (Year)> - SxxEyy - Names.mkv
+
+    The TMDB id is an agent-match hint that belongs on the show *folder* only
+    (both servers read `{tmdb-NNN}` there); the file prefix stays clean.
+    Season 0 lands in the "Specials" folder (recognised by both servers).
+    Each path component is sanitised independently, then joined with "/" —
+    the separators in the returned string are deliberate, not stray."""
+    prefix = sanitize_filename(f"{show} ({year})" if year else show)
+    show_dir = prefix + (f" {{tmdb-{tmdb_id}}}" if tmdb_id else "")
+    season = eps[0].season
+    folder = "Specials" if season == 0 else f"Season {season:02d}"
     names = " & ".join(e.name for e in eps)
-    return sanitize_filename(f"{show} - S{eps[0].season:02d}{nums} - {names}.mkv")
+    fname = sanitize_filename(f"{prefix} - {_episode_tag(eps)} - {names}.mkv")
+    return f"{show_dir}/{folder}/{fname}"
 
 
-def emit_rip_commands(records: list[dict], preset: str) -> None:
-    """Print a HandBrakeCLI line per episode record."""
+def emit_rip_commands(records: list[dict], preset: str,
+                      output_prefix: Optional[str] = None) -> None:
+    """Emit a runnable bash rip script (one HandBrakeCLI call per episode).
+
+    The common knobs are hoisted into shell variables at the top so the script
+    can be tweaked after generation without touching every line:
+      PREFIX          output root (e.g. a transcode disk)
+      PRESET          HandBrake preset name
+      HANDBRAKE_OPTS  array of extra flags (e.g. --preset-import-gui to load
+                      GUI-saved presets) — edit it to apply to every rip
+    suggested_filename is a relative path including season folders, so each
+    rip is preceded by an idempotent mkdir -p for its season directory."""
+    print("#!/usr/bin/env bash")
+    print("set -euo pipefail")
+    print()
+    print(f"PREFIX={shlex.quote(str(output_prefix) if output_prefix else '.')}")
+    print(f"PRESET={shlex.quote(preset)}")
+    print("# Extra HandBrakeCLI flags applied to every rip, e.g.:")
+    print("#   HANDBRAKE_OPTS=(--preset-import-gui)")
+    print("HANDBRAKE_OPTS=()")
+    print()
     for r in records:
         if r.get("kind") != "episode":
             continue
-        print(f'HandBrakeCLI -i "{r["image"]}" -t {r["title"]} '
-              f'--preset "{preset}" -o "{r["suggested_filename"]}"')
+        out = r["suggested_filename"]
+        parent = os.path.dirname(out)
+        if parent:
+            print(f'mkdir -p "$PREFIX/{parent}"')
+        print(f'HandBrakeCLI "${{HANDBRAKE_OPTS[@]}}" '
+              f'-i {shlex.quote(r["image"])} -t {r["title"]} '
+              f'--preset "$PRESET" -o "$PREFIX/{out}"')
 
 
 def merge_records(existing: list[dict], new: list[dict],

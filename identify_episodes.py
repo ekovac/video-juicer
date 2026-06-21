@@ -58,6 +58,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--handbrake-preset", default="Fast 1080p30",
                     metavar="PRESET",
                     help='HandBrake preset for rip commands (default: "Fast 1080p30")')
+    ap.add_argument("--output-prefix", type=Path, metavar="DIR",
+                    help="prepend this path to rip-command output files (e.g. a "
+                         "target disk); the Plex/Jellyfin tree is built under it")
     ap.add_argument("--verify", action="store_true",
                     help="OCR title cards of low-confidence matches via Ollama")
     ap.add_argument("--verify-all", action="store_true",
@@ -88,7 +91,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     # Pure transform: emit rip commands from a saved manifest, no scanning.
     if args.from_manifest:
         records = json.loads(args.from_manifest.read_text())
-        emit_rip_commands(records, args.handbrake_preset)
+        emit_rip_commands(records, args.handbrake_preset, args.output_prefix)
         return 0
 
     if not args.images:
@@ -104,6 +107,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     tmdb = Tmdb(args.tmdb_api_key, args.cache_dir / str(args.tv_id))
     series = tmdb.series(args.tv_id)
     show = series["name"]
+    fad = series.get("first_air_date") or ""
+    year = int(fad[:4]) if fad[:4].isdigit() else None
     series_rt = series.get("episode_run_time") or []
     fallback_rt = series_rt[0] * 60.0 if series_rt else None
     if args.episode_order != "aired":
@@ -228,7 +233,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             "verified_by_titlecard": a.verified_name is not None,
             "identified_by": a.method or (
                 "title-card" if args.ocr_identify else "runtime-align"),
-            "suggested_filename": suggested_filename(show, a.episodes),
+            "suggested_filename": suggested_filename(show, a.episodes, year,
+                                                     args.tv_id),
         })
         if e0.aired_season is not None:
             records[-1]["aired"] = [
@@ -281,7 +287,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     if args.emit_rip_commands:
         print("\n# rip commands")
-        emit_rip_commands(records, args.handbrake_preset)
+        emit_rip_commands(records, args.handbrake_preset, args.output_prefix)
 
     # validation summary — count from the written manifest (so a --merge run
     # reflects total coverage across all discs, not just the ones re-run)

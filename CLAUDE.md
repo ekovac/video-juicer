@@ -119,6 +119,23 @@ Three sources of canonical episode ORDER, cheapest first:
   HandBrake scan) — NOT the `.mpls` id and NOT a player's HDMV title-object
   number. All three differ (one Enterprise episode was .mpls 1 = HandBrake t2 =
   VLC title 19, because index.bdmv defined 78 title objects).
+- **`suggested_filename` is a relative path in the Plex/Jellyfin layout**:
+  `<Show (Year) {tmdb-ID}>/<Season NN>/<Show (Year)> - SxxEyy - Names.mkv`. The
+  `{tmdb-ID}` match hint goes on the show *folder* only (both servers read it
+  there) — the file prefix stays clean. Season 0 → the `Specials` folder; a
+  multi-episode title uses `SxxEyy-Ezz` (the hyphen range both servers parse —
+  NOT a bare `E01E02` run). Each path component is sanitised independently; the
+  `/`s are real separators. Year comes from TMDB `first_air_date`.
+- **`emit_rip_commands` emits a runnable bash script**, not bare lines: a
+  `#!/usr/bin/env bash` + `set -euo pipefail` header that hoists the common
+  knobs into shell variables — `PREFIX` (output root), `PRESET`, and
+  `HANDBRAKE_OPTS=()` (an array of extra flags, e.g. `--preset-import-gui` to
+  load GUI-saved presets) — so the script is editable after generation without
+  touching every line. Each rip is a `mkdir -p "$PREFIX/<season>"` then
+  `HandBrakeCLI "${HANDBRAKE_OPTS[@]}" -i <img> -t N --preset "$PRESET" -o
+  "$PREFIX/<path>"`. Image paths are `shlex.quote`d (disc dirs have spaces).
+- `--output-prefix DIR` → sets the script's `PREFIX` (e.g. a target transcode
+  disk); the whole Plex/Jellyfin tree is built under it. Default `PREFIX=.`.
 - `--from-manifest FILE` → emit rip commands from a saved manifest, no scanning.
 - `--merge` → merge a run into the existing `--out`, replacing only the discs
   processed this run.

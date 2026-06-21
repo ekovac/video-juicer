@@ -582,5 +582,88 @@ class HintTest(unittest.TestCase):
         self.assertEqual((d.season_hint, d.disc_hint), (4, None))
 
 
+class NamingTest(unittest.TestCase):
+    def ep(self, season, number, name):
+        return ie.Episode(season=season, number=number, name=name, runtime=1440)
+
+    def test_plex_folder_layout(self):
+        p = ie.suggested_filename("Enterprise", [self.ep(1, 1, "Broken Bow")],
+                                  2001, 314)
+        self.assertEqual(
+            p, "Enterprise (2001) {tmdb-314}/Season 01/"
+               "Enterprise (2001) - S01E01 - Broken Bow.mkv")
+
+    def test_tmdb_id_only_on_show_folder(self):
+        p = ie.suggested_filename("Show", [self.ep(1, 1, "X")], 2010, 99)
+        top, season, fname = p.split("/")
+        self.assertEqual(top, "Show (2010) {tmdb-99}")
+        self.assertNotIn("tmdb", fname)
+
+    def test_multi_episode_range(self):
+        eps = [self.ep(1, 1, "Part One"), self.ep(1, 2, "Part Two")]
+        p = ie.suggested_filename("Show", eps, 2010)
+        self.assertIn("S01E01-E02 - Part One & Part Two", p)
+
+    def test_specials_folder(self):
+        p = ie.suggested_filename("Avatar", [self.ep(0, 3, "Bonus")], 2005)
+        self.assertTrue(p.startswith("Avatar (2005)/Specials/"))
+
+    def test_no_year(self):
+        p = ie.suggested_filename("Show", [self.ep(2, 5, "X")])
+        self.assertEqual(p, "Show/Season 02/Show - S02E05 - X.mkv")
+
+    def test_illegal_chars_stripped_per_component(self):
+        p = ie.suggested_filename("Star Trek: Enterprise",
+                                  [self.ep(1, 1, "A/B?")], 2001)
+        self.assertEqual(p.count("/"), 2)            # only the path separators
+        self.assertNotIn(":", p)
+        self.assertNotIn("?", p)
+
+
+class RipCommandTest(unittest.TestCase):
+    def rec(self):
+        return [{"kind": "episode", "image": "/d/disc.iso", "title": 3,
+                 "suggested_filename": "Show (2001) {tmdb-9}/Season 01/"
+                                       "Show (2001) - S01E01 - X.mkv"}]
+
+    def lines(self, *args):
+        import io
+        from contextlib import redirect_stdout
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            ie.emit_rip_commands(*args)
+        return buf.getvalue().splitlines()
+
+    def test_header_variables(self):
+        out = self.lines(self.rec(), "Fast 1080p30", "/mnt/transcode")
+        self.assertEqual(out[0], "#!/usr/bin/env bash")
+        self.assertIn("PREFIX=/mnt/transcode", out)
+        self.assertIn("PRESET='Fast 1080p30'", out)
+        self.assertIn("HANDBRAKE_OPTS=()", out)
+
+    def test_no_prefix_defaults_to_dot(self):
+        out = self.lines(self.rec(), "Fast 1080p30")
+        self.assertIn("PREFIX=.", out)
+
+    def test_commands_reference_variables(self):
+        out = self.lines(self.rec(), "Fast 1080p30", "/mnt/transcode")
+        mkdir = next(l for l in out if l.startswith("mkdir"))
+        rip = next(l for l in out if l.startswith("HandBrakeCLI"))
+        self.assertEqual(
+            mkdir, 'mkdir -p "$PREFIX/Show (2001) {tmdb-9}/Season 01"')
+        self.assertIn('HandBrakeCLI "${HANDBRAKE_OPTS[@]}"', rip)
+        self.assertIn("--preset \"$PRESET\"", rip)
+        self.assertIn('-o "$PREFIX/Show (2001) {tmdb-9}/Season 01/'
+                      'Show (2001) - S01E01 - X.mkv"', rip)
+        self.assertIn("-i /d/disc.iso", rip)
+
+    def test_image_with_spaces_is_shell_quoted(self):
+        rec = self.rec()
+        rec[0]["image"] = "/run/media/ST ENTERPRISE S1D1"
+        rip = next(l for l in self.lines(rec, "Fast 1080p30")
+                   if l.startswith("HandBrakeCLI"))
+        self.assertIn("-i '/run/media/ST ENTERPRISE S1D1'", rip)
+
+
 if __name__ == "__main__":
     unittest.main()
