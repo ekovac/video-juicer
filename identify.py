@@ -594,11 +594,26 @@ def ocr_identify(discs: list[Disc], seasons: dict[int, list[Episode]],
                 delta = abs(t.duration - sum(e.runtime or 0 for e in eps))
                 raw.append(Assignment(d, t, eps, delta, "high", ep.name))
 
-    # Resolve collisions: each episode claimed once. Prefer single-episode
-    # assignments over doubles, then the longest (most complete) playlist. A
-    # combined double is kept if it carries at least one *unclaimed* episode
-    # (e.g. a finale where E19 exists only inside the E19+E20 double while E20
-    # also has a single) — only dropped when fully redundant.
+    final, claimed = resolve_assignment_collisions(raw, leftovers)
+
+    hinted = {d.season_hint for d in discs if d.season_hint}
+    missed = [e for n in sorted(seasons) for e in seasons[n]
+              if (e.season, e.number) not in claimed
+              and (not hinted or e.season in hinted)]
+    return recover_by_elimination(final, leftovers, missed)
+
+
+def resolve_assignment_collisions(
+        raw: list[Assignment],
+        leftovers: list[tuple[Disc, Title]]
+) -> tuple[list[Assignment], dict[tuple, Assignment]]:
+    """Reduce overlapping OCR assignments to one claim per episode.
+
+    Prefer single-episode assignments over doubles, then the longest (most
+    complete) playlist. A combined double is kept if it carries at least one
+    *unclaimed* episode (e.g. a finale where E19 exists only inside the E19+E20
+    double while E20 also has a single) — only dropped when fully redundant.
+    Demoted titles are appended to `leftovers`. Returns (final, claimed)."""
     final: list[Assignment] = []
     claimed: dict[tuple, Assignment] = {}
     for a in sorted(raw, key=lambda a: (len(a.episodes), -a.title.duration)):
@@ -610,15 +625,31 @@ def ocr_identify(discs: list[Disc], seasons: dict[int, list[Episode]],
                         "episode(s); treating as extra", a.disc.path.name,
                         a.title.id, a.episodes[0].name)
             continue
+        # A retained combined playlist supersedes any same-disc standalone
+        # single it already contains. The double is kept because it is the sole
+        # source of its *other* episode (e.g. E13 lives only inside the E12+E13
+        # playlist); but it also carries E12, which a standalone single already
+        # claimed. Ripping both would duplicate E12's content on disk and make
+        # Plex see S02E12 and S02E12-E13 overlap, so demote the redundant single
+        # to an extra — the merged file is now the source for both episodes.
+        # (Cross-disc dups are resolve_cross_disc's job; this is same-disc only.)
+        for k in keys:
+            if k in unclaimed:
+                continue
+            prev = claimed[k]
+            if (prev.disc is a.disc and len(prev.episodes) < len(a.episodes)
+                    and any(p is prev for p in final)):
+                final = [p for p in final if p is not prev]
+                leftovers.append((prev.disc, prev.title))
+                log.warning("%s pl %d (%r) is contained in combined playlist "
+                            "pl %d (%r); demoting the standalone single to extra",
+                            prev.disc.path.name, prev.title.id,
+                            prev.episodes[0].name, a.title.id, a.episodes[0].name)
+                claimed[k] = a
         for k in unclaimed:
             claimed[k] = a
         final.append(a)
-
-    hinted = {d.season_hint for d in discs if d.season_hint}
-    missed = [e for n in sorted(seasons) for e in seasons[n]
-              if (e.season, e.number) not in claimed
-              and (not hinted or e.season in hinted)]
-    return recover_by_elimination(final, leftovers, missed)
+    return final, claimed
 
 
 def recover_by_elimination(final: list[Assignment],

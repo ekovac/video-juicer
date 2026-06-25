@@ -537,6 +537,56 @@ class CrossDiscTest(unittest.TestCase):
         self.assertEqual(sum(r["kind"] == "episode" for r in out), 2)
 
 
+class CollisionTest(unittest.TestCase):
+    def asg(self, d, tid, dur, eps):
+        return ie.Assignment(d, title(tid, dur), eps, 0.0, "high", eps[0].name)
+
+    def eps(self):
+        return (ie.Episode(2, 11, "K", 1440), ie.Episode(2, 12, "Serpent", 1440),
+                ie.Episode(2, 13, "Drill", 1440))
+
+    def test_double_sole_source_demotes_redundant_single(self):
+        d = disc([])
+        e11, e12, e13 = self.eps()
+        single11 = self.asg(d, 66, 1440, [e11])
+        single12 = self.asg(d, 56, 1440, [e12])       # standalone E12
+        double = self.asg(d, 67, 2880, [e12, e13])    # E13 lives only here
+        leftovers = []
+        final, claimed = ie.resolve_assignment_collisions(
+            [single11, single12, double], leftovers)
+        final_titles = {a.title.id for a in final}
+        self.assertIn(67, final_titles)               # double kept (carries E13)
+        self.assertIn(66, final_titles)               # untouched single kept
+        self.assertNotIn(56, final_titles)            # redundant single demoted
+        self.assertIn(56, {t.id for _, t in leftovers})
+        self.assertEqual(claimed[(2, 12)].title.id, 67)
+        self.assertEqual(claimed[(2, 13)].title.id, 67)
+
+    def test_both_singles_present_double_dropped(self):
+        d = disc([])
+        _, e12, e13 = self.eps()
+        single12 = self.asg(d, 56, 1440, [e12])
+        single13 = self.asg(d, 58, 1440, [e13])
+        double = self.asg(d, 67, 2880, [e12, e13])
+        leftovers = []
+        final, _ = ie.resolve_assignment_collisions(
+            [single12, single13, double], leftovers)
+        final_titles = {a.title.id for a in final}
+        self.assertEqual(final_titles, {56, 58})      # both standalones win
+        self.assertIn(67, {t.id for _, t in leftovers})  # double fully redundant
+
+    def test_cross_disc_single_not_demoted_here(self):
+        # different discs -> left for resolve_cross_disc, not demoted here
+        da, db = disc([], name="A"), disc([], name="B")
+        _, e12, e13 = self.eps()
+        single12 = self.asg(da, 56, 1440, [e12])
+        double = self.asg(db, 67, 2880, [e12, e13])
+        leftovers = []
+        final, _ = ie.resolve_assignment_collisions([single12, double], leftovers)
+        self.assertEqual({a.title.id for a in final}, {56, 67})
+        self.assertEqual(leftovers, [])
+
+
 class MergeTest(unittest.TestCase):
     def test_merge_replaces_only_reprocessed_discs(self):
         existing = [

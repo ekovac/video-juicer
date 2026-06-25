@@ -65,9 +65,17 @@ Three sources of canonical episode ORDER, cheapest first:
 - **Two authoring versions per episode** (body alone vs body+logo/recap) →
   `dedup_subset_playlists`: drop a playlist whose clips are a strict subset of a
   similar-length one (1.5x guard stops a play-all swallowing episodes).
-- **Combined two-parter "double" playlists** (one playlist = 2 episodes, no
-  singles) → claim N and N+1; collision logic keeps a double only for its
-  *unclaimed* episode, so a finale present only inside an E19+E20 double survives.
+- **Combined two-parter "double" playlists** (one playlist = 2 episodes) →
+  claim N and N+1; `resolve_assignment_collisions` (OCR path only — the
+  metadata DP is monotonic and never double-claims) keeps a double only when it
+  carries an *unclaimed* episode, so a finale present only inside an E19+E20
+  double survives. When a kept double *also* contains an episode a same-disc
+  standalone single already claimed (Avatar: single E12 + the E12+E13 double,
+  where E13 lives only in the double), the redundant single is demoted to an
+  extra — else the rip plan emits E12 twice and Plex sees S02E12 vs S02E12-E13
+  overlap. The merged file becomes the source for both; the bundled twin (E12)
+  has no standalone, which is expected for combined-on-disc two-parters.
+  Cross-disc dups are a separate pass (`resolve_cross_disc`).
 - **Featurette that runs episode-length AND names an episode on screen**
   (Avatar "Inside the Korean Animation Studios" said "Chapter 14, The
   Fortuneteller") → false OCR match at 1.0. **Length cannot catch this** — it is
