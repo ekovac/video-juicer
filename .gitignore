@@ -5,3 +5,7 @@ manifest.json
 debug_frames*/
 *.json.lock
 *.json.tmp
+# compiled BD-J probe binaries (sources committed; see BDJ_NOTES.md)
+bdj_probe
+bdj_navigate
+bdj_titlemap
