@@ -234,6 +234,26 @@ class FuzzyTest(unittest.TestCase):
         self.assertEqual(ep.number, 15)
         self.assertGreaterEqual(score, 0.8)
 
+    # Regression (The Magicians): a thinking-model reasoning dump that *names*
+    # a distinctive multi-word title once scored 1.0 — the `distinctive` flag
+    # bypassed the incidental guard — and overrode correct metadata (E01->E04).
+    MAGICIANS = [ie.Episode(1, 1, "Unauthorized Magic", 2520),
+                 ie.Episode(1, 4, "The World in the Walls", 2520)]
+
+    def test_distinctive_title_in_reasoning_dump_rejected(self):
+        _, score = ie.fuzzy_best(
+            "Got it, let's look at the image and transcribe all the text. "
+            "The World in the Walls", self.MAGICIANS)
+        self.assertLess(score, 0.8)
+
+    def test_distinctive_title_with_credit_line_still_matches(self):
+        # a genuine card carrying a credit line must stay conclusive (credits,
+        # unlike reasoning, don't demote a distinctive verbatim hit)
+        ep, score = ie.fuzzy_best(
+            "The World in the Walls   directed by Chris Fisher", self.MAGICIANS)
+        self.assertEqual(ep.number, 4)
+        self.assertGreaterEqual(score, 0.9)
+
 
 def build_mpls(playitems, marks):
     """Minimal valid MPLS: playitems=[(clip, in_t, out_t)], marks=[(type, ref, tick)]."""

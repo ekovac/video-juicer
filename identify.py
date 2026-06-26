@@ -331,14 +331,25 @@ def canon_parts(norm: str) -> str:
         lambda m: _PARTNUM.get(m.group(1), m.group(1)), norm)
 
 
-# Text that means a short word-boundary hit is probably incidental, not a
-# title: opening-credits roles, and the VLM's own reasoning preamble.
-_INCIDENTAL_MARKERS = (
+# Markers that a word-boundary title hit is incidental, not a real card.
+# Two kinds, handled differently in fuzzy_best:
+#  - CREDITS: a genuine card can carry a credit line beside a distinctive
+#    title, so a distinctive verbatim hit there is still trustworthy (1.0).
+#  - REASONING: the VLM's own chain-of-thought (used when a thinking model
+#    returns no `content` and we fall back to `thinking`). Any title it names
+#    is the model *guessing*, not transcribing — it once scored a hallucinated
+#    "The World in the Walls" at 1.0 and overrode correct metadata. A title
+#    inside a reasoning dump must never win on verbatim presence alone.
+_CREDIT_MARKERS = (
     "producer", "directed", "director", "written", "writer", "teleplay",
     "story by", "music", "edited", "editor", "starring", "executive",
     "casting", "narrat",
-    "got it", "let s", "the image", "i need", "looking at", "transcribe",
 )
+_REASONING_MARKERS = (
+    "got it", "let s", "the image", "i need", "looking at", "transcribe",
+    "appears to", "this is", "the text reads", "i can see", "the title",
+)
+_INCIDENTAL_MARKERS = _CREDIT_MARKERS + _REASONING_MARKERS
 
 
 def fuzzy_best(text: str, episodes: list[Episode]) -> tuple[Optional[Episode], float]:
@@ -347,7 +358,8 @@ def fuzzy_best(text: str, episodes: list[Episode]) -> tuple[Optional[Episode], f
     norm = canon_parts(normalize_text(text))
     if not norm:
         return None, 0.0
-    incidental = any(m in norm for m in _INCIDENTAL_MARKERS)
+    reasoning = any(m in norm for m in _REASONING_MARKERS)
+    incidental = reasoning or any(m in norm for m in _CREDIT_MARKERS)
     best, best_score = None, 0.0
     for ep in episodes:
         name = canon_parts(normalize_text(ep.name))
@@ -362,7 +374,13 @@ def fuzzy_best(text: str, episodes: list[Episode]) -> tuple[Optional[Episode], f
         # incidental markers we fall back to coverage (title must dominate).
         if re.search(rf"\b{re.escape(name)}\b", norm):
             distinctive = len(name.split()) >= 2 or len(name.replace(" ", "")) >= 10
-            if distinctive or not incidental:
+            if reasoning:
+                # A reasoning dump that merely *names* a title is the model
+                # guessing — never let verbatim presence alone score 1.0. Use
+                # coverage: in a long chain-of-thought the title is a tiny
+                # fraction, so it lands well below ocr_accept and is rejected.
+                score = len(name) / len(norm)
+            elif distinctive or not incidental:
                 score = 1.0
             else:
                 score = len(name) / len(norm)

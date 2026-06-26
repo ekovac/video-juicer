@@ -109,6 +109,15 @@ Three sources of canonical episode ORDER, cheapest first:
   conclusive; a short single-word title (Dawn, Jet, ORB) matches only if the
   frame isn't dominated by credit/reasoning markers (`_INCIDENTAL_MARKERS`),
   else by coverage. `canon_parts` maps "Part One/I/1" ↔ TMDB "(1)".
+  - Markers split into `_CREDIT_MARKERS` and `_REASONING_MARKERS`. A distinctive
+    verbatim hit beside a *credit* line is still 1.0 (real card + credit), but a
+    title named inside a *reasoning* dump never wins on presence alone — it
+    scores by coverage (tiny in a long chain-of-thought) and is rejected. This
+    fires when a thinking model returns no `content` and we fall back to
+    `thinking`: on a no-title-card show (The Magicians) the VLM's reasoning
+    ("Got it, let's look at the image…") once named a title and scored 1.0,
+    overriding correct metadata (E01→E04). Cards-less shows must yield no OCR
+    match, not a confident wrong one.
 
 ## TMDB notes
 
