@@ -65,6 +65,13 @@ def main(argv: Optional[list[str]] = None) -> int:
                     help="OCR title cards of low-confidence matches via Ollama")
     ap.add_argument("--verify-all", action="store_true",
                     help="OCR every matched title, not just low-confidence ones")
+    ap.add_argument("--spot-check", type=int, nargs="?", const=1, default=0,
+                    metavar="N",
+                    help="OCR ~N matched episodes per disc (default 1) as a cheap "
+                         "spot-check; if any disagree with the alignment, fully "
+                         "verify that disc")
+    ap.add_argument("--spot-check-seed", type=int, default=0,
+                    help="RNG seed for --spot-check sampling (reproducible)")
     ap.add_argument("--ocr-identify", action="store_true",
                     help="identify every candidate playlist by OCRing its "
                          "title card instead of metadata alignment — for "
@@ -194,26 +201,39 @@ def main(argv: Optional[list[str]] = None) -> int:
         with tempfile.TemporaryDirectory(prefix="identify-eps-",
                                          dir=args.scratch_dir) as tmp:
             for a in targets:
-                season_pool = seasons.get(a.episodes[0].season, [])
-                ep, score, _ = verify_title(a.disc, a.title, season_pool,
-                                            args.vlm_model, args.ollama_host,
-                                            Path(tmp))
-                if ep and score >= 0.8:
-                    a.verified_name = ep.name
-                    if [ep.number] != [e.number for e in a.episodes]:
-                        log.warning(
-                            "%s title %d: VLM says S%02dE%02d %r, alignment said %s — using VLM",
-                            a.disc.path.name, a.title.id, ep.season, ep.number,
-                            ep.name, [e.number for e in a.episodes])
-                        a.episodes = [ep]
-                    a.confidence = "high"
-                else:
-                    log.warning(
-                        "%s title %d: no title card found (best fuzzy score "
-                        "%.2f%s) — keeping alignment result %s",
-                        a.disc.path.name, a.title.id, score,
-                        f" vs {ep.name!r}" if ep else "",
-                        [e.number for e in a.episodes])
+                verify_assignment(a, seasons, args.vlm_model, args.ollama_host,
+                                  Path(tmp), args.ocr_accept)
+    # cheap random spot-check: OCR ~N matched episodes per disc; if any
+    # disagrees with the alignment, fully verify that disc (catches a dropped/
+    # shifted title that renumbered a run, e.g. Sonic SatAM, without doing all).
+    elif args.spot_check and not args.ocr_identify:
+        import random
+        from collections import defaultdict
+        per_disc: dict[Path, list] = defaultdict(list)
+        for a in all_assignments:
+            per_disc[a.disc.path].append(a)
+        rng = random.Random(args.spot_check_seed)
+        log.info("spot-check: ~%d episode(s)/disc across %d disc(s) via %s",
+                 args.spot_check, len(per_disc), args.vlm_model)
+        with tempfile.TemporaryDirectory(prefix="identify-eps-",
+                                         dir=args.scratch_dir) as tmp:
+            for path, asgs in per_disc.items():
+                ordered = sorted(asgs, key=lambda a: a.title.order_key)
+                sample = rng.sample(ordered, min(args.spot_check, len(ordered)))
+                results = [verify_assignment(a, seasons, args.vlm_model,
+                                             args.ollama_host, Path(tmp),
+                                             args.ocr_accept) for a in sample]
+                if any(r is False for r in results):
+                    log.warning("%s: spot-check DISAGREED — verifying the whole "
+                                "disc", path.name)
+                    for a in ordered:
+                        if a not in sample:
+                            verify_assignment(a, seasons, args.vlm_model,
+                                              args.ollama_host, Path(tmp),
+                                              args.ocr_accept)
+                elif all(r is None for r in results):
+                    log.warning("%s: spot-check found no title cards on the "
+                                "sampled episodes — can't confirm", path.name)
 
     # ---- report ----
     records = []

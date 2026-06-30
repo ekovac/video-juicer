@@ -897,5 +897,37 @@ class OllamaChatTest(unittest.TestCase):
         self.assertEqual(out, "")
 
 
+class VerifyAssignmentTest(unittest.TestCase):
+    SEASONS = {1: [ie.Episode(1, n, f"E{n}", 1440) for n in range(1, 14)]}
+
+    def _asg(self, num):
+        return ie.Assignment(disc=disc([], fmt="dvd"), title=title(num, 1440),
+                             episodes=[ie.Episode(1, num, f"E{num}", 1440)],
+                             delta=0.0, confidence="low")
+
+    def _run(self, a, ret):
+        from unittest import mock
+        with mock.patch("identify.verify_title", return_value=ret):
+            return ie.verify_assignment(a, self.SEASONS, "m", "h", Path("/tmp"))
+
+    def test_card_confirms_alignment(self):
+        a = self._asg(5)
+        r = self._run(a, (ie.Episode(1, 5, "E5", 1440), 1.0, 60.0))
+        self.assertTrue(r)                              # agreed
+        self.assertEqual(a.confidence, "high")
+
+    def test_card_overrides_alignment(self):
+        a = self._asg(5)
+        r = self._run(a, (ie.Episode(1, 6, "E6", 1440), 1.0, 60.0))  # VLM: E6
+        self.assertFalse(r)                             # disagreed
+        self.assertEqual([e.number for e in a.episodes], [6])
+
+    def test_no_card_keeps_alignment(self):
+        a = self._asg(5)
+        r = self._run(a, (None, 0.4, None))
+        self.assertIsNone(r)                            # inconclusive
+        self.assertEqual([e.number for e in a.episodes], [5])
+
+
 if __name__ == "__main__":
     unittest.main()

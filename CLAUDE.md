@@ -78,6 +78,15 @@ Three sources of canonical episode ORDER, cheapest first:
   No VLM or no titles → keep the metadata mapping, flagged. Never silently
   wrong; never wasted OCR. Korra was correctly judged verifiable → no OCR
   needed; Avatar/MOTU unverifiable → OCR.
+- **OCR verification tiers** (post-metadata; all share `verify_assignment`,
+  which OCRs a title card and returns confirmed / overridden / no-card):
+  `--verify` OCRs only low-confidence matches; `--verify-all` OCRs every match;
+  **`--spot-check N`** (default 1) OCRs ~N matched episodes *per disc* at random
+  (seeded via `--spot-check-seed`, stratified so every disc is sampled) and, if
+  any sampled episode's card DISAGREES with the alignment, fully verifies that
+  disc. It's the cheap middle ground — a stratified spot-check catches a
+  dropped/shifted title that renumbered a whole disc (Sonic SatAM) in ~1 OCR
+  call/disc instead of all 26.
 
 ## Failure modes and the defense for each
 

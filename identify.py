@@ -812,6 +812,37 @@ def format_outliers(assignments: list[Assignment]
     return majority, outliers
 
 
+def verify_assignment(a: Assignment, seasons: dict[int, list[Episode]],
+                      vlm_model: str, ollama_host: str, workdir: Path,
+                      accept: float = 0.8) -> Optional[bool]:
+    """OCR one assignment's title card and reconcile it with the alignment.
+
+    Mutates `a` (verified_name / episodes / confidence) when the VLM is
+    confident. Returns True if the card CONFIRMED the alignment, False if it
+    OVERRODE it (a real disagreement), None if no card was found (alignment
+    kept). The True/False distinction is what a spot-check keys on."""
+    season_pool = seasons.get(a.episodes[0].season, [])
+    ep, score, _ = verify_title(a.disc, a.title, season_pool, vlm_model,
+                                ollama_host, workdir, accept=accept)
+    if ep and score >= accept:
+        agreed = (ep.season == a.episodes[0].season
+                  and [ep.number] == [e.number for e in a.episodes])
+        a.verified_name = ep.name
+        if not agreed:
+            log.warning("%s title %d: VLM says S%02dE%02d %r, alignment said "
+                        "%s — using VLM", a.disc.path.name, a.title.id,
+                        ep.season, ep.number, ep.name,
+                        [e.number for e in a.episodes])
+            a.episodes = [ep]
+        a.confidence = "high"
+        return agreed
+    log.warning("%s title %d: no title card found (best fuzzy score %.2f%s) — "
+                "keeping alignment result %s", a.disc.path.name, a.title.id,
+                score, f" vs {ep.name!r}" if ep else "",
+                [e.number for e in a.episodes])
+    return None
+
+
 def vlm_available(model: str, host: str) -> bool:
     """Is the Ollama VLM reachable and the model pulled?"""
     try:
