@@ -81,12 +81,19 @@ Three sources of canonical episode ORDER, cheapest first:
 - **OCR verification tiers** (post-metadata; all share `verify_assignment`,
   which OCRs a title card and returns confirmed / overridden / no-card):
   `--verify` OCRs only low-confidence matches; `--verify-all` OCRs every match;
-  **`--spot-check N`** (default 1) OCRs ~N matched episodes *per disc* at random
-  (seeded via `--spot-check-seed`, stratified so every disc is sampled) and, if
-  any sampled episode's card DISAGREES with the alignment, fully verifies that
-  disc. It's the cheap middle ground — a stratified spot-check catches a
-  dropped/shifted title that renumbered a whole disc (Sonic SatAM) in ~1 OCR
-  call/disc instead of all 26.
+  **`--spot-check`** OCRs each disc's *first and last* matched episode and
+  **escalates to a full verify of that disc UNLESS both boundaries positively
+  confirm** the alignment. The failure it targets is a dropped/shifted title
+  that renumbers a whole contiguous run (Sonic SatAM) — so the *boundary*
+  episodes are where it shows up. First+last beats random-N: deterministic,
+  brackets the run, two shots at a readable card. The escalate-unless-confirmed
+  policy matters: a *disagreement* is an error, but a *no-readable-card*
+  boundary also escalates — Sonic disc 3's boundary episodes truncate while its
+  middle reads, so "escalate only on disagree" would have silently kept it
+  wrong. Cost: shows whose premieres/finales have no title card escalate every
+  disc (acceptable — you'd want them verified). Caveat it still does NOT fix: a
+  *dropped* title is a leftover, not an assignment, so it stays missing (Sonic
+  E08 — only `recover_by_elimination` in the OCR path recovers those).
 
 ## Failure modes and the defense for each
 

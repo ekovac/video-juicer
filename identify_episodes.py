@@ -65,13 +65,12 @@ def main(argv: Optional[list[str]] = None) -> int:
                     help="OCR title cards of low-confidence matches via Ollama")
     ap.add_argument("--verify-all", action="store_true",
                     help="OCR every matched title, not just low-confidence ones")
-    ap.add_argument("--spot-check", type=int, nargs="?", const=1, default=0,
-                    metavar="N",
-                    help="OCR ~N matched episodes per disc (default 1) as a cheap "
-                         "spot-check; if any disagree with the alignment, fully "
-                         "verify that disc")
-    ap.add_argument("--spot-check-seed", type=int, default=0,
-                    help="RNG seed for --spot-check sampling (reproducible)")
+    ap.add_argument("--spot-check", action="store_true",
+                    help="OCR each disc's FIRST and LAST matched episode as a "
+                         "cheap check; if either disagrees with the alignment, "
+                         "fully verify that disc. The boundary episodes bracket "
+                         "the disc, so a dropped/shifted title (which moves the "
+                         "whole run) shows up there")
     ap.add_argument("--ocr-identify", action="store_true",
                     help="identify every candidate playlist by OCRing its "
                          "title card instead of metadata alignment — for "
@@ -203,37 +202,41 @@ def main(argv: Optional[list[str]] = None) -> int:
             for a in targets:
                 verify_assignment(a, seasons, args.vlm_model, args.ollama_host,
                                   Path(tmp), args.ocr_accept)
-    # cheap random spot-check: OCR ~N matched episodes per disc; if any
-    # disagrees with the alignment, fully verify that disc (catches a dropped/
-    # shifted title that renumbered a run, e.g. Sonic SatAM, without doing all).
+    # cheap spot-check: OCR each disc's first and last matched episode; if
+    # either disagrees with the alignment, fully verify that disc. A dropped/
+    # shifted title renumbers the whole contiguous run, so the boundary episodes
+    # reveal it (Sonic SatAM) — without OCRing every episode.
     elif args.spot_check and not args.ocr_identify:
-        import random
         from collections import defaultdict
         per_disc: dict[Path, list] = defaultdict(list)
         for a in all_assignments:
             per_disc[a.disc.path].append(a)
-        rng = random.Random(args.spot_check_seed)
-        log.info("spot-check: ~%d episode(s)/disc across %d disc(s) via %s",
-                 args.spot_check, len(per_disc), args.vlm_model)
+        log.info("spot-check (first+last/disc) across %d disc(s) via %s",
+                 len(per_disc), args.vlm_model)
         with tempfile.TemporaryDirectory(prefix="identify-eps-",
                                          dir=args.scratch_dir) as tmp:
             for path, asgs in per_disc.items():
                 ordered = sorted(asgs, key=lambda a: a.title.order_key)
-                sample = rng.sample(ordered, min(args.spot_check, len(ordered)))
+                sample = [ordered[i] for i in sorted({0, len(ordered) - 1})]
                 results = [verify_assignment(a, seasons, args.vlm_model,
                                              args.ollama_host, Path(tmp),
                                              args.ocr_accept) for a in sample]
-                if any(r is False for r in results):
-                    log.warning("%s: spot-check DISAGREED — verifying the whole "
-                                "disc", path.name)
-                    for a in ordered:
-                        if a not in sample:
-                            verify_assignment(a, seasons, args.vlm_model,
-                                              args.ollama_host, Path(tmp),
-                                              args.ocr_accept)
-                elif all(r is None for r in results):
-                    log.warning("%s: spot-check found no title cards on the "
-                                "sampled episodes — can't confirm", path.name)
+                # Escalate UNLESS both boundaries positively confirmed. A
+                # disagreement is an error; a no-readable-card boundary means we
+                # couldn't verify the disc cheaply (Sonic disc 3's boundary
+                # episodes truncate while its middle reads) — either way, do the
+                # full check rather than silently trust the alignment.
+                if all(r is True for r in results):
+                    continue
+                why = ("DISAGREED" if any(r is False for r in results)
+                       else "couldn't confirm (no readable card at first/last)")
+                log.warning("%s: spot-check %s — verifying the whole disc",
+                            path.name, why)
+                for a in ordered:
+                    if a not in sample:
+                        verify_assignment(a, seasons, args.vlm_model,
+                                          args.ollama_host, Path(tmp),
+                                          args.ocr_accept)
 
     # ---- report ----
     records = []
