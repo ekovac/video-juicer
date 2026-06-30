@@ -269,6 +269,11 @@ VLM_PROMPT = (
     "is no text reply with NONE. Reply with only the transcription."
 )
 
+# Token cap for the VLM call. A thinking model needs room to finish reasoning
+# AND emit the answer; 2048 truncated rare complex frames (leaking the partial
+# chain-of-thought as a fake transcription). It's a cap, not a target.
+VLM_NUM_PREDICT = 8192
+
 
 def ollama_chat(model: str, prompt: str, image_path: Path,
                 host: str, retries: int = 4) -> str:
@@ -279,12 +284,15 @@ def ollama_chat(model: str, prompt: str, image_path: Path,
     and the first retry pays a model reload, hence the generous timeout.
     """
     img_b64 = base64.b64encode(image_path.read_bytes()).decode()
-    # Thinking models (qwen3-vl) spend tokens reasoning before answering; a
-    # tight num_predict exhausts the budget mid-think and yields empty content.
+    # Thinking models (qwen3-vl) spend tokens reasoning before the final answer;
+    # if num_predict is exhausted mid-think, `content` comes back empty. It's a
+    # CAP not a target (a frame that finishes early stops regardless), so set it
+    # generously: near-free for normal frames, and it lets the rare complex
+    # frame finish instead of truncating. think:false is a no-op for this model.
     body = json.dumps({
         "model": model, "stream": False,
         "messages": [{"role": "user", "content": prompt, "images": [img_b64]}],
-        "options": {"num_predict": 2048, "temperature": 0},
+        "options": {"num_predict": VLM_NUM_PREDICT, "temperature": 0},
     }).encode()
     delays = [5, 15, 30, 60]
     for attempt in range(retries + 1):
@@ -295,9 +303,15 @@ def ollama_chat(model: str, prompt: str, image_path: Path,
             with urllib.request.urlopen(req, timeout=300) as resp:
                 data = json.loads(resp.read())
             msg = data["message"]
-            # If the answer still got cut off mid-think, the transcription
-            # often appears inside the thinking text — better than nothing.
-            return (msg.get("content") or msg.get("thinking") or "").strip()
+            content = (msg.get("content") or "").strip()
+            if not content and data.get("done_reason") == "length":
+                # Truncated mid-think: the leftover `thinking` is chain-of-thought,
+                # NOT a transcription. Matching against it yields confident-wrong
+                # hits, so drop it — a missing read is recoverable by position/
+                # elimination; a wrong one silently corrupts the mapping.
+                log.warning("%s: VLM truncated mid-think at num_predict=%d; "
+                            "no transcription", image_path.name, VLM_NUM_PREDICT)
+            return content
         except Exception as e:  # noqa: BLE001 - URLError, timeout, bad JSON
             if attempt >= retries:
                 raise

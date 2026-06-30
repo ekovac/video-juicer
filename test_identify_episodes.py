@@ -841,5 +841,37 @@ class RipCommandTest(unittest.TestCase):
         self.assertFalse(any("PRESET_ALT" in l for l in out))
 
 
+class OllamaChatTest(unittest.TestCase):
+    def _call(self, resp):
+        import io, json as _json, os, tempfile
+        from unittest import mock
+
+        class FakeResp:
+            def __enter__(self_): return self_
+            def __exit__(self_, *a): return False
+            def read(self_): return _json.dumps(resp).encode()
+
+        fd, name = tempfile.mkstemp(suffix=".jpg")
+        os.write(fd, b"x"); os.close(fd)
+        try:
+            with mock.patch("identify.urllib.request.urlopen",
+                            return_value=FakeResp()):
+                return ie.ollama_chat("m", "p", Path(name), "http://h")
+        finally:
+            os.unlink(name)
+
+    def test_returns_clean_content(self):
+        out = self._call({"message": {"content": '"Introitus"', "thinking": "x"},
+                          "done_reason": "stop"})
+        self.assertEqual(out, '"Introitus"')
+
+    def test_truncated_midthink_returns_empty_not_thinking(self):
+        # content empty + done_reason length: must NOT leak the thinking text
+        out = self._call({"message": {"content": "",
+                          "thinking": "Got it, let's look at the image..."},
+                          "done_reason": "length"})
+        self.assertEqual(out, "")
+
+
 if __name__ == "__main__":
     unittest.main()

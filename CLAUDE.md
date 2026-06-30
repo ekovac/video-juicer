@@ -114,32 +114,34 @@ Three sources of canonical episode ORDER, cheapest first:
   guarded but the fuzzy branch is not. Unresolved; fixing it is delicate (on
   Broken Saints a reasoning-dump match is currently load-bearing for E19).
 
-  **TODO — reasoning-leak fix (validated, not yet implemented):** the leak is a
-  thinking-model truncation, not a content problem. Experiment (2026-06):
-  `think:false` is a no-op for qwen3-vl on Ollama 0.30.3 (still thinks); leaks
-  are rare (1/60 frames in the leaky window) and happen only when thinking
-  overruns `num_predict` (`done_reason=="length"` → empty `content` → we fall
-  back to the partial `thinking`). `num_predict` is a CAP not a target, so a
-  frame that finishes early stops at `done=stop` regardless — raising it is
-  near-free for the 59/60 normal frames and lets the rare frame finish. The same
-  leaky frame at `num_predict=6144` returned clean `content`. Two-part fix:
-  1. **Raise `num_predict` 2048 → ~8192** in `ollama_chat` (near-zero cost,
-     prevents most leaks at the source).
-  2. **On residual `done_reason=="length"`, reject (return NONE/empty) instead
-     of falling back to `thinking`** — a missing read is recoverable by
-     position/elimination; a confident wrong read is not. No second classifier
-     LLM needed; `done_reason` is the deterministic signal.
-  Caveat still open: clean transcriptions turn the load-bearing E19 reasoning
-  match into a leftover (its frame is a quote, not a card), handing E19 to the
-  clean "Signals" extra — the position-vs-content question is unresolved.
+  **Reasoning-leak fix (implemented):** the leak is a thinking-model truncation,
+  not a content problem. Experiment (2026-06): `think:false` is a no-op for
+  qwen3-vl on Ollama 0.30.3 (still thinks); leaks are rare (1/60 frames in the
+  leaky window) and happen only when thinking overruns `num_predict`
+  (`done_reason=="length"` → empty `content`). `num_predict` is a CAP not a
+  target, so a frame that finishes early stops regardless — raising it is
+  near-free. Fix in `ollama_chat`: (1) `VLM_NUM_PREDICT=8192`; (2) on empty
+  `content` with `done_reason=="length"` return "" instead of the partial
+  `thinking` — `done_reason` is the deterministic signal, no classifier LLM
+  needed. Caveat still open: cleanly rejecting leaks turns the load-bearing E19
+  reasoning match into a leftover (its frame is a quote, not a card), handing
+  E19 to the clean "Signals" extra — the position-vs-content question is
+  unresolved, so a Broken Saints re-run may shift the finale-disc mapping.
 
 ## VLM / OCR specifics
 
 - **Model: `qwen3-vl:2B`.** Benchmarked alternatives and rejected them:
   moondream *describes* images instead of transcribing (unusable); `glm-ocr`
   equally accurate but ~3x slower; `qwen2.5vl` translates non-English titles.
-- qwen3-vl is a *thinking* model: give `num_predict` headroom (2048) or `content`
-  comes back empty (`done_reason: length`); fall back to the `thinking` text.
+- qwen3-vl is a *thinking* model: it spends tokens reasoning before the final
+  answer, so `num_predict` must cover both. `VLM_NUM_PREDICT=8192` (it's a cap,
+  not a target — frames that finish early stop regardless, so a big cap is
+  near-free and lets rare complex frames finish). If it still truncates
+  (`done_reason == "length"`, empty `content`), `ollama_chat` returns "" — it
+  does NOT fall back to the partial `thinking` text, which is chain-of-thought,
+  not a transcription, and fuzzy-matches confident-wrong titles. A missing read
+  is recoverable by position/elimination; a wrong one corrupts the mapping.
+  (`think:false` is a no-op for this model on Ollama 0.30.3.)
 - **Sample frames at ≤2 s** — cards are on screen ~2-4 s; a 4-8 s stride
   phase-skips them and looks like "show has no titles". `extract_frames`=1.5 s.
 - **Card location varies by show**: VB at the end (~21:40, stylized script —
