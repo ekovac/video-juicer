@@ -32,23 +32,36 @@ Needs `lsdvd`,`7z`; OCR also needs `ffmpeg`/`mencoder` + Ollama; `TMDB_API_KEY` 
 
 Three sources of canonical episode ORDER, cheapest first:
 1. **DVD (lsdvd) title order** — reliable.
-2. **A Blu-ray play-all's clip sequence** (`order_by_playall`) — a play-all's
-   clips are the ordered union of the episode clips, so its order IS broadcast
-   order, *exact even for same-runtime scrambled discs*. Free, no OCR. Avatar
-   has one; MOTU does not. Sets `order_key` + marks `kind="play-all"`.
-   - **DVD analogue: `mark_dvd_playall`** — a DVD play-all is one title whose
-     runtime ≈ the sum of the episode titles (which share its audio layout;
-     extras/menus have fewer streams). It marks the play-all `kind="play-all"`
-     and each episode `kind="episode-candidate"`, identifying the episode SET
-     and order *independent of episode runtimes*. Essential when TMDB runtimes
-     are wrong: Broken Saints (tmdb 111718) reports 9 min for all 24 chapters
-     though they run 9-49 min, so the length band picked 6 wrong titles/disc;
-     the play-all picks the right 8/7/8/10. Non-regressive — Venture Bros (which
-     also has DVD play-alls) is metadata-aligned and ignores the marks, 81/81.
+2. **A play-all that concatenates the episodes** — order/set independent of
+   (possibly wrong) TMDB runtimes. Two detectors, by disc format:
+   - **Blu-ray: `order_by_playall`** — a play-all's clips are the ordered union
+     of the episode clips, so its clip order IS broadcast order, *exact even for
+     same-runtime scrambled discs* (Avatar has one; MOTU doesn't). Sets
+     `order_key` + `kind="play-all"`.
+   - **DVD: `detect_play_all`** — ONE function, two strategies: (a) *chapter
+     match* — the play-all's chapter marks segment into the other titles'
+     durations (exact; handles multi-chapter-per-episode); (b) *duration-sum
+     fallback* — the longest title whose runtime == the sum of its same-audio
+     peers (catches discs whose chapters don't align to title boundaries, e.g.
+     Broken Saints D3/D4 where chapter-match finds nothing). Inert on Blu-ray
+     (n_audio is 0 there). `classify_disc` (metadata path) and `episode_candidates`
+     (OCR path) both call it; it's why Broken Saints (tmdb 111718, TMDB says
+     9 min for 9-49 min chapters) picks the right 8/7/8/10 episodes/disc where
+     the length band picked 6 wrong ones. (This unified the old `detect_play_all`
+     + `mark_dvd_playall` pair into one — same results: BS candidates unchanged,
+     Venture Bros 81/81 unchanged.)
 3. **Title-card OCR** — when neither of the above is available.
 
 `assess_ordering` decides per disc whether the episode ORDER can be trusted:
-- **DVD (lsdvd) title order is reliable.**
+- **DVD (lsdvd) title order is broadcast order WITHIN a disc** — but the aligner
+  decides which episode each disc *starts* on, and with no season/disc hint AND
+  same-runtime episodes it has no anchor: it can drop or shift a title and
+  renumber the rest. Sonic SatAM (tmdb 2404) — ~all 22.7 min, no `S?D?` in the
+  ISO names — dropped a 22.7-min episode that looked like its peers, shifting
+  E08→ onward by one (OCR caught it). So DVD is trusted only with a disc hint
+  (Venture Bros has `S?D?`) OR runtime-separable episodes; else → unverifiable,
+  recommend OCR. (DVD was previously trusted unconditionally — the bug was false
+  confidence, not a missing aligner constraint.)
 - **Blu-ray `.mpls` playlist order is NOT broadcast order** — scrambled on Avatar
   and MOTU (verified by OCR). Trust it only via a play-all, multi-part names,
   or runtime-separability; else escalate to OCR.
@@ -99,12 +112,13 @@ Three sources of canonical episode ORDER, cheapest first:
 - **Candidate length filter** is `valid_episode_lengths`, NOT a wide band: TMDB
   per-episode runtimes ∪ multiples of the median (robust to a wrong/null TMDB
   runtime for a long episode — it still lands on k*median) ∪ consecutive sums.
-  `episode_candidates` overrides it with the `mark_dvd_playall` set when present
+  `episode_candidates` overrides it with the `detect_play_all` set when present
   (the play-all is used *because* runtimes are untrusted, so the length band is
-  moot). For the same reason the OCR two-parter heuristic (claim N+1 when a
-  title is ~2x the runtime) is **skipped for `episode-candidate` titles** — with
-  wrong runtimes every single looked like a 2x double, so it merged E01+E02 and
-  the collision pass then demoted the correct standalone.
+  moot), and marks those titles `kind="episode-candidate"`. For the same reason
+  the OCR two-parter heuristic (claim N+1 when a title is ~2x the runtime) is
+  **skipped for `episode-candidate` titles** — with wrong runtimes every single
+  looked like a 2x double, so it merged E01+E02 and the collision pass then
+  demoted the correct standalone.
 - **Known limitation (Broken Saints back discs):** a feature-length finale split
   across many DVD titles (E24 "Truth" = ~7 titles, only fragments carrying a
   card) does not map cleanly to one title; sub-segments open with epigraph

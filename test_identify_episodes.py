@@ -69,46 +69,54 @@ class PlayAllTest(unittest.TestCase):
 
 
 class DvdPlayAllTest(unittest.TestCase):
-    # Broken Saints shape: a play-all title whose runtime == sum of the episode
-    # titles (which share its audio layout), plus low-audio extras and dummies.
+    # detect_play_all's duration-sum FALLBACK (Broken Saints D3/D4 shape): a
+    # play-all with no usable chapter marks, whose runtime == the sum of the
+    # episode titles (sharing its audio layout), plus low-audio extras/dummies.
     def _disc(self, ep_durs, extra_durs=(), pa_audio=3):
         eps = [title(i + 3, d, [d], n_audio=pa_audio) for i, d in enumerate(ep_durs)]
-        pa = title(1, sum(ep_durs), [], n_audio=pa_audio)
+        pa = title(1, sum(ep_durs), [], n_audio=pa_audio)   # no chapters
         dummy = title(2, 1.0, [], n_audio=0)
         extras = [title(50 + i, d, [d], n_audio=1) for i, d in enumerate(extra_durs)]
         return [pa, dummy] + eps + extras
 
-    def test_marks_playall_and_episodes(self):
+    def test_sum_match_finds_playall_and_episodes(self):
         ts = self._disc([998, 606, 549, 660, 1758], extra_durs=(1283, 686))
-        pa = ie.mark_dvd_playall(ts)
+        pa, matched = ie.detect_play_all(ts)
         self.assertEqual(pa.id, 1)
-        self.assertEqual(pa.kind, "play-all")
-        marked = [t.id for t in ts if t.kind == "episode-candidate"]
-        self.assertEqual(marked, [3, 4, 5, 6, 7])      # episodes, not extras/dummy
+        self.assertEqual([t.id for t in matched], [3, 4, 5, 6, 7])  # not extras
 
-    def test_episode_candidates_prefer_marked_over_length_band(self):
+    def test_episode_candidates_prefer_playall_over_length_band(self):
         # bogus uniform runtimes (Broken Saints: TMDB says 9 min for all) would
         # make the length band miss the real 16-29 min episodes; the play-all
-        # marking overrides it.
+        # set overrides it AND marks the titles so ocr_identify skips 2x-doubling.
         ts = self._disc([998, 606, 549, 660, 1758])
-        d = disc(ts)
-        ie.mark_dvd_playall(ts)
+        d = disc(ts)                                   # fmt='dvd' (default)
         pool = [ie.Episode(1, i + 1, f"E{i+1}", 540) for i in range(24)]
         cands = ie.episode_candidates(d, pool)
         self.assertEqual([t.id for t in cands], [3, 4, 5, 6, 7])
+        self.assertTrue(all(t.kind == "episode-candidate" for t in cands))
 
     def test_episode_with_extra_audio_track_still_counted(self):
         # a real episode may carry an extra commentary (n_audio 4 vs play-all 3)
         ts = self._disc([998, 606, 549, 660])
         ts[4].n_audio = 4                              # title id 5: 4 audio
-        pa = ie.mark_dvd_playall(ts)
-        self.assertIsNotNone(pa)
-        self.assertIn(5, [t.id for t in ts if t.kind == "episode-candidate"])
+        pa, matched = ie.detect_play_all(ts)
+        self.assertIn(5, [t.id for t in matched])
 
-    def test_no_playall_when_no_title_sums_to_peers(self):
-        # ordinary disc: episodes don't sum to any single title -> no detection
+    def test_chapter_match_precedes_sum_match(self):
+        # when the play-all HAS chapter marks at episode boundaries, the precise
+        # chapter-match wins (works even where sum-match would over-include)
+        ep_durs = [1356.0, 1353.0, 1349.0, 1417.0]
+        pa = title(1, sum(ep_durs), list(ep_durs), n_audio=1)   # 4 chapters
+        eps = [title(i + 2, d, [d], n_audio=1) for i, d in enumerate(ep_durs)]
+        found_pa, matched = ie.detect_play_all([pa] + eps)
+        self.assertEqual(found_pa.id, 1)
+        self.assertEqual([t.id for t in matched], [2, 3, 4, 5])
+
+    def test_no_playall_when_nothing_concatenates(self):
+        # ordinary disc: no chapters, episodes don't sum to a single title
         ts = [title(i + 1, 1320, [1320], n_audio=2) for i in range(5)]
-        self.assertIsNone(ie.mark_dvd_playall(ts))
+        self.assertIsNone(ie.detect_play_all(ts))
 
 
 class ClassifyTest(unittest.TestCase):
@@ -468,9 +476,25 @@ class OrderabilityTest(unittest.TestCase):
             out.append(ie.Assignment(d, t, [ep], delta, "high"))
         return out
 
-    def test_dvd_always_orderable(self):
+    def test_dvd_with_disc_hint_orderable(self):
         d = disc([], fmt="dvd")
+        d.disc_hint = 1                                # S?D? in the filename
         ok, _ = ie.assess_ordering(d, self._asgs(d, [(1440, 5)] * 5))
+        self.assertTrue(ok)
+
+    def test_dvd_same_runtime_no_hint_unverifiable(self):
+        # Sonic SatAM: ~all 22.7min, no S?D? hint -> aligner can drop/shift a
+        # title and renumber, so cross-disc numbering isn't verifiable
+        d = disc([], fmt="dvd")
+        ok, why = ie.assess_ordering(d, self._asgs(d, [(1360, 5)] * 5))
+        self.assertFalse(ok)
+        self.assertIn("no disc hint", why)
+
+    def test_dvd_runtime_separable_no_hint_orderable(self):
+        # varied runtimes anchor the numbering even without a hint
+        d = disc([], fmt="dvd")
+        ok, _ = ie.assess_ordering(
+            d, self._asgs(d, [(600, 5), (1000, 5), (1500, 5), (2900, 5)]))
         self.assertTrue(ok)
 
     def test_bluray_same_runtime_unverifiable(self):

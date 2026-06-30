@@ -27,13 +27,28 @@ HARD_MATCH_TOL = 420.0
 
 
 def detect_play_all(titles: list[Title]) -> Optional[tuple[Title, list[Title]]]:
-    """Find a title whose chapters segment into the durations of other titles.
+    """Find the DVD play-all and its episode titles in order, or None.
 
-    Handles both one-chapter-per-episode play-alls (S1: 8 chapters <-> 8
-    titles) and multi-chapter-per-episode ones (S7: 25 chapters spanning 5
-    titles) by greedily accumulating consecutive chapters until the running
-    sum matches an unused title.
+    Runtime-INDEPENDENT — keys on the disc's own structure, not TMDB runtimes
+    (which can be wrong: Broken Saints reports a uniform 9 min for 9-49 min
+    chapters). Two strategies, precise first:
+
+    1. **Chapter-match**: the play-all's chapter marks segment into the other
+       titles' durations. Handles one-chapter-per-episode (8 chapters <-> 8
+       titles) and multi-chapter-per-episode (25 chapters spanning 5) by
+       greedily accumulating chapters until the running sum hits an unused
+       title. Exact when the marks fall on episode boundaries.
+    2. **Duration-sum fallback**: the longest title whose runtime == the sum of
+       its peers (peers share its audio layout; extras/menus have fewer
+       streams). Catches discs whose play-all chapters DON'T align to title
+       boundaries (Broken Saints D3/D4, where chapter-match finds nothing).
+       Looser — can sweep in a same-audio extra — so it's the fallback. Inert
+       on Blu-ray (n_audio is 0 there, so every title "matches" and the sum
+       overshoots), where order_by_playall handles play-alls via clips instead.
+
+    Returns (play_all, episodes_in_play_order).
     """
+    # Strategy 1: chapter segmentation.
     best = None
     for cand in titles:
         if len(cand.chapters) < 2:
@@ -44,7 +59,6 @@ def detect_play_all(titles: list[Title]) -> Optional[tuple[Title, list[Title]]]:
         unused = list(others)
         matched: list[Title] = []
         acc = 0.0
-        ok = True
         for ch in cand.chapters:
             acc += ch
             hit = next((o for o in unused
@@ -54,11 +68,26 @@ def detect_play_all(titles: list[Title]) -> Optional[tuple[Title, list[Title]]]:
                 unused.remove(hit)
                 acc = 0.0
         # Allow a small unmatched tail (credits/logo chapter).
-        if acc > 30.0:
-            ok = False
-        if ok and len(matched) >= 2 and (best is None or len(matched) > len(best[1])):
+        if acc <= 30.0 and len(matched) >= 2 and (
+                best is None or len(matched) > len(best[1])):
             best = (cand, matched)
-    return best
+    if best:
+        return best
+
+    # Strategy 2: duration-sum fallback (the longest title concatenates peers
+    # of the same audio richness). The episodes' DVD title order is play order.
+    if len(titles) < 4:
+        return None
+    pa = max(titles, key=lambda t: t.duration)
+    rich = pa.n_audio >= 2          # commentary present -> match by ">= 2";
+    peers = [t for t in titles if t is not pa and t.duration > 60
+             and (t.n_audio >= 2 if rich else t.n_audio == pa.n_audio)]
+    if len(peers) < 3:
+        return None
+    total = sum(t.duration for t in peers)
+    if abs(total - pa.duration) > max(30.0, 0.03 * pa.duration):
+        return None
+    return pa, sorted(peers, key=lambda t: t.order_key)
 
 
 def classify_disc(disc: Disc, expected_runtime: float) -> list[Title]:
@@ -111,11 +140,9 @@ def assess_ordering(disc: Disc, assignments: list["Assignment"],
     """Whether a disc's episode ORDER can be trusted from the metadata path.
 
     Identity there rests on title/playlist position plus a runtime match,
-    aligned monotonically (the aligner can't reorder). Reliable for DVD
-    (lsdvd title order) but not Blu-ray, where .mpls order has been scrambled
-    vs broadcast (Avatar, MOTU). Signals, in order:
-      - DVD, or a play-all whose chapters matched the titles, or multi-part
-        "(1)/(2)" names in sequence  -> order corroborated;
+    aligned monotonically (the aligner can't reorder). Signals, in order:
+      - DVD with a disc hint, a play-all, or multi-part "(1)/(2)" names in
+        sequence  -> order/numbering corroborated;
       - episodes ~all one length     -> runtime can't order them at all;
       - large alignment deltas        -> the monotonic order conflicts with
         the TMDB runtimes, i.e. the playlist order is likely scrambled;
@@ -123,16 +150,27 @@ def assess_ordering(disc: Disc, assignments: list["Assignment"],
     Returns (verifiable, reason)."""
     if len(assignments) <= 1:
         return True, "single title"
-    if disc.format == "dvd":
-        return True, "DVD title order"
-    if any(t.kind == "play-all" for t in disc.titles):
-        return True, "play-all corroborates order"
     eps = [e for a in assignments for e in a.episodes]
-    if sum(1 for e in eps if re.search(r"\(\d+\)\s*$", e.name)) >= 2:
-        return True, "multi-part titles corroborate order"
     rts = sorted(e.runtime for e in eps if e.runtime)
     min_gap = min((rts[i + 1] - rts[i] for i in range(len(rts) - 1)),
                   default=tol + 1)
+    if disc.format == "dvd":
+        # Within a disc, lsdvd title order IS broadcast order. But the aligner
+        # decides which episode each disc *starts* on; with no season/disc hint
+        # AND same-runtime episodes it has no anchor and can drop or shift a
+        # title, renumbering the rest (Sonic SatAM: dropped a 22.7-min episode
+        # that looked like its peers). A disc hint anchors the numbering.
+        if disc.disc_hint is not None:
+            return True, "DVD title order (disc hint anchors numbering)"
+        if min_gap <= tol:
+            return False, ("DVD, episodes ~same runtime and no disc hint — "
+                           "cross-disc numbering is unanchored and can drop or "
+                           "shift a title; recommend --ocr-identify")
+        return True, "DVD title order"
+    if any(t.kind == "play-all" for t in disc.titles):
+        return True, "play-all corroborates order"
+    if sum(1 for e in eps if re.search(r"\(\d+\)\s*$", e.name)) >= 2:
+        return True, "multi-part titles corroborate order"
     if min_gap <= tol:                 # two episodes runtime-indistinguishable
         return False, (f"Blu-ray, episodes not runtime-separable (two within "
                        f"{min_gap:.0f}s) — order can't be verified")
@@ -563,12 +601,17 @@ def episode_candidates(disc: Disc, pool: list[Episode]) -> list[Title]:
     """Episode-length playlists on a disc, in play order — the candidates an
     OCR pass should consider. Uses the TMDB runtime set when available, else a
     wide band around the median."""
-    # A detected play-all (DVD: a title that concatenates the episodes; BD:
-    # order_by_playall) names the episode set structurally, independent of
-    # runtimes — use it when present, since it survives wrong TMDB durations.
-    marked = [t for t in disc.titles if t.kind == "episode-candidate"]
-    if marked:
-        return sorted(marked, key=lambda t: t.order_key)
+    # A DVD play-all names the episode set structurally, independent of
+    # runtimes — use it when present, since it survives wrong TMDB durations
+    # (Broken Saints). On Blu-ray the play-all set isn't enumerated this way
+    # (order_by_playall only fixes order), so fall through to the band there.
+    if disc.format == "dvd":
+        pa = detect_play_all([t for t in disc.titles if t.duration > 0])
+        if pa:
+            pa[0].kind = "play-all"
+            for t in pa[1]:
+                t.kind = "episode-candidate"   # ocr_identify skips 2x-doubling
+            return list(pa[1])                 # for these (runtimes untrusted)
     bands = valid_episode_lengths(pool)
     if bands:
         lengths, tol = bands

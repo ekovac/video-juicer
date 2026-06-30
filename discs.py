@@ -102,40 +102,6 @@ def detect_format(path: Path) -> str:
     raise ValueError(f"{path}: no BDMV/ or VIDEO_TS/ in image root")
 
 
-def mark_dvd_playall(titles: list[Title]) -> Optional[Title]:
-    """Mark a DVD play-all and its episodes when one title concatenates them.
-
-    Some DVDs author a "play all" as one long title whose runtime is the sum of
-    the individual episode titles (the episodes share its audio/subtitle layout;
-    extras and menus have a different, usually smaller one). This is the DVD
-    analogue of order_by_playall: it identifies the episode set and their order
-    WITHOUT trusting episode runtimes — the key when TMDB runtimes are wrong
-    (Broken Saints: TMDB says 9 min for every chapter, but they run 9-49 min).
-    Marks the play-all kind="play-all" and each episode kind="episode-candidate".
-    Returns the play-all, or None when no title is a clean sum of its peers."""
-    if len(titles) < 4:
-        return None
-    pa = max(titles, key=lambda t: t.duration)
-    # Episodes share the play-all's audio richness; extras/menus have less.
-    # When the play-all carries commentary (n_audio >= 2), accept any title
-    # that also does (an episode may add an extra commentary track, so match by
-    # ">= 2" not exact); otherwise require the exact same audio count.
-    rich = pa.n_audio >= 2
-    peers = [t for t in titles if t is not pa and t.duration > 60
-             and (t.n_audio >= 2 if rich else t.n_audio == pa.n_audio)]
-    if len(peers) < 3:
-        return None
-    total = sum(t.duration for t in peers)
-    if abs(total - pa.duration) > max(30.0, 0.03 * pa.duration):
-        return None                       # not a clean concatenation
-    pa.kind = "play-all"
-    for t in peers:
-        t.kind = "episode-candidate"
-    log.info("DVD play-all: title %d (%.0f min) = %d episodes (%.0f min total)",
-             pa.id, pa.duration / 60, len(peers), total / 60)
-    return pa
-
-
 def scan_dvd(path: Path) -> Disc:
     """Read the DVD title table via lsdvd (IFO metadata only)."""
     proc = run(["lsdvd", "-Oy", "-c", "-a", "-s", str(path)])
@@ -156,7 +122,6 @@ def scan_dvd(path: Path) -> Disc:
             cells=len(t.get("cell", [])) or len(t.get("chapter", [])),
             order_key=t["ix"],
         ))
-    mark_dvd_playall(titles)
     return Disc(path=path, format="dvd", label=data.get("title", path.stem), titles=titles)
 
 
