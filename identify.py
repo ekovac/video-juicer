@@ -735,6 +735,26 @@ def recover_by_elimination(final: list[Assignment],
     return final, leftovers, list(missing.values())
 
 
+def format_outliers(assignments: list[Assignment]
+                    ) -> tuple[Optional[str], list[Assignment]]:
+    """Episodes whose video format differs from the run's majority.
+
+    A few episodes authored at a lower quality than the rest (Avatar's Sozin's
+    Comet finale is 480i SD while the season is 1080p) won't be caught by
+    runtime/title-card matching — they map correctly, just to an inferior
+    source. Flag them so the user can decide before ripping. Returns
+    (majority_format, outlier_assignments); empty when formats agree or are
+    unknown (DVD / unparsed STN)."""
+    from collections import Counter
+    fmts = [a.title.video_format for a in assignments if a.title.video_format]
+    if len(fmts) < 3 or len(set(fmts)) < 2:
+        return None, []
+    majority = Counter(fmts).most_common(1)[0][0]
+    outliers = [a for a in assignments
+                if a.title.video_format and a.title.video_format != majority]
+    return majority, outliers
+
+
 def vlm_available(model: str, host: str) -> bool:
     """Is the Ollama VLM reachable and the model pulled?"""
     try:

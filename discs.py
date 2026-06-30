@@ -31,6 +31,8 @@ class Title:
     n_sub: int = 0
     cells: int = 0               # DVD cells / BD play items
     clips: tuple = ()            # BD: referenced .m2ts clip ids (for dedup)
+    video_format: Optional[str] = None   # e.g. "1080p", "480i" (resolution+scan)
+    audio_format: Optional[str] = None   # e.g. "DTS-HDMA", "AC3" (best-effort)
     # classification results
     kind: str = "unknown"        # episode-candidate | play-all | extra | junk
     evidence: float = 0.0        # [-1, 1]; >0 favors episode
@@ -161,6 +163,49 @@ def scan_dvd(path: Path) -> Disc:
 # --- Blu-ray: parse BDMV/PLAYLIST/*.mpls without touching the m2ts payload ---
 
 
+# MPLS STN stream-attribute codes.
+_VIDEO_FORMAT = {1: "480i", 2: "576i", 3: "480p", 4: "1080i", 5: "720p",
+                 6: "1080p", 7: "576p", 8: "2160p"}
+_AUDIO_CODING = {0x80: "LPCM", 0x81: "AC3", 0x82: "DTS", 0x83: "TrueHD",
+                 0x84: "EAC3", 0x85: "DTS-HD", 0x86: "DTS-HDMA"}
+
+
+def _stn_formats(buf: bytes, item_pos: int, item_len: int):
+    """Read the first PlayItem's primary video (and best-effort audio) format
+    from its STN stream table. Pure metadata — no payload. Returns
+    (video_format, audio_format) as strings, or (None, None) if the layout
+    doesn't validate (parsing the STN is fragile; fail soft rather than guess).
+
+    The non-multi-angle PlayItem header is 32 bytes before the STN table:
+    clip(5)+codec(4)+flags(2)+stc(1)+in(4)+out(4)+UO(8)+ra(1)+still(1)+
+    still_time(2). The STN table then opens with its own length, which must
+    end exactly at the PlayItem boundary — used here as a sanity anchor."""
+    data = item_pos + 2
+    try:
+        if (struct.unpack_from(">H", buf, data + 9)[0] >> 4) & 1:
+            return None, None                 # multi-angle: header differs
+        stn = data + 32
+        stn_len = struct.unpack_from(">H", buf, stn)[0]
+        if stn + 2 + stn_len != data + item_len:
+            return None, None                 # end-anchor failed
+        n_video, n_audio = buf[stn + 4], buf[stn + 5]
+        p = stn + 16                          # past counts(7) + reserved(5)
+        vfmt = afmt = None
+        for i in range(n_video):
+            attr = p + 1 + buf[p]
+            if i == 0:
+                vfmt = _VIDEO_FORMAT.get(buf[attr + 2] >> 4)
+            p = attr + 1 + buf[attr]
+        for i in range(n_audio):
+            attr = p + 1 + buf[p]
+            if i == 0:
+                afmt = _AUDIO_CODING.get(buf[attr + 1], f"a{buf[attr + 1]:02x}")
+            p = attr + 1 + buf[attr]
+        return vfmt, afmt
+    except (struct.error, IndexError):
+        return None, None
+
+
 def parse_mpls(buf: bytes) -> Optional[dict]:
     """Parse one .mpls playlist. Returns {duration, chapters, clips, n_audio, n_sub}."""
     if len(buf) < 40 or buf[:4] != b"MPLS":
@@ -171,13 +216,16 @@ def parse_mpls(buf: bytes) -> Optional[dict]:
     pos = playlist_start + 10
     clips, in_times, durations = [], [], []
     n_audio = n_sub = 0
-    for _ in range(n_items):
+    video_format = audio_format = None
+    for idx in range(n_items):
         item_len = struct.unpack_from(">H", buf, pos)[0]
         clip = buf[pos + 2:pos + 7].decode("ascii", "replace")
         in_t, out_t = struct.unpack_from(">II", buf, pos + 14)
         clips.append(clip)
         in_times.append(in_t)
         durations.append((out_t - in_t) / 45000.0)
+        if idx == 0:        # the playlist's format is its first item's
+            video_format, audio_format = _stn_formats(buf, pos, item_len)
         pos += 2 + item_len
     # Stream counts live in the STN table at a variable offset; parsing it is
     # fragile, so Blu-ray keeps counts at 0 and relies on duration/chapter
@@ -209,7 +257,8 @@ def parse_mpls(buf: bytes) -> Optional[dict]:
         end = starts[i + 1] if i + 1 < len(starts) else duration
         chapters.append(max(0.0, end - s))
     return {"duration": duration, "chapters": chapters, "clips": tuple(clips),
-            "n_audio": n_audio, "n_sub": n_sub, "n_items": n_items}
+            "n_audio": n_audio, "n_sub": n_sub, "n_items": n_items,
+            "video_format": video_format, "audio_format": audio_format}
 
 
 def dedup_subset_playlists(titles: list[Title]) -> list[Title]:
@@ -305,6 +354,7 @@ def scan_bluray(path: Path) -> Disc:
             id=num, duration=info["duration"], chapters=info["chapters"],
             n_audio=info["n_audio"], n_sub=info["n_sub"],
             cells=info["n_items"], clips=info["clips"], order_key=num,
+            video_format=info["video_format"], audio_format=info["audio_format"],
         ))
     titles = dedup_subset_playlists(titles)
     order_by_playall(titles)   # exact ordering when a play-all is present

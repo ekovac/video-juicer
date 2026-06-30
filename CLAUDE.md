@@ -114,6 +114,25 @@ Three sources of canonical episode ORDER, cheapest first:
   guarded but the fuzzy branch is not. Unresolved; fixing it is delicate (on
   Broken Saints a reasoning-dump match is currently load-bearing for E19).
 
+  **TODO — reasoning-leak fix (validated, not yet implemented):** the leak is a
+  thinking-model truncation, not a content problem. Experiment (2026-06):
+  `think:false` is a no-op for qwen3-vl on Ollama 0.30.3 (still thinks); leaks
+  are rare (1/60 frames in the leaky window) and happen only when thinking
+  overruns `num_predict` (`done_reason=="length"` → empty `content` → we fall
+  back to the partial `thinking`). `num_predict` is a CAP not a target, so a
+  frame that finishes early stops at `done=stop` regardless — raising it is
+  near-free for the 59/60 normal frames and lets the rare frame finish. The same
+  leaky frame at `num_predict=6144` returned clean `content`. Two-part fix:
+  1. **Raise `num_predict` 2048 → ~8192** in `ollama_chat` (near-zero cost,
+     prevents most leaks at the source).
+  2. **On residual `done_reason=="length"`, reject (return NONE/empty) instead
+     of falling back to `thinking`** — a missing read is recoverable by
+     position/elimination; a confident wrong read is not. No second classifier
+     LLM needed; `done_reason` is the deterministic signal.
+  Caveat still open: clean transcriptions turn the load-bearing E19 reasoning
+  match into a leftover (its frame is a quote, not a card), handing E19 to the
+  clean "Signals" extra — the position-vs-content question is unresolved.
+
 ## VLM / OCR specifics
 
 - **Model: `qwen3-vl:2B`.** Benchmarked alternatives and rejected them:
@@ -181,6 +200,15 @@ Three sources of canonical episode ORDER, cheapest first:
   processed this run.
 - Every episode record has `identified_by`: `runtime-align` / `title-card` /
   `elimination`, plus `confidence` and `verified_by_titlecard`.
+- **Video-format outlier warning.** Each record carries `video_format`
+  (`1080p`/`480i`/…) and `audio_format`, read from the Blu-ray MPLS STN stream
+  table (`_stn_formats` — pure metadata, no payload; end-anchored so a bad
+  layout fails soft to None; audio is best-effort, video is exact). At report
+  time `format_outliers` flags episodes whose video format differs from the
+  run's majority — they matched correctly but point to an inferior source. The
+  Avatar BD authors 11 of its 61 episodes (the Sozin's Comet finale, Day of
+  Black Sun, a few S1/S2) at 480i SD among a 1080p show; the warning surfaces
+  all of them. DVD titles have `video_format=None` (not parsed) → never flagged.
 
 ## Operational gotchas (Ollama OOM + orchestration)
 

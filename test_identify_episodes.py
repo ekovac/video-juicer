@@ -650,6 +650,33 @@ class CollisionTest(unittest.TestCase):
         self.assertEqual(leftovers, [])
 
 
+class FormatOutlierTest(unittest.TestCase):
+    def asg(self, num, vf):
+        t = title(num, 1440)
+        t.video_format = vf
+        return ie.Assignment(disc=disc([], fmt="bluray"), title=t,
+                             episodes=[ie.Episode(3, num, f"E{num}", 1440)],
+                             delta=0.0, confidence="high")
+
+    def test_minority_flagged_against_majority(self):
+        # Avatar shape: a 1080p season with a 480i finale block
+        asgs = [self.asg(n, "1080p") for n in range(1, 18)] + \
+               [self.asg(n, "480i") for n in range(18, 22)]
+        maj, out = ie.format_outliers(asgs)
+        self.assertEqual(maj, "1080p")
+        self.assertEqual(sorted(a.episodes[0].number for a in out), [18, 19, 20, 21])
+
+    def test_uniform_format_no_outliers(self):
+        asgs = [self.asg(n, "1080p") for n in range(1, 13)]
+        maj, out = ie.format_outliers(asgs)
+        self.assertEqual(out, [])
+
+    def test_unknown_formats_ignored(self):
+        # DVD / unparsed STN -> video_format None -> no false warning
+        asgs = [self.asg(n, None) for n in range(1, 13)]
+        self.assertEqual(ie.format_outliers(asgs), (None, []))
+
+
 class MergeTest(unittest.TestCase):
     def test_merge_replaces_only_reprocessed_discs(self):
         existing = [

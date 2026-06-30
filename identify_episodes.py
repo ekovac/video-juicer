@@ -233,6 +233,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             "verified_by_titlecard": a.verified_name is not None,
             "identified_by": a.method or (
                 "title-card" if args.ocr_identify else "runtime-align"),
+            "video_format": a.title.video_format,
+            "audio_format": a.title.audio_format,
             "suggested_filename": suggested_filename(show, a.episodes, year,
                                                      args.tv_id),
         })
@@ -339,7 +341,23 @@ def main(argv: Optional[list[str]] = None) -> int:
               "identities by title card:")
         for name, reason in unverifiable:
             print(f"  {name}: {reason}")
-    return 1 if (problems or crossdisc or unverifiable) else 0
+
+    # Video-format outliers: episodes authored at a lower quality than the rest
+    # (e.g. Avatar's 480i Sozin's Comet finale among a 1080p season). Correctly
+    # identified, but the selected source is inferior — flag before ripping.
+    maj_fmt, outliers = format_outliers(all_assignments)
+    if outliers:
+        print(f"\nWARNING: video format differs from the majority ({maj_fmt}) — "
+              "these episodes are a lower-quality source on the disc:")
+        for a in sorted(outliers, key=lambda a: (a.episodes[0].season,
+                                                 a.episodes[0].number)):
+            e0 = a.episodes[0]
+            af = f", {a.title.audio_format}" if a.title.audio_format else ""
+            print(f"  S{e0.season:02d}E{e0.number:02d} {a.title.video_format}{af}"
+                  f"  ({a.disc.path.name} title "
+                  f"{rip_title_number(a.disc, a.title)})  "
+                  f"{' & '.join(e.name for e in a.episodes)}")
+    return 1 if (problems or crossdisc or unverifiable or outliers) else 0
 
 
 if __name__ == "__main__":
