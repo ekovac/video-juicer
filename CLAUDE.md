@@ -36,6 +36,15 @@ Three sources of canonical episode ORDER, cheapest first:
    clips are the ordered union of the episode clips, so its order IS broadcast
    order, *exact even for same-runtime scrambled discs*. Free, no OCR. Avatar
    has one; MOTU does not. Sets `order_key` + marks `kind="play-all"`.
+   - **DVD analogue: `mark_dvd_playall`** — a DVD play-all is one title whose
+     runtime ≈ the sum of the episode titles (which share its audio layout;
+     extras/menus have fewer streams). It marks the play-all `kind="play-all"`
+     and each episode `kind="episode-candidate"`, identifying the episode SET
+     and order *independent of episode runtimes*. Essential when TMDB runtimes
+     are wrong: Broken Saints (tmdb 111718) reports 9 min for all 24 chapters
+     though they run 9-49 min, so the length band picked 6 wrong titles/disc;
+     the play-all picks the right 8/7/8/10. Non-regressive — Venture Bros (which
+     also has DVD play-alls) is metadata-aligned and ignores the marks, 81/81.
 3. **Title-card OCR** — when neither of the above is available.
 
 `assess_ordering` decides per disc whether the episode ORDER can be trusted:
@@ -90,6 +99,20 @@ Three sources of canonical episode ORDER, cheapest first:
 - **Candidate length filter** is `valid_episode_lengths`, NOT a wide band: TMDB
   per-episode runtimes ∪ multiples of the median (robust to a wrong/null TMDB
   runtime for a long episode — it still lands on k*median) ∪ consecutive sums.
+  `episode_candidates` overrides it with the `mark_dvd_playall` set when present
+  (the play-all is used *because* runtimes are untrusted, so the length band is
+  moot). For the same reason the OCR two-parter heuristic (claim N+1 when a
+  title is ~2x the runtime) is **skipped for `episode-candidate` titles** — with
+  wrong runtimes every single looked like a 2x double, so it merged E01+E02 and
+  the collision pass then demoted the correct standalone.
+- **Known limitation (Broken Saints back discs):** a feature-length finale split
+  across many DVD titles (E24 "Truth" = ~7 titles, only fragments carrying a
+  card) does not map cleanly to one title; sub-segments open with epigraph
+  quotes, and short common-word titles (Truth/Inside/Signals/Trinity) match any
+  quote frame containing the word. Also a VLM *reasoning dump* can still
+  fuzzy-match (~0.80) via the SequenceMatcher branch — the verbatim branch is
+  guarded but the fuzzy branch is not. Unresolved; fixing it is delicate (on
+  Broken Saints a reasoning-dump match is currently load-bearing for E19).
 
 ## VLM / OCR specifics
 

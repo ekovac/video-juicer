@@ -68,6 +68,49 @@ class PlayAllTest(unittest.TestCase):
         self.assertIsNone(ie.detect_play_all(s1d2_titles(with_play_all=False)))
 
 
+class DvdPlayAllTest(unittest.TestCase):
+    # Broken Saints shape: a play-all title whose runtime == sum of the episode
+    # titles (which share its audio layout), plus low-audio extras and dummies.
+    def _disc(self, ep_durs, extra_durs=(), pa_audio=3):
+        eps = [title(i + 3, d, [d], n_audio=pa_audio) for i, d in enumerate(ep_durs)]
+        pa = title(1, sum(ep_durs), [], n_audio=pa_audio)
+        dummy = title(2, 1.0, [], n_audio=0)
+        extras = [title(50 + i, d, [d], n_audio=1) for i, d in enumerate(extra_durs)]
+        return [pa, dummy] + eps + extras
+
+    def test_marks_playall_and_episodes(self):
+        ts = self._disc([998, 606, 549, 660, 1758], extra_durs=(1283, 686))
+        pa = ie.mark_dvd_playall(ts)
+        self.assertEqual(pa.id, 1)
+        self.assertEqual(pa.kind, "play-all")
+        marked = [t.id for t in ts if t.kind == "episode-candidate"]
+        self.assertEqual(marked, [3, 4, 5, 6, 7])      # episodes, not extras/dummy
+
+    def test_episode_candidates_prefer_marked_over_length_band(self):
+        # bogus uniform runtimes (Broken Saints: TMDB says 9 min for all) would
+        # make the length band miss the real 16-29 min episodes; the play-all
+        # marking overrides it.
+        ts = self._disc([998, 606, 549, 660, 1758])
+        d = disc(ts)
+        ie.mark_dvd_playall(ts)
+        pool = [ie.Episode(1, i + 1, f"E{i+1}", 540) for i in range(24)]
+        cands = ie.episode_candidates(d, pool)
+        self.assertEqual([t.id for t in cands], [3, 4, 5, 6, 7])
+
+    def test_episode_with_extra_audio_track_still_counted(self):
+        # a real episode may carry an extra commentary (n_audio 4 vs play-all 3)
+        ts = self._disc([998, 606, 549, 660])
+        ts[4].n_audio = 4                              # title id 5: 4 audio
+        pa = ie.mark_dvd_playall(ts)
+        self.assertIsNotNone(pa)
+        self.assertIn(5, [t.id for t in ts if t.kind == "episode-candidate"])
+
+    def test_no_playall_when_no_title_sums_to_peers(self):
+        # ordinary disc: episodes don't sum to any single title -> no detection
+        ts = [title(i + 1, 1320, [1320], n_audio=2) for i in range(5)]
+        self.assertIsNone(ie.mark_dvd_playall(ts))
+
+
 class ClassifyTest(unittest.TestCase):
     def test_duplicate_titles_dropped(self):
         ts = [title(1, 1350, [1350]), title(2, 1350, [1350])]

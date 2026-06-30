@@ -549,6 +549,12 @@ def episode_candidates(disc: Disc, pool: list[Episode]) -> list[Title]:
     """Episode-length playlists on a disc, in play order — the candidates an
     OCR pass should consider. Uses the TMDB runtime set when available, else a
     wide band around the median."""
+    # A detected play-all (DVD: a title that concatenates the episodes; BD:
+    # order_by_playall) names the episode set structurally, independent of
+    # runtimes — use it when present, since it survives wrong TMDB durations.
+    marked = [t for t in disc.titles if t.kind == "episode-candidate"]
+    if marked:
+        return sorted(marked, key=lambda t: t.order_key)
     bands = valid_episode_lengths(pool)
     if bands:
         lengths, tol = bands
@@ -604,8 +610,15 @@ def ocr_identify(discs: list[Disc], seasons: dict[int, list[Episode]],
                              d.path.name, t.id, score)
                     continue
                 eps = [ep]
-                # combined two-parter playlist (~2x runtime): claim next too
-                if ep.runtime and t.duration >= ep.runtime * 1.6:
+                # combined two-parter playlist (~2x runtime): claim next too.
+                # This trusts the TMDB runtime, so skip it for play-all-derived
+                # candidates — the play-all is used precisely *because* runtimes
+                # are unreliable (Broken Saints: every 9-min TMDB runtime vs real
+                # 9-49 min titles made every single look like a 2x double, then
+                # got the correct single demoted). The play-all already segments
+                # the disc into one-episode units; its card gives the identity.
+                if (t.kind != "episode-candidate" and ep.runtime
+                        and t.duration >= ep.runtime * 1.6):
                     nxt = next((e for e in pool if e.number == ep.number + 1), None)
                     if nxt:
                         eps.append(nxt)
