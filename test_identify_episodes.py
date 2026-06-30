@@ -804,6 +804,42 @@ class RipCommandTest(unittest.TestCase):
                    if l.startswith("HandBrakeCLI"))
         self.assertIn("-i '/run/media/ST ENTERPRISE S1D1'", rip)
 
+    def _ep(self, n, vf):
+        return {"kind": "episode", "image": "/d/disc.iso", "title": n,
+                "season": 1, "episodes": [n], "video_format": vf,
+                "audio_format": "AC3" if vf == "480i" else "DTS-HDMA",
+                "suggested_filename": f"Show/Season 01/Show - S01E{n:02d} - X.mkv"}
+
+    def test_no_alt_block_when_uniform_format(self):
+        recs = [self._ep(n, "1080p") for n in range(1, 6)]
+        out = self.lines(recs, "P")
+        self.assertNotIn("PRESET_ALT=\"$PRESET\"", out)
+        self.assertFalse(any("NON-CONFORMING" in l for l in out))
+
+    def test_outliers_split_into_alt_block(self):
+        recs = [self._ep(n, "1080p") for n in range(1, 6)] + \
+               [self._ep(n, "480i") for n in (6, 7)]
+        out = self.lines(recs, "P")
+        self.assertIn('PRESET_ALT="$PRESET"', out)
+        self.assertTrue(any("NON-CONFORMING VIDEO FORMAT (480i)" in l for l in out))
+        # the 480i episodes rip with $PRESET_ALT, the rest with $PRESET
+        rips = [l for l in out if l.startswith("HandBrakeCLI")]
+        alt = [l for l in rips if '"$PRESET_ALT"' in l]
+        main = [l for l in rips if '"$PRESET"' in l]
+        self.assertEqual(len(alt), 2)        # E06, E07
+        self.assertEqual(len(main), 5)       # E01-E05
+        # outlier lines are annotated with their format
+        self.assertTrue(any(l.startswith("#") and "480i" in l and "AC3" in l
+                            for l in out))
+
+    def test_old_manifest_without_formats_unchanged(self):
+        # records lacking video_format -> no majority -> single block
+        recs = [{"kind": "episode", "image": "/d/d.iso", "title": n,
+                 "suggested_filename": f"S/Season 01/S - S01E{n:02d} - X.mkv"}
+                for n in range(1, 6)]
+        out = self.lines(recs, "P")
+        self.assertFalse(any("PRESET_ALT" in l for l in out))
+
 
 if __name__ == "__main__":
     unittest.main()

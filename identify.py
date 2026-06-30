@@ -833,6 +833,26 @@ def suggested_filename(show: str, eps: list[Episode],
     return f"{show_dir}/{folder}/{fname}"
 
 
+def _record_video_majority(records: list[dict]) -> Optional[str]:
+    """Majority video format among episode records, or None if uniform/unknown."""
+    from collections import Counter
+    fmts = [r.get("video_format") for r in records
+            if r.get("kind") == "episode" and r.get("video_format")]
+    if len(fmts) < 3 or len(set(fmts)) < 2:
+        return None
+    return Counter(fmts).most_common(1)[0][0]
+
+
+def _emit_rip_line(r: dict, preset_var: str) -> None:
+    out = r["suggested_filename"]
+    parent = os.path.dirname(out)
+    if parent:
+        print(f'mkdir -p "$PREFIX/{parent}"')
+    print(f'HandBrakeCLI "${{HANDBRAKE_OPTS[@]}}" '
+          f'-i {shlex.quote(r["image"])} -t {r["title"]} '
+          f'--preset "{preset_var}" -o "$PREFIX/{out}"')
+
+
 def emit_rip_commands(records: list[dict], preset: str,
                       output_prefix: Optional[str] = None) -> None:
     """Emit a runnable bash rip script (one HandBrakeCLI call per episode).
@@ -841,29 +861,56 @@ def emit_rip_commands(records: list[dict], preset: str,
     can be tweaked after generation without touching every line:
       PREFIX          output root (e.g. a transcode disk)
       PRESET          HandBrake preset name
+      PRESET_ALT      preset for format-outlier episodes (only when present)
       HANDBRAKE_OPTS  array of extra flags (e.g. --preset-import-gui to load
                       GUI-saved presets) — edit it to apply to every rip
     suggested_filename is a relative path including season folders, so each
-    rip is preceded by an idempotent mkdir -p for its season directory."""
+    rip is preceded by an idempotent mkdir -p for its season directory.
+
+    Episodes whose video format differs from the majority (Avatar's 480i finale
+    among a 1080p show) are emitted in a separate, commented block that rips
+    with $PRESET_ALT, so the user can give that lower-quality source a different
+    encode (e.g. a deinterlacing profile) without touching the rest."""
+    eps = [r for r in records if r.get("kind") == "episode"]
+    majority = _record_video_majority(records)
+    outliers = [r for r in eps
+                if majority and r.get("video_format")
+                and r["video_format"] != majority]
+    out_ids = {id(r) for r in outliers}
+    conforming = [r for r in eps if id(r) not in out_ids]
+
     print("#!/usr/bin/env bash")
     print("set -euo pipefail")
     print()
     print(f"PREFIX={shlex.quote(str(output_prefix) if output_prefix else '.')}")
     print(f"PRESET={shlex.quote(preset)}")
+    if outliers:
+        odd = sorted({r["video_format"] for r in outliers})
+        print(f"# {len(outliers)} episode(s) are {'/'.join(odd)} on the disc "
+              f"(the rest are {majority}); they rip with PRESET_ALT below so you")
+        print("# can choose a different encode for them. Defaults to PRESET.")
+        print('PRESET_ALT="$PRESET"')
     print("# Extra HandBrakeCLI flags applied to every rip, e.g.:")
     print("#   HANDBRAKE_OPTS=(--preset-import-gui)")
     print("HANDBRAKE_OPTS=()")
     print()
-    for r in records:
-        if r.get("kind") != "episode":
-            continue
-        out = r["suggested_filename"]
-        parent = os.path.dirname(out)
-        if parent:
-            print(f'mkdir -p "$PREFIX/{parent}"')
-        print(f'HandBrakeCLI "${{HANDBRAKE_OPTS[@]}}" '
-              f'-i {shlex.quote(r["image"])} -t {r["title"]} '
-              f'--preset "$PRESET" -o "$PREFIX/{out}"')
+    for r in conforming:
+        _emit_rip_line(r, "$PRESET")
+    if outliers:
+        odd = sorted({r["video_format"] for r in outliers})
+        print()
+        print(f"# {'=' * 70}")
+        print(f"# NON-CONFORMING VIDEO FORMAT ({'/'.join(odd)}) — "
+              f"lower-quality source on the disc.")
+        print("# Reviewed separately so you can apply a different encode profile")
+        print("# (edit PRESET_ALT above, e.g. a deinterlace/upscale preset).")
+        print(f"# {'=' * 70}")
+        for r in sorted(outliers, key=lambda r: (r.get("season", 0),
+                                                 r.get("episodes", [0]))):
+            af = f", {r['audio_format']}" if r.get("audio_format") else ""
+            print(f"# {os.path.basename(r['suggested_filename'])}  "
+                  f"[{r['video_format']}{af}]")
+            _emit_rip_line(r, "$PRESET_ALT")
 
 
 def merge_records(existing: list[dict], new: list[dict],

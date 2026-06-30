@@ -209,6 +209,12 @@ Three sources of canonical episode ORDER, cheapest first:
   Avatar BD authors 11 of its 61 episodes (the Sozin's Comet finale, Day of
   Black Sun, a few S1/S2) at 480i SD among a 1080p show; the warning surfaces
   all of them. DVD titles have `video_format=None` (not parsed) → never flagged.
+  - The **rip script** splits on this too: the conforming episodes rip with
+    `$PRESET`, and the format-outliers go in a separate commented block that rips
+    with `$PRESET_ALT` (defaults to `$PRESET`), so the user can give the SD
+    source a different encode (e.g. a deinterlace/upscale preset) without
+    touching the rest. Old manifests lacking `video_format` → one block, as
+    before.
 
 ## Operational gotchas (Ollama OOM + orchestration)
 
