@@ -160,9 +160,37 @@ Three sources of canonical episode ORDER, cheapest first:
 
 ## VLM / OCR specifics
 
-- **Model: `qwen3-vl:2B`.** Benchmarked alternatives and rejected them:
-  moondream *describes* images instead of transcribing (unusable); `glm-ocr`
-  equally accurate but ~3x slower; `qwen2.5vl` translates non-English titles.
+- **OCR engine is a hybrid, `--ocr-engine auto` (default): Tesseract first,
+  VLM fallback.** A title card is a plain OCR task, not a reasoning one — so
+  `tesseract_text` (pytesseract, ~60-95 ms/frame) reads plain block cards
+  (Sonic, Enterprise, Avatar) outright and returns "" *instantly* on text-less
+  scene frames. Only when Tesseract finds no accept-match in a whole window does
+  `verify_title` fall back to the VLM, **over the whole window** (anchor-sorted,
+  so a known anchor still hits the card first). On Sonic SatAM this cut a
+  multi-hour VLM-only run to ~21 min (season 1 near-instant) with no accuracy
+  loss on plain cards; stylized-script shows (Venture Bros) still read via the
+  VLM fallback. `--ocr-engine {tesseract,vlm}` force either.
+  - **Do NOT gate the VLM fallback on "Tesseract saw text here."** Tried it (to
+    skip truncation-bait scene frames) — it broke VB: a stylized card Tesseract
+    can't read returns "" just like a scene frame, so gating skips the card
+    frame and misses the episode (VB got 0.56/wrong vs 1.00 correct un-gated).
+    Tesseract-empty can't distinguish "no text" from "text I can't read"; only a
+    text-*region* detector could, which is the real follow-up for wart 1.
+  - **TODO (wart 1): the VLM fallback still truncates on busy scene frames** and
+    the search rips too many windows (front/end/widen) per hard title — that was
+    the bulk of Sonic's ~20 min season 2, mostly `rip_window` (mencoder), not
+    OCR. A text-region pre-detector (flag frames with text regions, regardless
+    of whether Tesseract can read them) would prune scene frames from the VLM
+    pass *without* the VB failure above.
+  - **TODO (wart 2): OCR overrides correct metadata on part-number two-parters.**
+    "Blast to the Past (1)/(2)" show an identical card with no "(1)/(2)", so OCR
+    matches both to part 1 and *overrode* the alignment's correct E05→part-2,
+    losing it (Sonic S02E05). When the matched episode is a `(N)`-part title and
+    the card lacks the part number, OCR should NOT override the alignment (the
+    monotonic order distinguishes the parts; the card can't).
+- **Model (VLM fallback): `qwen3-vl:2B`.** Benchmarked alternatives and rejected
+  them: moondream *describes* images instead of transcribing (unusable);
+  `glm-ocr` equally accurate but ~3x slower; `qwen2.5vl` translates titles.
 - qwen3-vl is a *thinking* model: it spends tokens reasoning before the final
   answer, so `num_predict` must cover both. `VLM_NUM_PREDICT=8192` (it's a cap,
   not a target — frames that finish early stop regardless, so a big cap is

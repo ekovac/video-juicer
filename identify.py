@@ -349,6 +349,17 @@ def ollama_chat(model: str, prompt: str, image_path: Path,
                 # elimination; a wrong one silently corrupts the mapping.
                 log.warning("%s: VLM truncated mid-think at num_predict=%d; "
                             "no transcription", image_path.name, VLM_NUM_PREDICT)
+                # Persist the offending frame (content-hashed, so dups collapse)
+                # when OCR_DEBUG_FRAMES names a dir — for diagnosing WHY these
+                # frames make the model reason past the cap.
+                dbg = os.environ.get("OCR_DEBUG_FRAMES")
+                if dbg:
+                    import hashlib
+                    raw = image_path.read_bytes()
+                    out = Path(dbg)
+                    out.mkdir(parents=True, exist_ok=True)
+                    (out / f"trunc_{hashlib.md5(raw).hexdigest()[:10]}.jpg"
+                     ).write_bytes(raw)
             return content
         except Exception as e:  # noqa: BLE001 - URLError, timeout, bad JSON
             if attempt >= retries:
@@ -494,11 +505,37 @@ def extract_frames(video: Path, workdir: Path,
 ANCHOR_RADIUS = 90.0   # seconds either side of a learned card location
 
 
+def tesseract_text(frame: Path) -> str:
+    """Fast CPU OCR of a frame via Tesseract. ~60-95 ms/frame; returns "" on no
+    text or failure. Plain block title cards (Sonic, Enterprise, Avatar) read
+    cleanly and, crucially, a busy text-less scene returns "" instantly instead
+    of a thinking VLM burning tokens on it. Stylized script cards (Venture Bros)
+    don't read here — the VLM fallback in verify_title covers those."""
+    try:
+        import pytesseract
+        from PIL import Image
+        return pytesseract.image_to_string(Image.open(frame)).strip()
+    except Exception as e:  # noqa: BLE001 - tesseract/PIL missing or bad image
+        log.debug("tesseract failed on %s: %s", frame.name, e)
+        return ""
+
+
+_VLM_OK: dict[tuple, bool] = {}
+
+
+def _vlm_reachable(model: str, host: str) -> bool:
+    """vlm_available, cached per (model, host) so the hybrid path checks once."""
+    key = (model, host)
+    if key not in _VLM_OK:
+        _VLM_OK[key] = vlm_available(model, host)
+    return _VLM_OK[key]
+
+
 def verify_title(disc: Disc, title: Title, episodes: list[Episode],
                  model: str, host: str, workdir: Path,
                  window: float = 150.0, front_window: float = 280.0,
                  fallback_window: float = 720.0, accept: float = 0.8,
-                 anchor: Optional[float] = None
+                 anchor: Optional[float] = None, engine: str = "auto"
                  ) -> tuple[Optional[Episode], float, Optional[float]]:
     """OCR a title's title-card window against the season's episode names.
 
@@ -514,6 +551,29 @@ def verify_title(disc: Disc, title: Title, episodes: list[Episode],
     fallback_window for recap-delayed premieres. So the first episode or two
     on a disc pay full cost; once the location is known the rest are cheap."""
     state = {"ep": None, "score": 0.0, "time": None}
+    use_tess = engine in ("auto", "tesseract")
+    use_vlm = engine == "vlm" or (engine == "auto"
+                                  and _vlm_reachable(model, host))
+
+    def ocr_pass(timed, ocr_fn, tag):
+        """OCR every frame with one engine; return (ep, score) on the first
+        accept-match, updating the running best."""
+        for frame, ts in timed:
+            try:
+                text = ocr_fn(frame)
+            except Exception as e:  # noqa: BLE001
+                log.error("%s failed on %s: %s", tag, frame.name, e)
+                continue
+            ep, score = fuzzy_best(text, episodes)
+            if score > state["score"]:
+                state["ep"], state["score"], state["time"] = ep, score, ts
+            if score >= accept:
+                log.info("%s title %d: verified %r -> S%02dE%02d (%.2f) @%.0fs "
+                         "[%s]", disc.path.name, title.id,
+                         text.splitlines()[0][:60] if text else "",
+                         ep.season, ep.number, score, ts, tag)
+                return ep, score
+        return None
 
     def scan(start, length, anchor_time=None):
         start = max(0.0, start)
@@ -528,21 +588,25 @@ def verify_title(disc: Disc, title: Title, episodes: list[Episode],
             timed = [(f, start + i * FRAME_INTERVAL) for i, f in enumerate(frames)]
             if anchor_time is not None:   # try frames nearest the anchor first
                 timed.sort(key=lambda ft: abs(ft[1] - anchor_time))
-            for frame, ts in timed:
-                try:
-                    text = ollama_chat(model, VLM_PROMPT, frame, host)
-                except Exception as e:  # noqa: BLE001
-                    log.error("VLM permanently failed on %s: %s", frame.name, e)
-                    continue
-                ep, score = fuzzy_best(text, episodes)
-                if score > state["score"]:
-                    state["ep"], state["score"], state["time"] = ep, score, ts
-                if score >= accept:
-                    log.info("%s title %d: verified %r -> S%02dE%02d (%.2f) @%.0fs",
-                             disc.path.name, title.id,
-                             text.splitlines()[0][:60] if text else "",
-                             ep.season, ep.number, score, ts)
-                    return ep, score
+            # Pass 1: fast Tesseract sweep — reads plain block cards outright
+            # and returns "" instantly on text-less scene frames.
+            if use_tess:
+                hit = ocr_pass(timed, tesseract_text, "tesseract")
+                if hit:
+                    return hit
+            # Pass 2: VLM fallback over the WHOLE window. A stylized card
+            # (Venture Bros' script titles) is one Tesseract returns "" for —
+            # same as a scene frame — so we must NOT gate the fallback on "did
+            # Tesseract see text" (that skips the card frame and misses it, as
+            # VB did). Anchor-sorted, so a known anchor still hits the card
+            # first. Cost: scene frames still truncate the thinking VLM here —
+            # a follow-up (text-region detection) can prune them safely.
+            if use_vlm and state["score"] < accept:
+                hit = ocr_pass(
+                    timed, lambda f: ollama_chat(model, VLM_PROMPT, f, host),
+                    "vlm")
+                if hit:
+                    return hit
         finally:
             video.unlink(missing_ok=True)
         return None
@@ -655,7 +719,8 @@ def ocr_identify(discs: list[Disc], seasons: dict[int, list[Episode]],
                     anchor = (t.duration - off) if from_end else off
                 ep, score, card_time = verify_title(
                     d, t, pool, args.vlm_model, args.ollama_host, workdir,
-                    accept=args.ocr_accept, anchor=anchor)
+                    accept=args.ocr_accept, anchor=anchor,
+                    engine=getattr(args, "ocr_engine", "auto"))
                 if card_time is not None and ep and score >= args.ocr_accept:
                     from_end = card_time > t.duration / 2
                     card_ends.append(from_end)
@@ -814,23 +879,23 @@ def format_outliers(assignments: list[Assignment]
 
 def verify_assignment(a: Assignment, seasons: dict[int, list[Episode]],
                       vlm_model: str, ollama_host: str, workdir: Path,
-                      accept: float = 0.8) -> Optional[bool]:
+                      accept: float = 0.8, engine: str = "auto") -> Optional[bool]:
     """OCR one assignment's title card and reconcile it with the alignment.
 
-    Mutates `a` (verified_name / episodes / confidence) when the VLM is
+    Mutates `a` (verified_name / episodes / confidence) when the OCR is
     confident. Returns True if the card CONFIRMED the alignment, False if it
     OVERRODE it (a real disagreement), None if no card was found (alignment
     kept). The True/False distinction is what a spot-check keys on."""
     season_pool = seasons.get(a.episodes[0].season, [])
     ep, score, _ = verify_title(a.disc, a.title, season_pool, vlm_model,
-                                ollama_host, workdir, accept=accept)
+                                ollama_host, workdir, accept=accept, engine=engine)
     if ep and score >= accept:
         agreed = (ep.season == a.episodes[0].season
                   and [ep.number] == [e.number for e in a.episodes])
         a.verified_name = ep.name
         if not agreed:
-            log.warning("%s title %d: VLM says S%02dE%02d %r, alignment said "
-                        "%s — using VLM", a.disc.path.name, a.title.id,
+            log.warning("%s title %d: OCR says S%02dE%02d %r, alignment said "
+                        "%s — using OCR", a.disc.path.name, a.title.id,
                         ep.season, ep.number, ep.name,
                         [e.number for e in a.episodes])
             a.episodes = [ep]
@@ -870,7 +935,8 @@ def probe_card_presence(discs: list[Disc], seasons: dict[int, list[Episode]],
             for t in mids:
                 ep, score, _ = verify_title(d, t, pool, args.vlm_model,
                                             args.ollama_host, workdir,
-                                            accept=args.ocr_accept)
+                                            accept=args.ocr_accept,
+                                            engine=getattr(args, "ocr_engine", "auto"))
                 probed += 1
                 log.info("card probe: %s pl %d -> %.2f", d.path.name, t.id, score)
                 if ep and score >= args.ocr_accept:

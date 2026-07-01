@@ -86,6 +86,11 @@ def main(argv: Optional[list[str]] = None) -> int:
                     help="directory for temporary rips/frames (put on disk, "
                          "not tmpfs, for large OCR runs)")
     ap.add_argument("--vlm-model", default="qwen3-vl:2B")
+    ap.add_argument("--ocr-engine", choices=("auto", "tesseract", "vlm"),
+                    default="auto",
+                    help="OCR engine for title cards: 'auto' (fast Tesseract "
+                         "first, VLM fallback for stylized cards — default), "
+                         "'tesseract' only, or 'vlm' only")
     ap.add_argument("--ollama-host",
                     default=os.environ.get("OLLAMA_HOST", "http://localhost:11434"))
     ap.add_argument("-v", "--verbose", action="store_true")
@@ -201,7 +206,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                                          dir=args.scratch_dir) as tmp:
             for a in targets:
                 verify_assignment(a, seasons, args.vlm_model, args.ollama_host,
-                                  Path(tmp), args.ocr_accept)
+                                  Path(tmp), args.ocr_accept, args.ocr_engine)
     # cheap spot-check: OCR each disc's first and last matched episode; if
     # either disagrees with the alignment, fully verify that disc. A dropped/
     # shifted title renumbers the whole contiguous run, so the boundary episodes
@@ -220,7 +225,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                 sample = [ordered[i] for i in sorted({0, len(ordered) - 1})]
                 results = [verify_assignment(a, seasons, args.vlm_model,
                                              args.ollama_host, Path(tmp),
-                                             args.ocr_accept) for a in sample]
+                                             args.ocr_accept, args.ocr_engine)
+                           for a in sample]
                 # Escalate UNLESS both boundaries positively confirmed. A
                 # disagreement is an error; a no-readable-card boundary means we
                 # couldn't verify the disc cheaply (Sonic disc 3's boundary
@@ -236,7 +242,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                     if a not in sample:
                         verify_assignment(a, seasons, args.vlm_model,
                                           args.ollama_host, Path(tmp),
-                                          args.ocr_accept)
+                                          args.ocr_accept, args.ocr_engine)
 
     # ---- report ----
     records = []
