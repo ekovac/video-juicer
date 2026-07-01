@@ -193,7 +193,8 @@ def run_ocr(conn, args) -> dict:
             ep, score, card_t = verify_title(
                 disc, title, pool, args.vlm_model, args.ollama_host, workdir,
                 accept=args.ocr_accept, anchor=anchors.get(disc_id),
-                engine=args.ocr_engine, capture=capture)
+                engine=args.ocr_engine, capture=capture,
+                text_filter=getattr(args, "text_filter", True))
             if card_t is not None:
                 anchors[disc_id] = card_t
 

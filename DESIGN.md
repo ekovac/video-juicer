@@ -156,11 +156,15 @@ UNIX tool with structured output and no hidden state.** Concretely:
   evidence (wraps `align`, `runtime_scale`).
 - `vj run play-all <state.db> --disc D` — order via play-all (wraps
   `detect_play_all` / `order_by_playall`).
-- `vj run ocr <state.db> --title T [--title …] [--include-specials]` —
-  title-card OCR on specific titles (wraps `verify_title`). The match pool is
-  scoped to the disc's season by default (efficient, right for episodes);
-  `--include-specials` widens it with the S00 pool so a leftover title can be
-  identified as a special (its card has something to match against).
+- `vj run ocr <state.db> --title T [--title …] [--include-specials]
+  [--no-text-filter]` — title-card OCR on specific titles (wraps
+  `verify_title`). The match pool is scoped to the disc's season by default
+  (efficient, right for episodes); `--include-specials` widens it with the S00
+  pool so a leftover title can be identified as a special. The VLM pass is gated
+  by an OCR-free EAST text-region detector (`text_region.py`) that prunes
+  text-less scene frames — recall-first, fails open, guarded; `--no-text-filter`
+  disables it for shows whose title is painted into the scene art (Adventure
+  Time), where a text detector may not see the card.
 - `vj run synopsis <state.db> --title T` — dialogue→synopsis judge (wraps
   `synopsis.identify_by_synopsis`).
 - `vj run elimination <state.db> [--disc D]` — recover-by-elimination.

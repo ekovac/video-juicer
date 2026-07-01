@@ -223,12 +223,26 @@ Three sources of canonical episode ORDER, cheapest first:
     frame and misses the episode (VB got 0.56/wrong vs 1.00 correct un-gated).
     Tesseract-empty can't distinguish "no text" from "text I can't read"; only a
     text-*region* detector could, which is the real follow-up for wart 1.
-  - **TODO (wart 1): the VLM fallback still truncates on busy scene frames** and
-    the search rips too many windows (front/end/widen) per hard title — that was
-    the bulk of Sonic's ~20 min season 2, mostly `rip_window` (mencoder), not
-    OCR. A text-region pre-detector (flag frames with text regions, regardless
-    of whether Tesseract can read them) would prune scene frames from the VLM
-    pass *without* the VB failure above.
+  - **Wart 1 (fixed): scene frames flooding the VLM pass.** The VLM fallback ran
+    on every frame of a window; on a long title with no card in the primary band
+    it ground through hundreds (a 50-min VB special once took 44 min). Now
+    `verify_title` gates the VLM pass with an **OCR-free EAST text-region
+    detector** (`text_region.py`): only frames EAST scores as bearing text reach
+    the VLM. It's **recall-first** (real cards score ~1.0, so a high conf
+    threshold prunes scenes without dropping cards) and **fails open** (missing
+    model / cv2 → no pruning) and **guarded** (if it would prune the whole
+    window, keep the window). Measured on a VB(stylized)+Enterprise(plain) card
+    corpus vs scene negatives: ~100% recall on real episode cards, ~70% scene
+    rejection, ~50 ms/frame. Needs `frozen_east_text_detection.pb` (~96 MB,
+    `VJ_EAST_MODEL` or the artifacts `models/` dir). Classical detectors were
+    tried and rejected first (morphological gate ~60% recall on stylized/
+    textured cards; MSER ~30% scene rejection) — see text_region.py.
+  - **Wart 1 caveat — scene-art title cards.** EAST detects *text*; a show whose
+    title is painted INTO the scene art (Adventure Time — hand-lettered, more
+    stylized than VB) may not read as text, so the gate could prune the real
+    card. Default is on; disable per-run with `vj run ocr --no-text-filter`
+    (also on `vj auto`). The escalation probe (`probe_card_presence`) always
+    runs unfiltered so a false "no text" never wrongly skips OCR.
   - **TODO (wart 2): OCR overrides correct metadata on part-number two-parters.**
     "Blast to the Past (1)/(2)" show an identical card with no "(1)/(2)", so OCR
     matches both to part 1 and *overrode* the alignment's correct E05→part-2,

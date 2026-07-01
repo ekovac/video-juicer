@@ -7,6 +7,9 @@ debug_frames*/
 *.db
 *.db-wal
 *.db-shm
+# pretrained models (EAST text detector, ~96 MB) live outside the repo
+*.pb
+models/
 *.json.lock
 *.json.tmp
 # local run artifacts live outside the repo (see CLAUDE.md: artifacts dir on the

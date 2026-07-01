@@ -536,7 +536,7 @@ def verify_title(disc: Disc, title: Title, episodes: list[Episode],
                  window: float = 150.0, front_window: float = 280.0,
                  fallback_window: float = 720.0, accept: float = 0.8,
                  anchor: Optional[float] = None, engine: str = "auto",
-                 capture: Optional[dict] = None
+                 capture: Optional[dict] = None, text_filter: bool = True
                  ) -> tuple[Optional[Episode], float, Optional[float]]:
     """OCR a title's title-card window against the season's episode names.
 
@@ -555,6 +555,16 @@ def verify_title(disc: Disc, title: Title, episodes: list[Episode],
     use_tess = engine in ("auto", "tesseract")
     use_vlm = engine == "vlm" or (engine == "auto"
                                   and _vlm_reachable(model, host))
+    # OCR-free text-region gate for the (expensive) VLM pass — prunes scene
+    # frames so the VLM only sees plausible card frames. Fails open (keeps the
+    # frame) if unavailable; lazily imported so cv2 isn't a hard dep of the
+    # metadata path.
+    has_text = None
+    if text_filter and use_vlm:
+        try:
+            from text_region import frame_has_text as has_text
+        except Exception:  # noqa: BLE001 — cv2 missing etc.
+            has_text = None
 
     def ocr_pass(timed, ocr_fn, tag):
         """OCR every frame with one engine; return (ep, score) on the first
@@ -600,16 +610,27 @@ def verify_title(disc: Disc, title: Title, episodes: list[Episode],
                 hit = ocr_pass(timed, tesseract_text, "tesseract")
                 if hit:
                     return hit
-            # Pass 2: VLM fallback over the WHOLE window. A stylized card
-            # (Venture Bros' script titles) is one Tesseract returns "" for —
-            # same as a scene frame — so we must NOT gate the fallback on "did
-            # Tesseract see text" (that skips the card frame and misses it, as
-            # VB did). Anchor-sorted, so a known anchor still hits the card
-            # first. Cost: scene frames still truncate the thinking VLM here —
-            # a follow-up (text-region detection) can prune them safely.
+            # Pass 2: VLM fallback. A stylized card (Venture Bros' script
+            # titles) is one Tesseract returns "" for — same as a scene frame —
+            # so we must NOT gate the fallback on "did Tesseract see text" (that
+            # skips the card frame and misses it, as VB did). Instead, an
+            # OCR-free EAST text-region gate prunes frames that bear NO text at
+            # all (safe: it fires on stylized cards too, unlike Tesseract). It's
+            # recall-first — text cards score ~1.0 — and guarded: if it would
+            # prune the whole window, keep the window. Anchor-sorted so a known
+            # anchor still hits the card first.
             if use_vlm and state["score"] < accept:
+                vlm_timed = timed
+                if has_text is not None:
+                    kept = [ft for ft in timed if has_text(ft[0])]
+                    if kept:                 # guard: never prune to nothing
+                        if len(kept) < len(timed):
+                            log.info("%s title %d: text-gate kept %d/%d frames "
+                                     "for VLM", disc.path.name, title.id,
+                                     len(kept), len(timed))
+                        vlm_timed = kept
                 hit = ocr_pass(
-                    timed, lambda f: ollama_chat(model, VLM_PROMPT, f, host),
+                    vlm_timed, lambda f: ollama_chat(model, VLM_PROMPT, f, host),
                     "vlm")
                 if hit:
                     return hit
@@ -976,7 +997,8 @@ def probe_card_presence(discs: list[Disc], seasons: dict[int, list[Episode]],
                 ep, score, _ = verify_title(d, t, pool, args.vlm_model,
                                             args.ollama_host, workdir,
                                             accept=args.ocr_accept,
-                                            engine=getattr(args, "ocr_engine", "auto"))
+                                            engine=getattr(args, "ocr_engine", "auto"),
+                                            text_filter=False)
                 probed += 1
                 log.info("card probe: %s pl %d -> %.2f", d.path.name, t.id, score)
                 if ep and score >= args.ocr_accept:

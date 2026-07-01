@@ -111,6 +111,18 @@ carry the aired numbering as an `aired` cross-reference. The TMDB type enum:
 - `ffmpeg`, `mencoder`, and a running **Ollama** with a vision model
   (default `qwen3-vl:2B`) — for `vj run ocr`.
 - `HandBrakeCLI` — only for the Blu-ray title-number scan at export time.
+- **EAST text-detection model** (optional, recommended) — `vj run ocr` gates the
+  slow VLM pass with an OCR-free text-region detector so it only reads frames
+  that plausibly bear a title. Drop `frozen_east_text_detection.pb` (~96 MB) in
+  the artifacts `models/` dir or point `VJ_EAST_MODEL` at it. Absent → the gate
+  fails open (no speedup, no risk). It's *recall-first*, but a show whose title
+  is painted into the scene art (Adventure Time) can defeat any text detector —
+  use `vj run ocr --no-text-filter` for those.
+  - **License note:** EAST's model isn't shipped here and its license is unclear
+    (GPL-3.0 upstream code, dubious mirrors, research-terms ICDAR training data).
+    Fine for personal use; the gate is detector-agnostic, so a permissively
+    licensed detector (PaddleOCR/docTR DBNet, Apache-2.0) can be dropped in
+    behind the same `frame_has_text` seam.
 
 ## Tests
 
