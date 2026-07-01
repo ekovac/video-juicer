@@ -60,6 +60,17 @@ def _title_db_id(conn, path2id: dict[str, int], disc: Disc, title) -> int:
     return state.title_id(conn, path2id[str(disc.path)], title.id)
 
 
+def _pool_for(disc: Disc, seasons, specials, all_eps, include_specials: bool):
+    """Episodes a title on `disc` could be. Scoped to the disc's season when it
+    has a hint (efficient, and what you want for episodes); widened with the S00
+    specials when `include_specials` (for identifying a leftover as a special).
+    No hint → the whole series (already includes specials)."""
+    base = seasons.get(disc.season_hint)
+    if base is None:
+        return all_eps
+    return list(base) + (specials if include_specials else [])
+
+
 # ---------------------------------------------------------------------------
 # run align — metadata path -> runtime-align evidence
 # ---------------------------------------------------------------------------
@@ -176,7 +187,8 @@ def run_ocr(conn, args) -> dict:
                          if t.id == conn.execute(
                              "SELECT title_number FROM title WHERE id=?",
                              (tid,)).fetchone()["title_number"])
-            pool = seasons.get(disc.season_hint) or all_eps
+            pool = _pool_for(disc, seasons, specials, all_eps,
+                             getattr(args, "include_specials", False))
             capture: dict = {}
             ep, score, card_t = verify_title(
                 disc, title, pool, args.vlm_model, args.ollama_host, workdir,
@@ -240,7 +252,8 @@ def run_synopsis(conn, args) -> dict:
             tn = conn.execute("SELECT title_number FROM title WHERE id=?",
                               (tid,)).fetchone()["title_number"]
             title = next(t for t in disc.titles if t.id == tn)
-            pool = seasons.get(disc.season_hint) or all_eps
+            pool = _pool_for(disc, seasons, specials, all_eps,
+                             getattr(args, "include_specials", False))
             ep, conf, detail = identify_by_synopsis(
                 disc, title, pool, workdir, args.vlm_model, args.ollama_host)
             ep_id = state.episode_id(conn, ep.season, ep.number) if ep else None

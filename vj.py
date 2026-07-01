@@ -594,6 +594,9 @@ def build_parser() -> argparse.ArgumentParser:
                        default="auto")
     p_run.add_argument("--ocr-accept", type=float, default=0.8,
                        help="min score to accept an OCR/synopsis match (0-1)")
+    p_run.add_argument("--include-specials", action="store_true",
+                       help="add S00 specials to the match pool (for "
+                            "identifying a leftover title as a special)")
     p_run.add_argument("--scratch-dir", type=Path, default=None,
                        help="dir for temp rips/frames (real disk, not tmpfs)")
     p_run.add_argument("--ollama-host",

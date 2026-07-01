@@ -125,6 +125,28 @@ class AlignEvidenceTests(Base):
         self.assertEqual(got, {1: (1, 1), 2: (1, 2), 3: (1, 3)})
 
 
+class PoolTests(Base):
+    def test_include_specials_widens_season_pool(self):
+        from discs import Disc
+        seasons = {1: [ep(1, 1, "A", 1320.0)]}
+        specials = [ep(0, 1, "Sp", 1400.0)]
+        all_eps = seasons[1] + specials
+        d = Disc(path=Path("/d.iso"), format="dvd", label="x", season_hint=1)
+        without = compute._pool_for(d, seasons, specials, all_eps, False)
+        withsp = compute._pool_for(d, seasons, specials, all_eps, True)
+        self.assertEqual([(e.season, e.number) for e in without], [(1, 1)])
+        self.assertEqual([(e.season, e.number) for e in withsp], [(1, 1), (0, 1)])
+
+    def test_no_hint_uses_whole_series(self):
+        from discs import Disc
+        seasons = {1: [ep(1, 1, "A", 1320.0)]}
+        specials = [ep(0, 1, "Sp", 1400.0)]
+        all_eps = seasons[1] + specials
+        d = Disc(path=Path("/d.iso"), format="dvd", label="x", season_hint=None)
+        self.assertEqual(compute._pool_for(d, seasons, specials, all_eps, False),
+                         all_eps)
+
+
 class ResolveTests(Base):
     def _one_title(self):
         state.upsert_episodes(self.conn, [ep(1, 1, "A", 1320.0), ep(1, 2, "B", 1320.0)])

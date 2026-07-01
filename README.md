@@ -24,6 +24,7 @@ vj scan show.db /path/to/*.iso
 # 3. run heuristics; each records evidence, decides nothing
 vj run align show.db                      # metadata runtime alignment (all seasons)
 vj run ocr   show.db --disc 1             # OCR title cards (keeps the frame)
+vj run ocr   show.db --title 205 --include-specials   # ID a leftover as an S00 special
 
 # 4. turn agreeing evidence into proposed assignments
 vj resolve show.db
