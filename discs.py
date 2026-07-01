@@ -58,6 +58,7 @@ class Episode:
     number: int
     name: str
     runtime: Optional[float]     # seconds, None if TMDB has no runtime
+    overview: str = ""           # TMDB synopsis (for the dialogue/synopsis judge)
     # set when an alternate episode ordering (TMDB episode group) is in use
     aired_season: Optional[int] = None
     aired_number: Optional[int] = None
@@ -466,6 +467,7 @@ class Tmdb:
             eps.append(Episode(
                 season=season, number=e["episode_number"], name=e["name"],
                 runtime=rt * 60.0 if rt else median,
+                overview=e.get("overview", ""),
             ))
         return eps
 
@@ -518,6 +520,7 @@ def grouped_seasons(tmdb: Tmdb, tv_id: int, selector: str,
             eps.append(Episode(
                 season=g["order"], number=e["order"] + 1, name=e["name"],
                 runtime=rt * 60.0 if rt else median,
+                overview=e.get("overview", ""),
                 aired_season=e["season_number"],
                 aired_number=e["episode_number"],
             ))
