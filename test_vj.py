@@ -1,0 +1,269 @@
+"""Unit tests for the vj state/compute/review/export layers.
+
+No disc images or network: discs/titles are constructed in-memory and inserted
+straight into a temp state DB, and the heuristics that need only metadata
+(classify + align) run against those rows.
+
+Run: python3 -m unittest test_vj -v
+"""
+import tempfile
+import unittest
+from pathlib import Path
+
+import types
+
+import auto as auto_mod
+import compute
+import export as export_mod
+import review
+import state
+from discs import Disc, Episode, Title
+
+
+def auto_args(**kw):
+    base = dict(threshold=0.5, ocr="never", vlm_model="x", ocr_accept=0.8,
+                ocr_engine="auto", scratch_dir=None,
+                ollama_host="http://localhost:1")
+    base.update(kw)
+    return types.SimpleNamespace(**base)
+
+
+def ep(season, number, name, runtime):
+    return Episode(season=season, number=number, name=name, runtime=runtime)
+
+
+def title(tid, dur, chapters):
+    return Title(id=tid, duration=float(dur), chapters=list(chapters),
+                 n_audio=2, n_sub=1, cells=len(chapters) or 1)
+
+
+class Base(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = str(Path(self.tmp.name) / "t.db")
+        self.conn = state.connect(self.db)
+        state.set_project(self.conn, tmdb_id=999, show_name="Test Show",
+                          year=2020, episode_order="aired")
+
+    def tearDown(self):
+        self.conn.close()
+        self.tmp.cleanup()
+
+    def add_disc(self, titles, season_hint=1, disc_hint=1, path="/d/s1d1.iso"):
+        d = Disc(path=Path(path), format="dvd", label="S1D1",
+                 season_hint=season_hint, disc_hint=disc_hint)
+        d.titles = titles
+        return state.add_disc(self.conn, d)
+
+
+class StateTests(Base):
+    def test_episode_roundtrip(self):
+        state.upsert_episodes(self.conn, [ep(1, 1, "A", 1320.0), ep(1, 2, "B", 1320.0)])
+        eps = state.load_episodes(self.conn)
+        self.assertEqual([(e.season, e.number) for e in eps], [(1, 1), (1, 2)])
+
+    def test_evidence_is_bounded_per_category(self):
+        state.upsert_episodes(self.conn, [ep(1, 1, "A", 1320.0)])
+        did = self.add_disc([title(1, 1320, [660, 660])])
+        tid = state.title_id(self.conn, did, 1)
+        eid = state.episode_id(self.conn, 1, 1)
+        state.put_evidence(self.conn, tid, "runtime-align", episode_id=eid, confidence=0.9)
+        state.put_evidence(self.conn, tid, "title-card-ocr", episode_id=eid, confidence=1.0)
+        state.put_evidence(self.conn, tid, "title-card-ocr", episode_id=eid,
+                           confidence=0.7, verdict="reread")   # upsert, not append
+        rows = state.evidence_for_title(self.conn, tid)
+        self.assertEqual(len(rows), 2)
+        ocr = [r for r in rows if r["category"] == "title-card-ocr"][0]
+        self.assertEqual(ocr["verdict"], "reread")
+        self.assertAlmostEqual(ocr["confidence"], 0.7)
+
+    def test_frame_roundtrip_and_cascade(self):
+        state.upsert_episodes(self.conn, [ep(1, 1, "A", 1320.0)])
+        did = self.add_disc([title(1, 1320, [660, 660])])
+        tid = state.title_id(self.conn, did, 1)
+        state.put_frame(self.conn, tid, "title-card-ocr", b"\xff\xd8\xff\xe0",
+                        source_time=1300.0, ocr_text="A")
+        f = state.get_frame(self.conn, tid)
+        self.assertEqual(f["ocr_text"], "A")
+        self.assertEqual(state.frame_categories(self.conn, tid), ["title-card-ocr"])
+        # re-scanning the disc cascades away its frames
+        self.add_disc([title(1, 1320, [660, 660])])
+        self.assertIsNone(state.get_frame(self.conn, tid))
+
+    def test_bad_category_rejected(self):
+        state.upsert_episodes(self.conn, [ep(1, 1, "A", 1320.0)])
+        did = self.add_disc([title(1, 1320, [660, 660])])
+        tid = state.title_id(self.conn, did, 1)
+        with self.assertRaises(ValueError):
+            state.put_evidence(self.conn, tid, "bogus", confidence=1.0)
+
+
+class AlignEvidenceTests(Base):
+    def test_align_writes_runtime_evidence(self):
+        # three runtime-separable episodes so alignment is unambiguous
+        state.upsert_episodes(self.conn, [
+            ep(1, 1, "One", 1200.0), ep(1, 2, "Two", 1400.0),
+            ep(1, 3, "Three", 1600.0)])
+        self.add_disc([
+            title(1, 1200, [600, 600]),
+            title(2, 1400, [700, 700, 300]),
+            title(3, 1600, [800, 800])])
+        r = compute.run_align(self.conn, args=None)
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["evidence"], 3)
+        # each title got a runtime-align row pointing at the right episode
+        got = {}
+        for t in (1, 2, 3):
+            tid = state.title_id(self.conn, 1, t)
+            row = [x for x in state.evidence_for_title(self.conn, tid)
+                   if x["category"] == "runtime-align"][0]
+            got[t] = (row["ep_season"], row["ep_number"])
+        self.assertEqual(got, {1: (1, 1), 2: (1, 2), 3: (1, 3)})
+
+
+class ResolveTests(Base):
+    def _one_title(self):
+        state.upsert_episodes(self.conn, [ep(1, 1, "A", 1320.0), ep(1, 2, "B", 1320.0)])
+        did = self.add_disc([title(1, 1320, [660, 660])])
+        return state.title_id(self.conn, did, 1)
+
+    def test_agreement_proposes_consensus(self):
+        tid = self._one_title()
+        e1 = state.episode_id(self.conn, 1, 1)
+        state.put_evidence(self.conn, tid, "runtime-align", episode_id=e1, confidence=0.9)
+        state.put_evidence(self.conn, tid, "title-card-ocr", episode_id=e1, confidence=1.0)
+        r = review.resolve(self.conn)
+        self.assertEqual(r["proposed"], 1)
+        a = state.get_assignment(self.conn, tid)
+        self.assertEqual(a["status"], "proposed")
+        self.assertEqual(a["decided_by"], "heuristic:consensus")
+
+    def test_conflict_is_not_proposed_and_shows_in_gaps(self):
+        tid = self._one_title()
+        e1 = state.episode_id(self.conn, 1, 1)
+        e2 = state.episode_id(self.conn, 1, 2)
+        state.put_evidence(self.conn, tid, "runtime-align", episode_id=e1, confidence=0.9)
+        state.put_evidence(self.conn, tid, "title-card-ocr", episode_id=e2, confidence=1.0)
+        r = review.resolve(self.conn)
+        self.assertEqual(r["proposed"], 0)
+        self.assertEqual(r["conflicts"], 1)
+        g = review.gaps(self.conn)
+        hit = [x for x in g["gaps"] if x["title_id"] == tid][0]
+        self.assertTrue(hit["conflict"])
+
+    def test_human_decision_is_sticky(self):
+        tid = self._one_title()
+        e1 = state.episode_id(self.conn, 1, 1)
+        e2 = state.episode_id(self.conn, 1, 2)
+        state.set_assignment(self.conn, tid, [e2], status="confirmed",
+                             decided_by="human")
+        state.put_evidence(self.conn, tid, "runtime-align", episode_id=e1, confidence=0.9)
+        review.resolve(self.conn)
+        a = state.get_assignment(self.conn, tid)
+        self.assertEqual(a["decided_by"], "human")
+        import json
+        self.assertEqual(json.loads(a["episode_ids_json"]), [e2])
+
+
+class ExportTests(Base):
+    def test_confirmed_assignment_exports(self):
+        state.upsert_episodes(self.conn, [ep(1, 1, "Pilot", 1320.0)])
+        did = self.add_disc([title(1, 1320, [660, 660])])
+        tid = state.title_id(self.conn, did, 1)
+        e1 = state.episode_id(self.conn, 1, 1)
+        state.set_assignment(self.conn, tid, [e1], status="confirmed",
+                             decided_by="human")
+        recs = export_mod.build_records(self.conn)
+        self.assertEqual(len(recs), 1)
+        r = recs[0]
+        self.assertEqual(r["title"], 1)                 # DVD rip title number
+        self.assertIn("S01E01", r["suggested_filename"])
+        self.assertIn("{tmdb-999}", r["suggested_filename"])
+        self.assertEqual(r["identified_by"], "human")
+
+    def test_proposed_excluded_unless_requested(self):
+        state.upsert_episodes(self.conn, [ep(1, 1, "Pilot", 1320.0)])
+        did = self.add_disc([title(1, 1320, [660, 660])])
+        tid = state.title_id(self.conn, did, 1)
+        e1 = state.episode_id(self.conn, 1, 1)
+        state.set_assignment(self.conn, tid, [e1], status="proposed",
+                             decided_by="heuristic:runtime-align")
+        self.assertEqual(len(export_mod.build_records(self.conn)), 0)
+        self.assertEqual(len(export_mod.build_records(self.conn, include_proposed=True)), 1)
+
+
+class EliminationTests(Base):
+    def test_recovers_lone_adjacent_missing(self):
+        # E2/E3 matched on a disc; E1 missing and adjacent -> the lone
+        # unmatched candidate (a title-card-less premiere) must be E1.
+        state.upsert_episodes(self.conn, [
+            ep(1, 1, "One", 1320.0), ep(1, 2, "Two", 1320.0),
+            ep(1, 3, "Three", 1320.0)])
+        t1, t2, t3 = (title(1, 1320, [660, 660]), title(2, 1320, [600, 720]),
+                      title(3, 1320, [700, 620]))
+        for t in (t1, t2, t3):
+            t.kind = "episode-candidate"
+        did = self.add_disc([t1, t2, t3])
+        e2 = state.episode_id(self.conn, 1, 2)
+        e3 = state.episode_id(self.conn, 1, 3)
+        state.set_assignment(self.conn, state.title_id(self.conn, did, 2), [e2],
+                             status="proposed", decided_by="heuristic:runtime-align")
+        state.set_assignment(self.conn, state.title_id(self.conn, did, 3), [e3],
+                             status="proposed", decided_by="heuristic:runtime-align")
+
+        r = compute.run_elimination(self.conn, args=None)
+        self.assertEqual(r["recovered"], 1)
+        t1id = state.title_id(self.conn, did, 1)
+        ev = [x for x in state.evidence_for_title(self.conn, t1id)
+              if x["category"] == "elimination"][0]
+        self.assertEqual((ev["ep_season"], ev["ep_number"]), (1, 1))
+        # resolve then proposes the recovered episode
+        review.resolve(self.conn)
+        a = state.get_assignment(self.conn, t1id)
+        self.assertEqual(a["status"], "proposed")
+
+    def test_noop_without_gaps(self):
+        state.upsert_episodes(self.conn, [ep(1, 1, "One", 1320.0)])
+        t1 = title(1, 1320, [660, 660])
+        t1.kind = "episode-candidate"
+        self.add_disc([t1])
+        r = compute.run_elimination(self.conn, args=None)
+        self.assertEqual(r["recovered"], 0)
+
+
+class AutoTests(Base):
+    def _separable_dvd(self):
+        # runtime-separable episodes on a disc-hinted DVD -> order verifiable
+        state.upsert_episodes(self.conn, [
+            ep(1, 1, "One", 1200.0), ep(1, 2, "Two", 1400.0),
+            ep(1, 3, "Three", 1600.0)])
+        self.add_disc([title(1, 1200, [600, 600]),
+                       title(2, 1400, [700, 700]),
+                       title(3, 1600, [800, 800])], disc_hint=1)
+
+    def test_auto_chains_align_resolve(self):
+        self._separable_dvd()
+        r = auto_mod.run_auto(self.conn, auto_args(ocr="never"))
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["assignments_by_status"].get("proposed"), 3)
+        s1 = [s for s in r["seasons"] if s["season"] == 1][0]
+        self.assertEqual((s1["matched"], s1["total"]), (3, 3))
+
+    def test_ocr_plan_skips_verifiable_disc(self):
+        # disc-hinted + runtime-separable -> assess_ordering verifiable, so the
+        # 'auto' OCR policy skips OCR without needing a VLM at all
+        self._separable_dvd()
+        compute.run_align(self.conn, args=None)
+        review.resolve(self.conn)
+        discs, why = auto_mod._ocr_plan(self.conn, auto_args(ocr="auto"))
+        self.assertEqual(discs, [])
+        self.assertIn("verifiable", why)
+
+    def test_no_discs_errors(self):
+        r = auto_mod.run_auto(self.conn, auto_args())
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["error"], "no-discs")
+
+
+if __name__ == "__main__":
+    unittest.main()

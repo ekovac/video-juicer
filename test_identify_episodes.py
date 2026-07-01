@@ -1,13 +1,22 @@
-"""Unit tests for identify_episodes (no disc images or network needed).
+"""Unit tests for the heuristic library (no disc images or network needed).
 
 Run: python3 -m unittest test_identify_episodes -v
+
+`ie` is the combined discs+identify namespace the old `identify_episodes` shim
+re-exported; the heuristics now live in those modules directly (the CLI is vj.py).
 """
 
 import struct
+import types
 import unittest
 from pathlib import Path
 
-import identify_episodes as ie
+import discs
+import identify
+
+ie = types.ModuleType("ie")            # combined namespace for the tests below
+ie.__dict__.update(vars(discs))
+ie.__dict__.update(vars(identify))
 
 
 def title(id, dur, chapters=(), n_audio=2, n_sub=3, cells=1):

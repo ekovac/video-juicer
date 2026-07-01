@@ -1,32 +1,79 @@
 # CLAUDE.md
 
-Working notes for `identify_episodes.py` — the hard-won lessons, decision model,
-and gotchas accumulated across real series (Venture Bros, Star Trek: Enterprise,
-Avatar, MOTU Revelation, Legend of Korra). README.md has user-facing usage and
-granular VLM notes; this file is the *why* and the traps. Keep it current.
+Working notes for video-juicer — the hard-won lessons, decision model, and
+gotchas accumulated across real series (Venture Bros, Star Trek: Enterprise,
+Avatar, MOTU Revelation, Legend of Korra). README.md has user-facing usage;
+DESIGN.md has the architecture + SQLite schema; **this file is the *why* behind
+the heuristics and their traps.** Keep it current.
 
 ## What this is
 
 Maps the playable titles on DVD/Blu-ray disc images (or BDMV/VIDEO_TS backup
-dirs) to TMDB episodes. Metadata-first; escalates to local-VLM title-card OCR
-only when metadata can't be trusted.
+dirs) to TMDB episodes. Reads disc *metadata* only (IFO via `lsdvd`, `.mpls`
+playlists via `7z`/parse) — never the multi-GB payload, so peak RSS stays
+~140 MB.
 
-Layout (split from one 1600-line script):
+## Architecture: Picard-style, evidence-first (see DESIGN.md)
+
+The tool is modelled on MusicBrainz Picard. Heuristics are **on-demand evidence
+producers**, not one committed pipeline; a human or agent adjudicates. State is a
+SQLite **project file**, three layers: facts (`disc`/`title`/`episode`),
+**evidence** (one upserted row per (title, category) — categories are the
+sources `runtime-align`/`title-card-ocr`/`synopsis`/`elimination`), and
+**assignment** (the thin adjudicated answer). Conflict is *computed* by `gaps`,
+not stored. Full schema + rationale: DESIGN.md.
+
+**IMPORTANT for edits:** the heuristic sections below (core idea, failure modes,
+VLM/OCR, TMDB, output) describe **library functions that the Picard rewrite left
+unchanged** — `align`, `detect_play_all`, `assess_ordering`, `verify_title`,
+`recover_by_elimination`, `suggested_filename`, `emit_rip_commands`, etc. What
+changed is *how they're invoked* (verbs, each writing evidence) and *where output
+lives* (state DB, then `vj export`). Where an old note mentions a flag
+(`--auto`, `--ocr-identify`, `--verify`, `--spot-check`, `--merge`), read it as
+describing the heuristic's *behaviour*, now reached through the verbs below.
+
+Layout:
 - `discs.py` — data model (Title/Disc/Episode/Assignment), disc scanning
   (DVD/Blu-ray, MPLS, dedup, play-all clip ordering, HandBrake titles, hints),
   TMDB client. `log` and `run()` live here.
-- `identify.py` — matching: metadata alignment + orderability, title-card OCR
-  (verify_title/ocr_identify/probe/elimination), manifest output. Imports the
-  model from `discs`.
-- `identify_episodes.py` — CLI/`main`; re-exports both modules, so
-  `import identify_episodes` and `python3 identify_episodes.py` are unchanged. Reads disc *metadata* only (IFO via
-`lsdvd`, `.mpls` playlists via `7z`/parse) — never the multi-GB payload, so peak
-RSS stays ~140 MB. Output: `manifest.json` (one record per title) + Plex-style
-filenames + `HandBrakeCLI` rip commands.
+- `identify.py` — the heuristics: metadata alignment + orderability, title-card
+  OCR (verify_title/ocr_identify/probe/elimination), rip-command/filename output.
+- `synopsis.py` — the dialogue→TMDB-synopsis judge (a second OCR-free identifier).
+- `state.py` — SQLite data layer (schema, row⇄dataclass mappers, evidence upsert,
+  frame BLOBs, assignment ops).
+- `compute.py` — `vj run <heuristic>`: wraps the heuristics as evidence producers.
+- `review.py` — inspect (`status`/`gaps`/`show`), `resolve` (evidence→proposals),
+  adjudicate (`assign`/`confirm`/`reject`). Conflict computed here.
+- `export.py` — manifest + rip script from the adjudicated assignments.
+- `vj.py` — the CLI entry point wiring all verbs.
 
-Run: `python3 identify_episodes.py --tv-id <id> --auto --scratch-dir <disk> --out <m.json> <discs...>`
-Tests: `python3 -m unittest test_identify_episodes` (no discs or network needed).
-Needs `lsdvd`,`7z`; OCR also needs `ffmpeg`/`mencoder` + Ollama; `TMDB_API_KEY` in env.
+Run (per-verb; see README for the full flow): `vj init db --tmdb-id <id>` →
+`vj scan db <discs>` → `vj run align db` → `vj run ocr db --disc N` →
+`vj resolve db` → review/adjudicate → `vj export db --manifest … --rip-script …`.
+Tests: `python3 -m unittest test_identify_episodes test_vj` (no discs/network).
+Needs `lsdvd`,`7z`; OCR also needs `ffmpeg`/`mencoder` + Ollama; `TMDB_API_KEY`
+in env for `init`.
+
+## Disc-probing findings (drive the scan design)
+
+- **lsdvd reads ISOs directly** (libdvdread, no mount) and touches only the IFO
+  metadata (a few MB), never the VOB payload. Machine-readable mode
+  `lsdvd -Oy -c -a -s <iso>` emits a Python dict, but prints a `libdvdread:`
+  warning line *on stdout first* — the parser slices from `lsdvd = {`.
+- **Blu-ray**: extract only `BDMV/PLAYLIST/*.mpls` (a few KB each) via `7z`; parse
+  MPLS in pure Python — total duration = Σ PlayItem `out_time - in_time` in
+  45 kHz ticks; chapter marks from PlaylistMark. Dedupe playlists referencing the
+  identical clip sequence (Blu-rays carry duplicate/obfuscation playlists).
+- **Extras can be episode-length AND fool runtime alignment.** On Venture Bros
+  S1D2, Title 8 is a 25:04 featurette and Title 16 a 21:23 extra, both confusable
+  with ~22-min episodes; neither matches a play-all chapter, and (on these discs)
+  extras lack the subtitle streams real episodes carry — a secondary discriminator
+  behind the play-all/stream-signature logic. This is the canonical unit-test trap.
+- **TMDB runtimes are integer minutes** (some `null`); direct runtime matching
+  needs ~±90 s tolerance, hence the calibration + `valid_episode_lengths` band.
+- **CSS-encrypted DVDs**: these ISOs are expected pre-decrypted; if libdvdread
+  reports encryption and IFO reads fail, error out pointing at libdvdcss rather
+  than emitting garbage.
 
 ## Core idea: trust metadata, escalate to OCR only when ambiguous
 
@@ -282,26 +329,30 @@ Three sources of canonical episode ORDER, cheapest first:
   with backoff to ride out the daemon restart + model reload. Reduce risk:
   `--scratch-dir` on a real disk (NOT `/tmp` tmpfs — rips there add memory
   pressure); the adaptive anchor cuts calls ~8x after the first episode.
-- **For OCR runs, go per-disc with `--merge`** so each disc is written on
-  completion — an OOM only loses the in-progress disc; re-run just that one.
-- **BUT `--merge`/per-disc is OCR-ONLY. The metadata aligner needs all of a
-  season's discs together.** Aligning a subset of a season against the full
-  episode pool makes each disc independently claim overlapping ranges (hit on
-  Korra: per-disc runs gave 7 unique episodes/season instead of 12-14). Run all
-  discs (or at least a whole season) in one metadata invocation.
-- Concurrent runs on the same `--out` race; `write_manifest` holds a file lock +
-  atomic rename. Still, don't launch two runs at once — an OOM'd run can linger
-  and a late write can clobber a good one (this corrupted an Avatar manifest).
-- Manifests, rip scripts, and their backups/locks are local artifacts — they
-  live OUTSIDE the repo at `/run/media/ekovac/MediaScratc/video-juicer-artifacts/`
-  (keep the repo to code/tests/docs). `.gitignore` also blocks the usual
-  artifact patterns so a stray run in the repo dir won't pollute it. Point
-  `--out` (and rip-script redirects) at the artifacts dir.
+- **OCR is naturally crash-safe now.** `vj run ocr` commits each title's evidence
+  (+ frame) as it finishes, so an OOM loses only the in-progress title — re-run
+  the verb and completed titles are already recorded. No `--merge` needed; the
+  state DB *is* incremental. Still point `--scratch-dir` at a real disk, not
+  tmpfs.
+- **BUT `vj run align` needs a whole season's discs scanned first.** Align reads
+  every scanned disc and aligns each season's discs together; running it after
+  scanning only a subset makes each disc independently claim overlapping ranges
+  (hit on Korra: 7 unique episodes/season instead of 12-14). Scan the whole
+  season (ideally the whole series) before `run align`. OCR, by contrast, is
+  per-title and safe to run disc-by-disc.
+- **Don't launch two writers on the same DB at once.** SQLite is in WAL mode and
+  each op is transactional, so a single writer is safe and reads never block —
+  but two concurrent `vj run`s writing the same file still contend, and an OOM'd
+  run lingering can interleave badly. One writer at a time.
+- Project DBs, manifests, and rip scripts are local artifacts — keep them OUTSIDE
+  the repo at `/run/media/ekovac/MediaScratc/video-juicer-artifacts/` (repo =
+  code/tests/docs). `.gitignore` also blocks the usual artifact patterns
+  (incl. `*.db`) so a stray run in the repo dir won't pollute it.
 
 ## Claude self-inflicted workflow traps (don't repeat)
 
-- `pgrep -f identify_episodes` matches its **own** command line → false "already
-  running". Use a specific pattern (e.g. `identify_episodes.py`).
+- `pgrep -f vj` (or `identify`) matches its **own** command line → false "already
+  running". Use a specific pattern (e.g. `vj.py run`).
 - Inner `&`/`nohup` backgrounding inside a Bash tool call gets orphaned or torn
   down at the foreground command's exit. Use the tool's `run_in_background`.
 - Running a script from `/tmp` puts `/tmp` (not the repo) on `sys.path`; set

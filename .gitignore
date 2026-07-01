@@ -3,6 +3,10 @@ discs/
 __pycache__/
 manifest.json
 debug_frames*/
+# SQLite project state files are artifacts (see DESIGN.md: artifacts dir)
+*.db
+*.db-wal
+*.db-shm
 *.json.lock
 *.json.tmp
 # local run artifacts live outside the repo (see CLAUDE.md: artifacts dir on the

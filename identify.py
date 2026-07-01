@@ -535,7 +535,8 @@ def verify_title(disc: Disc, title: Title, episodes: list[Episode],
                  model: str, host: str, workdir: Path,
                  window: float = 150.0, front_window: float = 280.0,
                  fallback_window: float = 720.0, accept: float = 0.8,
-                 anchor: Optional[float] = None, engine: str = "auto"
+                 anchor: Optional[float] = None, engine: str = "auto",
+                 capture: Optional[dict] = None
                  ) -> tuple[Optional[Episode], float, Optional[float]]:
     """OCR a title's title-card window against the season's episode names.
 
@@ -550,7 +551,7 @@ def verify_title(disc: Disc, title: Title, episodes: list[Episode],
     end, Venture Bros. style) — and finally the NO-CARD widen of the front to
     fallback_window for recap-delayed premieres. So the first episode or two
     on a disc pay full cost; once the location is known the rest are cheap."""
-    state = {"ep": None, "score": 0.0, "time": None}
+    state = {"ep": None, "score": 0.0, "time": None, "frame": None, "text": None}
     use_tess = engine in ("auto", "tesseract")
     use_vlm = engine == "vlm" or (engine == "auto"
                                   and _vlm_reachable(model, host))
@@ -567,6 +568,11 @@ def verify_title(disc: Disc, title: Title, episodes: list[Episode],
             ep, score = fuzzy_best(text, episodes)
             if score > state["score"]:
                 state["ep"], state["score"], state["time"] = ep, score, ts
+                if capture is not None:   # keep the winning frame for review
+                    try:
+                        state["frame"], state["text"] = frame.read_bytes(), text
+                    except OSError:
+                        pass
             if score >= accept:
                 log.info("%s title %d: verified %r -> S%02dE%02d (%.2f) @%.0fs "
                          "[%s]", disc.path.name, title.id,
@@ -612,6 +618,9 @@ def verify_title(disc: Disc, title: Title, episodes: list[Episode],
         return None
 
     def result():
+        if capture is not None:
+            capture.update(image=state["frame"], time=state["time"],
+                           text=state["text"], score=state["score"])
         return state["ep"], state["score"], state["time"]
 
     if anchor is not None:
