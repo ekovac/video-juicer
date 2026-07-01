@@ -611,7 +611,8 @@ def verify_title(disc: Disc, title: Title, episodes: list[Episode],
             video.unlink(missing_ok=True)
         return None
 
-    result = lambda: (state["ep"], state["score"], state["time"])
+    def result():
+        return state["ep"], state["score"], state["time"]
 
     if anchor is not None:
         if scan(anchor - ANCHOR_RADIUS, 2 * ANCHOR_RADIUS, anchor_time=anchor):
@@ -679,11 +680,13 @@ def episode_candidates(disc: Disc, pool: list[Episode]) -> list[Title]:
     bands = valid_episode_lengths(pool)
     if bands:
         lengths, tol = bands
-        ok = lambda dur: min(abs(dur - v) for v in lengths) <= tol
+        def ok(dur):
+            return min(abs(dur - v) for v in lengths) <= tol
     else:
         rts = [e.runtime for e in pool if e.runtime]
         expected = sorted(rts)[len(rts) // 2] if rts else 1320.0
-        ok = lambda dur: expected * 0.6 <= dur <= expected * 2.6
+        def ok(dur):
+            return expected * 0.6 <= dur <= expected * 2.6
     return sorted([t for t in disc.titles if ok(t.duration)],
                   key=lambda t: t.order_key)
 
