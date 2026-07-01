@@ -173,6 +173,11 @@ UNIX tool with structured output and no hidden state.** Concretely:
 - `vj frame <state.db> --title T [--out FILE]` — dump the retained OCR frame to
   a file (default: a temp path), so a human or a vision-capable agent can look
   at it and judge whether it's a real title card.
+- `vj play <state.db> <SxxEyy> | --title T [--player vlc] [--at-card] [--print]`
+  — launch a player on the title assigned to an episode (or any title by id, to
+  preview a candidate before adjudicating). `--at-card` seeks to the retained
+  OCR frame's timestamp. DVD title selection is exact (`dvd:///path#N`); Blu-ray
+  opens at the disc's main title (the MRL can't select a playlist).
 
 ### Resolve — evidence → proposed assignments (the bridge)
 - `vj resolve <state.db> [--threshold C]` — for each title whose evidence

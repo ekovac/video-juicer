@@ -10,6 +10,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import contextlib
+import io
+import json as _json
 import types
 
 import auto as auto_mod
@@ -17,6 +20,7 @@ import compute
 import export as export_mod
 import review
 import state
+import vj
 from discs import Disc, Episode, Title
 
 
@@ -263,6 +267,46 @@ class AutoTests(Base):
         r = auto_mod.run_auto(self.conn, auto_args())
         self.assertFalse(r["ok"])
         self.assertEqual(r["error"], "no-discs")
+
+
+class PlayTests(Base):
+    def test_mrl(self):
+        self.assertEqual(vj._play_mrl("dvd", "/x.iso", 4), "dvd:///x.iso#4")
+        self.assertTrue(vj._play_mrl("bluray", "/bd", 1).startswith("bluray:///bd"))
+
+    def _play_json(self, *cli):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = vj.main(["--json", "play", self.db, *cli])
+        # success prints to stdout; structured errors go to stderr
+        return rc, _json.loads(out.getvalue() or err.getvalue())
+
+    def test_play_by_title_print(self):
+        state.upsert_episodes(self.conn, [ep(1, 1, "A", 1320.0)])
+        did = self.add_disc([title(1, 1320, [660, 660])], path="/d/x.iso")
+        tid = state.title_id(self.conn, did, 1)
+        rc, out = self._play_json("--title", str(tid), "--print")
+        self.assertEqual(rc, 0)
+        self.assertEqual(out["mrl"], "dvd:///d/x.iso#1")
+        self.assertFalse(out["launched"])
+
+    def test_play_by_episode_uses_assignment(self):
+        state.upsert_episodes(self.conn, [ep(1, 1, "A", 1320.0)])
+        did = self.add_disc([title(1, 1320, [660, 660])], path="/d/x.iso")
+        tid = state.title_id(self.conn, did, 1)
+        e1 = state.episode_id(self.conn, 1, 1)
+        state.set_assignment(self.conn, tid, [e1], status="confirmed",
+                             decided_by="human")
+        rc, out = self._play_json("S01E01", "--print")
+        self.assertEqual(rc, 0)
+        self.assertEqual(out["title_id"], tid)
+
+    def test_play_unassigned_episode_errors(self):
+        state.upsert_episodes(self.conn, [ep(1, 1, "A", 1320.0)])
+        self.add_disc([title(1, 1320, [660, 660])])
+        rc, out = self._play_json("S01E01", "--print")
+        self.assertEqual(rc, 1)
+        self.assertEqual(out["error"], "no-assignment")
 
 
 if __name__ == "__main__":

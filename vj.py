@@ -10,6 +10,7 @@ result. All state lives in a SQLite project file (see DESIGN.md). Verbs:
   resolve:     resolve                    (evidence -> proposed assignments)
   adjudicate:  assign, confirm, reject
   auto:        auto                       (scripts align→resolve→ocr→…→resolve)
+  inspect:     play                       (launch a player on a title)
   export:      export
 
 Every verb takes an explicit <state.db> and emits JSON when stdout is not a TTY
@@ -24,6 +25,7 @@ import argparse
 import json
 import logging
 import os
+import shlex
 import shutil
 import sys
 from pathlib import Path
@@ -451,6 +453,88 @@ def cmd_auto(args) -> int:
     return 0
 
 
+def _play_mrl(fmt: str, path: str, title_number: int) -> str:
+    """A player MRL selecting one title. DVD title selection is reliable via the
+    `#N` fragment; Blu-ray playlist selection isn't exposed on the MRL, so BD
+    opens the disc at its main title (the caller warns)."""
+    if fmt == "dvd":
+        return f"dvd://{path}#{title_number}"
+    return f"bluray://{path}"
+
+
+def cmd_play(args) -> int:
+    conn, err = _open(args)
+    if err:
+        return err
+    # resolve target -> a title row
+    if args.title is not None:
+        row = conn.execute(
+            "SELECT t.id, t.title_number, d.path, d.format FROM title t "
+            "JOIN disc d ON d.id=t.disc_id WHERE t.id=?", (args.title,)).fetchone()
+        if row is None:
+            conn.close()
+            return fail(args, "no-title", f"no title {args.title}")
+        tid = args.title
+    elif args.target:
+        try:
+            eid = _parse_ep(conn, args.target)
+        except ValueError:
+            conn.close()
+            return fail(args, "bad-episode", "use an episode like S01E03, or --title N")
+        if eid is None:
+            conn.close()
+            return fail(args, "no-episode", f"no episode {args.target}")
+        tid = None
+        for a in conn.execute("SELECT title_id, episode_ids_json FROM assignment "
+                              "WHERE status IN ('proposed','confirmed')"):
+            if eid in json.loads(a["episode_ids_json"]):
+                tid = a["title_id"]
+                break
+        if tid is None:
+            conn.close()
+            return fail(args, "no-assignment",
+                        f"no title is assigned to {args.target} yet "
+                        f"(try --title N to preview a candidate)")
+        row = conn.execute(
+            "SELECT t.id, t.title_number, d.path, d.format FROM title t "
+            "JOIN disc d ON d.id=t.disc_id WHERE t.id=?", (tid,)).fetchone()
+    else:
+        conn.close()
+        return fail(args, "no-target", "give an episode (S01E03) or --title N")
+
+    start = args.start
+    if args.at_card:                     # jump to the retained title-card frame
+        f = state.get_frame(conn, tid, "title-card-ocr")
+        if f and f["source_time"] is not None:
+            start = max(0.0, f["source_time"] - 5.0)
+    conn.close()
+
+    mrl = _play_mrl(row["format"], row["path"], row["title_number"])
+    argv = [args.player, mrl]
+    if start:
+        argv += ["--start-time", str(int(start))]
+    warn = (" (Blu-ray: opens at the disc's main title — VLC can't select a "
+            "playlist from the MRL; pick it from the title menu)"
+            if row["format"] == "bluray" else "")
+
+    if args.print:
+        emit(args, {"ok": True, "command": argv, "mrl": mrl, "launched": False,
+                    "title_id": tid, "note": warn.strip() or None},
+             human="would run: " + " ".join(shlex.quote(a) for a in argv) + warn)
+        return 0
+    if not shutil.which(args.player):
+        return fail(args, "no-player", f"player not on PATH: {args.player}")
+    import subprocess
+    subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     start_new_session=True)
+    emit(args, {"ok": True, "command": argv, "mrl": mrl, "launched": True,
+                "title_id": tid, "note": warn.strip() or None},
+         human=f"launched {args.player}: title {row['title_number']} on "
+               f"{Path(row['path']).name}"
+               + (f" @{int(start)}s" if start else "") + warn)
+    return 0
+
+
 def cmd_export(args) -> int:
     conn, err = _open(args)
     if err:
@@ -589,6 +673,20 @@ def build_parser() -> argparse.ArgumentParser:
                         default=os.environ.get("OLLAMA_HOST",
                                                "http://localhost:11434"))
     p_auto.set_defaults(func=cmd_auto)
+
+    p_play = sub.add_parser("play", help="launch a player on a candidate title")
+    p_play.add_argument("db", type=Path)
+    p_play.add_argument("target", nargs="?",
+                        help="episode to play (SxxEyy) — the title assigned to it")
+    p_play.add_argument("--title", type=int, help="play a title by id instead")
+    p_play.add_argument("--player", default="vlc", help="player command (default vlc)")
+    p_play.add_argument("--start", type=float, default=0.0,
+                        help="start N seconds in")
+    p_play.add_argument("--at-card", action="store_true",
+                        help="start near the retained OCR title-card frame")
+    p_play.add_argument("--print", action="store_true",
+                        help="print the command instead of launching it")
+    p_play.set_defaults(func=cmd_play)
 
     p_exp = sub.add_parser("export", help="manifest + rip script from assignments")
     p_exp.add_argument("db", type=Path)

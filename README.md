@@ -33,6 +33,8 @@ vj status show.db                         # coverage summary
 vj gaps   show.db                         # the worklist: conflicts + missing eps
 vj show   show.db --title 7               # all evidence for one title
 vj frame  show.db --title 7 --out /tmp/card.jpg   # eyeball the OCR frame
+vj play   show.db S01E03                  # watch the assigned title in VLC
+vj play   show.db --title 7 --at-card     # preview a candidate at its title card
 vj confirm show.db --title 7              # accept the proposal
 vj assign  show.db --title 9 --episode S02E05     # or set it yourself
 vj reject  show.db --title 12             # not an episode
