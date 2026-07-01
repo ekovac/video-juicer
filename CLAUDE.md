@@ -226,17 +226,23 @@ Three sources of canonical episode ORDER, cheapest first:
   - **Wart 1 (fixed): scene frames flooding the VLM pass.** The VLM fallback ran
     on every frame of a window; on a long title with no card in the primary band
     it ground through hundreds (a 50-min VB special once took 44 min). Now
-    `verify_title` gates the VLM pass with an **OCR-free EAST text-region
-    detector** (`text_region.py`): only frames EAST scores as bearing text reach
-    the VLM. It's **recall-first** (real cards score ~1.0, so a high conf
-    threshold prunes scenes without dropping cards) and **fails open** (missing
-    model / cv2 → no pruning) and **guarded** (if it would prune the whole
-    window, keep the window). Measured on a VB(stylized)+Enterprise(plain) card
-    corpus vs scene negatives: ~100% recall on real episode cards, ~70% scene
-    rejection, ~50 ms/frame. Needs `frozen_east_text_detection.pb` (~96 MB,
-    `VJ_EAST_MODEL` or the artifacts `models/` dir). Classical detectors were
-    tried and rejected first (morphological gate ~60% recall on stylized/
-    textured cards; MSER ~30% scene rejection) — see text_region.py.
+    `verify_title` gates the VLM pass with an **OCR-free text-region detector**
+    (`text_region.py`): only frames a detector scores as bearing text reach the
+    VLM. It's **recall-first**, **fails open** (no detector → no pruning), and
+    **guarded** (would-prune-whole-window → keep the window). The seam
+    (`frame_has_text`) is detector-agnostic; two backends, measured on a
+    VB(stylized)+Enterprise(plain) card corpus vs scene negatives (both hold
+    100% recall on real episode cards):
+    - **PaddleOCR PP-OCRv3 det via RapidOCR/onnx (default)** — Apache-2.0, model
+      bundled with the pip package, **~92% scene rejection** (88% on the pathological
+      title-205 window), ~170 ms/frame.
+    - **EAST (cv2.dnn, fallback)** — ~70% rejection, ~50 ms/frame; its ~96 MB
+      model isn't shipped and is license-murky (GPL-3.0 upstream / ICDAR data),
+      so it's fallback-only (`VJ_EAST_MODEL`). Force a backend with
+      `VJ_TEXT_DETECTOR=paddle|east`.
+
+    Classical detectors were tried and rejected first (morphological gate ~60%
+    recall on stylized/textured cards; MSER ~30% scene rejection).
   - **Wart 1 caveat — scene-art title cards.** EAST detects *text*; a show whose
     title is painted INTO the scene art (Adventure Time — hand-lettered, more
     stylized than VB) may not read as text, so the gate could prune the real

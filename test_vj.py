@@ -292,28 +292,28 @@ class AutoTests(Base):
 
 
 class TextGateTests(unittest.TestCase):
-    def test_fails_open_without_model(self):
+    def test_fails_open_when_backend_unavailable(self):
         import text_region as tr
-        # a missing model must never prune (recall-first): score 1.0, has_text True
-        self.assertEqual(tr.frame_text_score("/any.jpg", model="/no/model.pb"), 1.0)
-        self.assertTrue(tr.frame_has_text("/any.jpg", model="/no/model.pb"))
+        # a forced-but-unavailable backend must never prune (recall-first)
+        self.assertTrue(tr.frame_has_text("/any.jpg", backend="east",
+                                          model="/no/model.pb"))
 
     def test_verify_title_accepts_text_filter(self):
-        # signature plumbing: verify_title must accept text_filter without error
         import inspect
         from identify import verify_title
         self.assertIn("text_filter", inspect.signature(verify_title).parameters)
 
-    def test_card_vs_scene_when_model_present(self):
+    def test_card_vs_scene_active_backend(self):
         import glob
         import text_region as tr
         base = "/run/media/ekovac/MediaScratc/video-juicer-artifacts/tr-eval"
         cards = glob.glob(f"{base}/pos_db/*.jpg")
         scenes = glob.glob(f"{base}/neg_ent/*.jpg")
-        if not (tr.model_available() and cards and scenes):
-            self.skipTest("EAST model or fixture frames unavailable")
-        self.assertGreaterEqual(tr.frame_text_score(cards[0]), 0.9)
-        self.assertLess(min(tr.frame_text_score(s) for s in scenes[:20]), 0.5)
+        available = tr.paddle_available() or tr.east_available()
+        if not (available and cards and scenes):
+            self.skipTest("no text detector or fixture frames available")
+        self.assertTrue(tr.frame_has_text(cards[0]))                 # card kept
+        self.assertFalse(any(tr.frame_has_text(s) for s in scenes[:15]))  # scenes pruned
 
 
 class PlayTests(Base):
