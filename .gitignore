@@ -5,6 +5,19 @@ manifest.json
 debug_frames*/
 *.json.lock
 *.json.tmp
+# local run artifacts live outside the repo (see CLAUDE.md: artifacts dir on the
+# MediaScratc disk); ignore any that get generated into the repo by accident
+*_manifest.json
+*-rip.sh
+*.json.bak
+*.json.bak[0-9]
+*.json.prev
+*.json.prehandfix
+*.json.precommentaryfix
+*.json.partial-ocr
+answer_key.json
+rename_undo.json
+claude-session
 # compiled BD-J probe binaries (sources committed; see BDJ_NOTES.md)
 bdj_probe
 bdj_navigate

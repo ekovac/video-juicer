@@ -1,4 +1,4 @@
-# bitter-episode-collator
+# video-juicer
 
 Maps the titles on DVD/Blu-ray disc images to TMDB episodes, without reading
 the multi-GB video payload. Design rationale in `IMPLEMENTATION_PLAN.md`.

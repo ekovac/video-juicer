@@ -292,8 +292,11 @@ Three sources of canonical episode ORDER, cheapest first:
 - Concurrent runs on the same `--out` race; `write_manifest` holds a file lock +
   atomic rename. Still, don't launch two runs at once — an OOM'd run can linger
   and a late write can clobber a good one (this corrupted an Avatar manifest).
-- Manifests are local artifacts (gitignored); only the code/tests/docs are
-  committed.
+- Manifests, rip scripts, and their backups/locks are local artifacts — they
+  live OUTSIDE the repo at `/run/media/ekovac/MediaScratc/video-juicer-artifacts/`
+  (keep the repo to code/tests/docs). `.gitignore` also blocks the usual
+  artifact patterns so a stray run in the repo dir won't pollute it. Point
+  `--out` (and rip-script redirects) at the artifacts dir.
 
 ## Claude self-inflicted workflow traps (don't repeat)
 
