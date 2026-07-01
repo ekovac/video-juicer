@@ -759,20 +759,48 @@ def ocr_identify(discs: list[Disc], seasons: dict[int, list[Episode]],
     return recover_by_elimination(final, leftovers, missed)
 
 
+def _format_quality(t: Title) -> tuple[int, int]:
+    """Coarse (video, audio) quality rank; higher is better.
+
+    When two same-disc playlists OCR to the *same* episode they share a title
+    card, so identity can't separate them — but one may be a clean HD master and
+    the other a lossy alternate. Avatar authors an audio-commentary playlist
+    (480i / AC3) beside each episode's 1080p / DTS-HD master; the commentary one
+    is often marginally longer, so a pure duration tiebreak picked it (S01E15
+    "Bato" ripped from the SD commentary title). Rank by format so the master
+    wins. Titles with no parsed format (all DVDs, unparsed STN) rank (0, 0) —
+    equal — so this is inert unless the formats actually differ."""
+    v = 0
+    if t.video_format:
+        m = re.match(r"(\d+)", t.video_format)
+        if m:                       # progressive edges interlaced at equal res
+            v = int(m.group(1)) * 2 + (0 if t.video_format.endswith("i") else 1)
+    a = 0
+    if t.audio_format:              # lossless master beats a lossy alternate
+        af = t.audio_format.upper()
+        a = 2 if any(k in af for k in
+                     ("HDMA", "TRUEHD", "PCM", "FLAC")) else 1
+    return v, a
+
+
 def resolve_assignment_collisions(
         raw: list[Assignment],
         leftovers: list[tuple[Disc, Title]]
 ) -> tuple[list[Assignment], dict[tuple, Assignment]]:
     """Reduce overlapping OCR assignments to one claim per episode.
 
-    Prefer single-episode assignments over doubles, then the longest (most
-    complete) playlist. A combined double is kept if it carries at least one
-    *unclaimed* episode (e.g. a finale where E19 exists only inside the E19+E20
-    double while E20 also has a single) — only dropped when fully redundant.
-    Demoted titles are appended to `leftovers`. Returns (final, claimed)."""
+    Prefer single-episode assignments over doubles, then the higher-quality
+    source (an HD/lossless master over a same-episode SD/commentary alternate),
+    then the longest (most complete) playlist. A combined double is kept if it
+    carries at least one *unclaimed* episode (e.g. a finale where E19 exists
+    only inside the E19+E20 double while E20 also has a single) — only dropped
+    when fully redundant. Demoted titles are appended to `leftovers`. Returns
+    (final, claimed)."""
     final: list[Assignment] = []
     claimed: dict[tuple, Assignment] = {}
-    for a in sorted(raw, key=lambda a: (len(a.episodes), -a.title.duration)):
+    for a in sorted(raw, key=lambda a: (len(a.episodes),
+                                        tuple(-q for q in _format_quality(a.title)),
+                                        -a.title.duration)):
         keys = [(e.season, e.number) for e in a.episodes]
         unclaimed = [k for k in keys if k not in claimed]
         if not unclaimed:

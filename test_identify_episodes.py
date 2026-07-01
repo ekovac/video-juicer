@@ -632,6 +632,32 @@ class CollisionTest(unittest.TestCase):
         return (ie.Episode(2, 11, "K", 1440), ie.Episode(2, 12, "Serpent", 1440),
                 ie.Episode(2, 13, "Drill", 1440))
 
+    def test_quality_tier_beats_duration_on_same_episode(self):
+        # Avatar: an SD/AC3 commentary title and the HD/DTS-HD master both OCR
+        # to the same episode (shared title card). The commentary is marginally
+        # longer, so the old -duration tiebreak picked it (S01E15 "Bato" ripped
+        # from the SD commentary). The clean master must win on format.
+        d = disc([])
+        e15 = ie.Episode(1, 15, "Bato", 1440)
+        master = ie.Assignment(d, title(65, 1444.2), [e15], 0.0, "high", "Bato")
+        master.title.video_format, master.title.audio_format = "1080p", "DTS-HDMA"
+        comm = ie.Assignment(d, title(57, 1467.0), [e15], 0.0, "high", "Bato")
+        comm.title.video_format, comm.title.audio_format = "480i", "AC3"
+        leftovers = []
+        _, claimed = ie.resolve_assignment_collisions([comm, master], leftovers)
+        self.assertEqual(claimed[(1, 15)].title.id, 65)          # clean master
+        self.assertIn(57, {t.id for _, t in leftovers})          # commentary demoted
+
+    def test_no_format_falls_back_to_duration(self):
+        # DVD / unparsed titles carry no format -> quality rank is equal ->
+        # behaviour is unchanged (longest wins), so this stays inert generally.
+        d = disc([])
+        e = ie.Episode(1, 5, "X", 1440)
+        short = ie.Assignment(d, title(10, 1400), [e], 0.0, "high", "X")
+        long = ie.Assignment(d, title(11, 1500), [e], 0.0, "high", "X")
+        _, claimed = ie.resolve_assignment_collisions([short, long], [])
+        self.assertEqual(claimed[(1, 5)].title.id, 11)           # longest kept
+
     def test_double_sole_source_demotes_redundant_single(self):
         d = disc([])
         e11, e12, e13 = self.eps()
