@@ -168,6 +168,14 @@ def _run_human(heuristic: str, r: dict) -> str:
         for x in r.get("titles", []):
             lines.append(f"  title {x['title_id']}: {x['verdict']}")
         return "\n".join(lines)
+    if heuristic == "streams":
+        lines = [f"streams: {r['evidence']} stream-signature row(s), "
+                 f"{r['flagged']} flagged extra-like"]
+        for x in r.get("titles", []):
+            if x["class"] == "extra":
+                lines.append(f"  disc {x['disc']} title {x['title']}: "
+                             f"extra-like ({x['sig'][0]}A/{x['sig'][1]}S)")
+        return "\n".join(lines)
     key = {"ocr": "ocr", "synopsis": "synopsis"}[heuristic]
     lines = [f"{heuristic}: {len(r[key])} title(s)"]
     for x in r[key]:

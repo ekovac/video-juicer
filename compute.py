@@ -20,7 +20,8 @@ from pathlib import Path
 
 import state
 from discs import Assignment, Disc, Episode, group_discs, log
-from identify import align, classify_disc, recover_by_elimination, verify_title
+from identify import (align, classify_disc, recover_by_elimination,
+                      stream_signature, verify_title)
 from synopsis import identify_by_synopsis
 
 # Map align's confidence label to a numeric evidence confidence.
@@ -29,6 +30,8 @@ _CONF = {"high": 0.9, "medium": 0.6, "low": 0.3}
 # Heuristics exposed by `vj run` (name -> one-line description), for --list.
 HEURISTICS = {
     "align": "metadata runtime alignment over each season (DP)",
+    "streams": "flag episode-length titles whose audio/subtitle layout is "
+               "unlike their disc's episodes (likely extras)",
     "ocr": "OCR each title's title card; keeps the winning frame",
     "synopsis": "judge sampled dialogue against TMDB synopses",
     "elimination": "pin a disc's lone unmatched candidate to its one missing "
@@ -165,6 +168,72 @@ def run_align(conn, args) -> dict:
 
     return {"ok": True, "evidence": n_ev, "leftovers": n_left,
             "anchors": n_anchor, "discs": len(discs)}
+
+
+# ---------------------------------------------------------------------------
+# run streams — audio/subtitle stream layout -> stream-signature evidence
+# ---------------------------------------------------------------------------
+
+# Titles shorter than this can't be episodes; excluding them keeps menus and
+# short extras from diluting the per-disc majority layout.
+STREAM_FLOOR = 300.0   # seconds
+
+
+def run_streams(conn, args) -> dict:
+    """Record a `stream-signature` evidence row per episode-length title: real
+    episodes on a disc share an audio/subtitle layout, so a title whose streams
+    disagree with its peers' is likely an episode-length *extra* (a featurette
+    or alternate cut that fools runtime matching). This carries NO episode
+    identity (episode_id is NULL) — it corroborates or contradicts *episode-
+    hood*, which `gaps` folds into its worklist. DVD counts come from lsdvd,
+    Blu-ray from the HandBrake scan; a disc with no counts yields no evidence.
+    """
+    loaded = _load_discs(conn)
+    if not loaded:
+        return {"ok": False, "error": "no-discs",
+                "message": "no discs scanned yet (run `scan`)"}
+    only = getattr(args, "disc", None)
+    n_ev = 0
+    results = []
+    for did, disc in loaded:
+        if only is not None and did != only:
+            continue
+        # Cluster over episode-length titles only. Exclude play-alls (they carry
+        # a legitimately richer/leaner layout — e.g. an added commentary track —
+        # so they'd read as the odd one out) and any concatenation far longer
+        # than its peers (a whole-disc monolith). classify_disc excludes play-alls
+        # from its nudge the same way; keep the two in step.
+        cands = [t for t in disc.titles
+                 if t.duration >= STREAM_FLOOR and t.kind != "play-all"]
+        if cands:
+            durs = sorted(t.duration for t in cands)
+            med = durs[len(durs) // 2]
+            cands = [t for t in cands if t.duration <= 1.6 * med]
+        maj, verdict = stream_signature(cands)
+        if not verdict:
+            continue                      # unanimous / no usable split on disc
+        ma, ms = maj
+        for t in cands:
+            v = verdict.get(t.id)
+            if v is None:
+                continue                  # title carried no stream count
+            tid = state.title_id(conn, did, t.id)
+            a, s = t.n_audio, t.n_sub
+            if v == "episode":
+                txt = f"episode stream layout {a}A/{s}S (disc majority)"
+                conf = 0.8
+            else:
+                txt = f"extra-like {a}A/{s}S vs {ma}A/{ms}S disc majority"
+                conf = 0.2
+            state.put_evidence(conn, tid, "stream-signature", episode_id=None,
+                               verdict=txt, confidence=conf,
+                               payload={"n_audio": a, "n_sub": s,
+                                        "majority": [ma, ms], "class": v})
+            n_ev += 1
+            results.append({"disc": state.disc_name(str(disc.path)),
+                            "title": t.id, "class": v, "sig": [a, s]})
+    return {"ok": True, "evidence": n_ev, "flagged":
+            sum(1 for r in results if r["class"] == "extra"), "titles": results}
 
 
 # ---------------------------------------------------------------------------
@@ -397,5 +466,5 @@ def run_elimination(conn, args) -> dict:
     return {"ok": True, "recovered": len(results), "titles": results}
 
 
-DISPATCH = {"align": run_align, "ocr": run_ocr, "synopsis": run_synopsis,
-            "elimination": run_elimination}
+DISPATCH = {"align": run_align, "streams": run_streams, "ocr": run_ocr,
+            "synopsis": run_synopsis, "elimination": run_elimination}

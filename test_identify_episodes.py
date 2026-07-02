@@ -445,9 +445,14 @@ class HandBrakeTitleTest(unittest.TestCase):
         'JSON Title Set: {\n'
         '  "MainFeature": 2,\n'
         '  "TitleList": [\n'
-        '    {"Index": 1, "Playlist": "0", "Name": "preroll"},\n'
-        '    {"Index": 2, "Playlist": "1", "Name": "ep"},\n'
-        '    {"Index": 9, "Playlist": "10", "Name": "ep"}\n'
+        '    {"Index": 1, "Playlist": "0", "Name": "preroll",\n'
+        '     "AudioList": [{"Description": "English (AC3, 2.0 ch)"}],\n'
+        '     "SubtitleList": []},\n'
+        '    {"Index": 2, "Playlist": "1", "Name": "ep",\n'
+        '     "AudioList": [{"Description": "English (DTS-HD MA, 5.1 ch)"},\n'
+        '       {}, {}, {}, {}], "SubtitleList": [{}, {}]},\n'
+        '    {"Index": 9, "Playlist": "10", "Name": "ep",\n'
+        '     "AudioList": [{}, {}, {}, {}, {}], "SubtitleList": [{}, {}]}\n'
         '  ]\n'
         '}\n')
 
@@ -455,9 +460,19 @@ class HandBrakeTitleTest(unittest.TestCase):
         m = ie._parse_hb_titles(self.HB_OUT)
         self.assertEqual(m, {0: 1, 1: 2, 10: 9})
 
+    def test_parse_scan_stream_counts(self):
+        s = ie._parse_hb_scan(self.HB_OUT)
+        self.assertEqual(s[0], {"index": 1, "n_audio": 1, "n_sub": 0,
+                                "lossless": False})
+        self.assertEqual(s[1], {"index": 2, "n_audio": 5, "n_sub": 2,
+                                "lossless": True})   # DTS-HD MA
+        self.assertEqual(s[10], {"index": 9, "n_audio": 5, "n_sub": 2,
+                                 "lossless": False})
+
     def test_parse_garbage(self):
         self.assertEqual(ie._parse_hb_titles("no json here"), {})
         self.assertEqual(ie._parse_hb_titles("JSON Title Set: {bad"), {})
+        self.assertEqual(ie._parse_hb_scan("no json here"), {})
 
     def test_rip_title_bluray_translates(self):
         d = disc([title(1, 2640)], fmt="bluray")
@@ -468,6 +483,60 @@ class HandBrakeTitleTest(unittest.TestCase):
         d = disc([title(7, 2640)], fmt="bluray")
         d.hb_map = {1: 2}  # playlist 7 absent
         self.assertEqual(ie.rip_title_number(d, d.titles[0]), 7)
+
+
+class DedupIdenticalClipsTest(unittest.TestCase):
+    def _t(self, tid, n_audio, n_sub, clips=("A", "B")):
+        t = title(tid, 1400, n_audio=n_audio, n_sub=n_sub)
+        t.clips = clips
+        return t
+
+    def test_keeps_richer_of_identical_clips(self):
+        lean = self._t(254, 1, 0)          # stereo AC3, no subs
+        full = self._t(601, 4, 1)          # DTS-HD MA + languages + subs
+        kept = ie.dedup_identical_clips([lean, full])
+        self.assertEqual([t.id for t in kept], [601])
+
+    def test_lossless_breaks_a_stream_count_tie(self):
+        # same 1A/1S count; only pl 601 has a lossless track
+        lossy = self._t(254, 1, 1)
+        loss = self._t(601, 1, 1)
+        kept = ie.dedup_identical_clips([lossy, loss], lossless=frozenset({601}))
+        self.assertEqual([t.id for t in kept], [601])
+
+    def test_distinct_clips_both_kept(self):
+        a = self._t(254, 1, 0, clips=("A", "B"))
+        b = self._t(255, 1, 0, clips=("A", "C"))
+        kept = ie.dedup_identical_clips([a, b])
+        self.assertEqual(sorted(t.id for t in kept), [254, 255])
+
+    def test_tie_falls_back_to_lowest_id(self):
+        a = self._t(254, 1, 0)
+        b = self._t(601, 1, 0)
+        kept = ie.dedup_identical_clips([a, b])   # no counts differ, no lossless
+        self.assertEqual([t.id for t in kept], [254])
+
+
+class StreamSignatureTest(unittest.TestCase):
+    def test_flags_the_minority_layout_as_extra(self):
+        # four episodes at 5A/2S, one episode-length extra at 1A/0S
+        eps = [title(i, 1400, n_audio=5, n_sub=2) for i in range(1, 5)]
+        extra = title(9, 1450, n_audio=1, n_sub=0)
+        maj, verdict = ie.stream_signature(eps + [extra])
+        self.assertEqual(maj, (5, 2))
+        self.assertEqual(verdict[9], "extra")
+        self.assertTrue(all(verdict[i] == "episode" for i in range(1, 5)))
+
+    def test_unanimous_layout_yields_no_split(self):
+        eps = [title(i, 1400, n_audio=5, n_sub=2) for i in range(1, 5)]
+        maj, verdict = ie.stream_signature(eps)
+        self.assertEqual(maj, (5, 2))
+        self.assertEqual(verdict, {})           # nothing to flag
+
+    def test_no_counts_no_signal(self):
+        # Blu-ray scanned without HandBrake -> all counts 0 -> no signal
+        eps = [title(i, 1400, n_audio=0, n_sub=0) for i in range(1, 4)]
+        self.assertEqual(ie.stream_signature(eps), (None, {}))
 
     def test_rip_title_dvd_is_identity(self):
         d = disc([title(3, 1320)], fmt="dvd")

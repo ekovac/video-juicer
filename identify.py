@@ -90,6 +90,33 @@ def detect_play_all(titles: list[Title]) -> Optional[tuple[Title, list[Title]]]:
     return pa, sorted(peers, key=lambda t: t.order_key)
 
 
+def stream_signature(titles: list[Title]) -> tuple[Optional[tuple], dict]:
+    """The disc's majority (n_audio, n_sub) stream layout and each title's
+    relation to it. Real episodes on a disc share an audio/subtitle layout
+    (e.g. 5 audio / 2 subtitle); an episode-*length* extra — a featurette or an
+    alternate cut that fools runtime matching — usually carries fewer streams.
+    So a title whose layout disagrees with its peers' is likely not an episode.
+
+    Returns (majority | None, {title.id: "episode" | "extra"}). The verdict map
+    is empty (no usable signal) when fewer than two titles carry any stream
+    count (a Blu-ray scanned with no HandBrake) or every title shares one layout
+    — only a genuine split yields verdicts. DVD counts come from lsdvd, Blu-ray
+    from the HandBrake scan; titles with no counts are ignored, not treated as 0.
+    """
+    usable = [t for t in titles if t.n_audio or t.n_sub]
+    if len(usable) < 2:
+        return None, {}
+    sigs: dict[tuple, int] = {}
+    for t in usable:
+        sigs[(t.n_audio, t.n_sub)] = sigs.get((t.n_audio, t.n_sub), 0) + 1
+    majority = max(sigs, key=lambda s: sigs[s])
+    if sigs[majority] < 2 or not any(s != majority for s in sigs):
+        return majority, {}          # unanimous / no clear majority -> no split
+    verdict = {t.id: ("episode" if (t.n_audio, t.n_sub) == majority else "extra")
+               for t in usable}
+    return majority, verdict
+
+
 def classify_disc(disc: Disc, expected_runtime: float) -> list[Title]:
     """Mark titles and return episode candidates in play order."""
     # 1. duration band kills menus/bumpers but keeps double-length episodes
@@ -116,15 +143,15 @@ def classify_disc(disc: Disc, expected_runtime: float) -> list[Title]:
 
     in_band = [t for t in disc.titles
                if t.kind == "unknown" and lo <= t.duration <= hi]
-    # 3. stream-signature clustering: episodes share audio/subtitle layout
-    if in_band:
-        sigs: dict[tuple, int] = {}
-        for t in in_band:
-            sigs[(t.n_audio, t.n_sub)] = sigs.get((t.n_audio, t.n_sub), 0) + 1
-        majority = max(sigs, key=lambda s: sigs[s])
-        if sigs[majority] >= 2 and any(majority != s for s in sigs):
-            for t in in_band:
-                t.evidence += 0.4 if (t.n_audio, t.n_sub) == majority else -0.4
+    # 3. stream-signature clustering: episodes share an audio/subtitle layout;
+    #    an episode-length extra usually carries fewer streams (see below).
+    _maj, verdict = stream_signature(in_band)
+    for t in in_band:
+        v = verdict.get(t.id)
+        if v == "episode":
+            t.evidence += 0.4
+        elif v == "extra":
+            t.evidence -= 0.4
 
     for t in disc.titles:
         if t.kind == "unknown":

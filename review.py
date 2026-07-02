@@ -44,6 +44,17 @@ def _ocr_finding(conn, tid: int) -> dict | None:
             "minutes": round(dur / 60, 1)}
 
 
+def _stream_finding(conn, tid: int) -> dict | None:
+    """The stream-signature verdict for a title: whether its audio/subtitle
+    layout matches its disc's episodes (`class`='episode') or looks like an
+    episode-length extra (`class`='extra'). None if `run streams` recorded none."""
+    for e in state.evidence_for_title(conn, tid):
+        if e["category"] == "stream-signature":
+            cls = json.loads(e["payload_json"] or "{}").get("class")
+            return {"class": cls, "verdict": e["verdict"]}
+    return None
+
+
 def _disc_assignments(conn):
     """{disc_id: (Disc, [Assignment sorted by play order])} from current
     proposed/confirmed assignments, with per-title delta from runtime-align
@@ -243,6 +254,7 @@ def gaps(conn, threshold: float = 0.5, accept: float = 0.8) -> dict:
         conflict, _eps = _conflict(conn, tid, threshold)
         lbl = _title_label(conn, tid)
         f = findings.get(tid)
+        sf = _stream_finding(conn, tid)
         unclaimed = not (a and json.loads(a["episode_ids_json"]))
         anomaly = (unclaimed and lbl["kind"] == "episode-candidate" and not f
                    and _episode_length(lbl["minutes"] * 60, medians))
@@ -273,9 +285,22 @@ def gaps(conn, threshold: float = 0.5, accept: float = 0.8) -> dict:
                           f"title(s) {', '.join(map(str, others))} — pick one, "
                           f"reject the rest (OCR the disc to tell them apart)"}
         elif anomaly:
-            suggestion = {"action": "run-ocr", "why":
-                          "episode-length but unidentified — likely a dropped/"
-                          "shifted episode; OCR this disc to corroborate"}
+            if sf and sf["class"] == "extra":
+                why = ("episode-length but unidentified, and its stream layout "
+                       f"is unlike this disc's episodes ({sf['verdict']}) — "
+                       "probably an extra, but OCR the disc to be sure")
+            elif sf and sf["class"] == "episode":
+                why = ("episode-length, unidentified, stream layout matches this "
+                       "disc's episodes — likely a dropped/shifted episode; OCR "
+                       "this disc to corroborate")
+            else:
+                why = ("episode-length but unidentified — likely a dropped/"
+                       "shifted episode; OCR this disc to corroborate")
+            suggestion = {"action": "run-ocr", "why": why}
+        elif sf and sf["class"] == "extra" and not unclaimed:
+            suggestion = {"action": "review", "why":
+                          f"proposed as an episode but {sf['verdict']} — likely "
+                          "an extra; OCR the disc to confirm before ripping"}
         elif status == "proposed" and not conflict:
             continue          # clean metadata proposal, no OCR issue — not a gap
         elif not ev and lbl["kind"] not in ("episode-candidate", "unknown"):
@@ -284,8 +309,8 @@ def gaps(conn, threshold: float = 0.5, accept: float = 0.8) -> dict:
             suggestion = {"action": "review", "why": f"{status}, awaiting decision"}
 
         lbl.update(status=status, conflict=conflict, anomaly=bool(anomaly),
-                   collision=tid in collision_ep, ocr=f, suggestion=suggestion,
-                   reason=suggestion["why"], evidence=ev)
+                   collision=tid in collision_ep, ocr=f, stream=sf,
+                   suggestion=suggestion, reason=suggestion["why"], evidence=ev)
         title_gaps.append(lbl)
 
     # episodes claimed by no assignment
@@ -326,8 +351,9 @@ def board(conn, season: int | None = None, disc_id: int | None = None) -> dict:
             continue
         titles = []
         for t in conn.execute(
-                "SELECT id,title_number,duration,kind FROM title WHERE disc_id=? "
-                "AND kind!='junk' ORDER BY order_key, title_number", (d["id"],)):
+                "SELECT id,title_number,duration,kind,n_audio,n_sub FROM title "
+                "WHERE disc_id=? AND kind!='junk' "
+                "ORDER BY order_key, title_number", (d["id"],)):
             a = state.get_assignment(conn, t["id"])
             asg = None
             if a and json.loads(a["episode_ids_json"]):
@@ -352,6 +378,7 @@ def board(conn, season: int | None = None, disc_id: int | None = None) -> dict:
             titles.append({
                 "title_id": t["id"], "pl": t["title_number"],
                 "minutes": round(t["duration"] / 60, 1), "kind": t["kind"],
+                "streams": f"{t['n_audio']}A/{t['n_sub']}S",
                 "assignment": asg, "evidence": ev, "conflict": conflict,
                 "frames": state.frame_categories(conn, t["id"])})
         discs.append({"disc": state.disc_name(d["path"]), "label": d["label"],

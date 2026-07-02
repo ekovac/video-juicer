@@ -19,7 +19,8 @@ The tool is modelled on MusicBrainz Picard. Heuristics are **on-demand evidence
 producers**, not one committed pipeline; a human or agent adjudicates. State is a
 SQLite **project file**, three layers: facts (`disc`/`title`/`episode`),
 **evidence** (one upserted row per (title, category) — categories are the
-sources `runtime-align`/`title-card-ocr`/`synopsis`/`elimination`), and
+sources `runtime-align`/`stream-signature`/`title-card-ocr`/`synopsis`/
+`elimination`), and
 **assignment** (the thin adjudicated answer). Conflict is *computed* by `gaps`,
 not stored. Full schema + rationale: DESIGN.md.
 
@@ -48,7 +49,8 @@ Layout:
 - `vj.py` — the CLI entry point wiring all verbs.
 
 Run (per-verb; see README for the full flow): `vj init db --tmdb-id <id>` →
-`vj scan db <discs>` → `vj run align db` → `vj run ocr db --disc N` →
+`vj scan db <discs>` → `vj run align db` → `vj run streams db` (optional; flags
+episode-length extras by audio/subtitle layout) → `vj run ocr db --disc N` →
 `vj resolve db` → review/adjudicate → `vj export db --manifest … --rip-script …`.
 Tests: `python3 -m unittest test_identify_episodes test_vj` (no discs/network).
 Needs `lsdvd`,`7z`; OCR also needs `ffmpeg`/`mencoder` + Ollama; `TMDB_API_KEY`
@@ -63,12 +65,31 @@ in env for `init`.
 - **Blu-ray**: extract only `BDMV/PLAYLIST/*.mpls` (a few KB each) via `7z`; parse
   MPLS in pure Python — total duration = Σ PlayItem `out_time - in_time` in
   45 kHz ticks; chapter marks from PlaylistMark. Dedupe playlists referencing the
-  identical clip sequence (Blu-rays carry duplicate/obfuscation playlists).
+  identical clip sequence (Blu-rays carry duplicate/obfuscation playlists) —
+  keeping the richest/lossless copy, see `dedup_identical_clips` in failure modes.
+- **BD audio/subtitle stream counts come from the HandBrake scan, not the MPLS.**
+  The STN table is too fragile to parse for counts (we only end-anchor it for the
+  `video_format`/`audio_format` codes), so `n_audio`/`n_sub` are 0 out of
+  `parse_mpls` and filled from `handbrake_scan` — the SAME scan already run for
+  the rip title index (`AudioList`/`SubtitleList` lengths, plus a lossless flag).
+  No HandBrake → counts stay 0 and the stream signals go quiet (fail-soft). DVD
+  counts come from lsdvd directly.
 - **Extras can be episode-length AND fool runtime alignment.** On Venture Bros
   S1D2, Title 8 is a 25:04 featurette and Title 16 a 21:23 extra, both confusable
   with ~22-min episodes; neither matches a play-all chapter, and (on these discs)
   extras lack the subtitle streams real episodes carry — a secondary discriminator
   behind the play-all/stream-signature logic. This is the canonical unit-test trap.
+  The stream discriminator lives in two places off ONE helper
+  (`identify.stream_signature`: the disc's majority `(n_audio, n_sub)` layout +
+  each title's episode/extra verdict): (1) a ±0.4 candidate-score nudge inside
+  `classify_disc` (unchanged), and (2) a first-class **`stream-signature`**
+  evidence category via `vj run streams` — a per-title row (episode_id NULL; it
+  attests episode-*hood*, not identity) that `gaps` folds in: an episode-length
+  title proposed as an episode but with an extra-like layout is surfaced for
+  review, and an unidentified episode-length leftover's dropped/-episode anomaly
+  is strengthened or softened by whether its layout matches the disc's episodes.
+  `run streams` excludes play-alls (legitimately richer — commentary track) and
+  concatenations (>1.6× median) from the clustering, matching `classify_disc`.
 - **TMDB runtimes are integer minutes** (some `null`); direct runtime matching
   needs ~±90 s tolerance, hence the calibration + `valid_episode_lengths` band.
 - **Volume labels are unreliable; the file basename is canonical.** Many box
@@ -197,6 +218,18 @@ Three sources of canonical episode ORDER, cheapest first:
 - **Two authoring versions per episode** (body alone vs body+logo/recap) →
   `dedup_subset_playlists`: drop a playlist whose clips are a strict subset of a
   similar-length one (1.5x guard stops a play-all swallowing episodes).
+- **Two playlists over the *identical* clips** (a lossless/multi-language master
+  and a stripped stereo copy — Avatar B1D3 authored every episode as both pl
+  60x = DTS-HD MA 4A/1S and pl 25x = AC3-stereo 1A/0S, byte-identical clips and
+  in/out ticks) → `dedup_identical_clips`. The old scan dropped exact-clip
+  duplicates by *filename order*, silently keeping the stripped version; now the
+  BD scan runs HandBrake *before* dedup (it already runs it for the rip index)
+  and keeps the RICHEST of each identical-clip group: most audio+subtitle
+  streams, then lossless-audio-present (`_has_lossless` on the HB Description),
+  then lowest id (= old first-seen, so no-HandBrake/DVD behaviour is unchanged).
+  So the rip plan sources the lossless master, and OCR/align are unaffected
+  (same clips, duration, and play-all order regardless of which id is kept). The
+  stripped twins are commonly commentary or stereo-compat versions.
 - **Combined two-parter "double" playlists** (one playlist = 2 episodes) →
   claim N and N+1; `resolve_assignment_collisions` (OCR path only — the
   metadata DP is monotonic and never double-claims) keeps a double only when it

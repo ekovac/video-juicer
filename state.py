@@ -28,6 +28,7 @@ from discs import Disc, Episode, Title
 CATEGORIES = (
     "runtime-align",
     "play-all",
+    "stream-signature",
     "title-card-ocr",
     "synopsis",
     "elimination",

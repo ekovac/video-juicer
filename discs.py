@@ -194,8 +194,8 @@ def parse_mpls(buf: bytes) -> Optional[dict]:
             video_format, audio_format = _stn_formats(buf, pos, item_len)
         pos += 2 + item_len
     # Stream counts live in the STN table at a variable offset; parsing it is
-    # fragile, so Blu-ray keeps counts at 0 and relies on duration/chapter
-    # evidence only.
+    # fragile, so the MPLS parse leaves counts at 0 — scan_bluray fills them in
+    # from the (already-run) HandBrake scan, which demuxes them reliably.
     duration = sum(durations)
     # PlaylistMark block: type 1 == chapter mark
     n_marks = struct.unpack_from(">H", buf, mark_start + 4)[0]
@@ -225,6 +225,27 @@ def parse_mpls(buf: bytes) -> Optional[dict]:
     return {"duration": duration, "chapters": chapters, "clips": tuple(clips),
             "n_audio": n_audio, "n_sub": n_sub, "n_items": n_items,
             "video_format": video_format, "audio_format": audio_format}
+
+
+def dedup_identical_clips(titles: list[Title],
+                          lossless: "frozenset[int]" = frozenset()) -> list[Title]:
+    """Collapse playlists that reference the identical clip sequence — Blu-rays
+    carry duplicate/obfuscation playlists, and often two authorings of one
+    episode (a lossless/multi-language master and a stripped stereo copy).
+
+    Keep the RICHEST of each group by, in order: most audio+subtitle streams;
+    then lossless audio present (`lossless` = the set of playlist ids HandBrake
+    reported a lossless track for) so a lossless master beats a same-count lossy
+    twin; then lowest playlist id (stable, and matches the old first-seen-by-
+    filename behaviour when no stream counts are available)."""
+    def rank(t: Title) -> tuple:
+        return (t.n_audio + t.n_sub, t.id in lossless, -t.id)
+    best: dict[tuple, Title] = {}
+    for t in titles:
+        cur = best.get(t.clips)
+        if cur is None or rank(t) > rank(cur):
+            best[t.clips] = t
+    return sorted(best.values(), key=lambda t: t.id)
 
 
 def dedup_subset_playlists(titles: list[Title]) -> list[Title]:
@@ -308,29 +329,60 @@ def scan_bluray(path: Path) -> Disc:
                                 capture_output=True, timeout=120)
             playlists[num] = ex.stdout
         label = path.stem
-    titles, seen_clips = [], set()
+    # Build every playlist first, then dedup — so when two playlists reference
+    # identical clips we keep the BETTER one. Blu-rays routinely author an
+    # episode twice: a full playlist (lossless audio + subtitles) and a lean one
+    # (stereo AC3, no subs). Dropping by filename order silently kept the
+    # inferior master (Avatar B1D3: pl 254 = 1A/0S beat pl 601 = DTS-HD MA 4A/1S
+    # over the same clips). The HandBrake scan's stream counts are the
+    # discriminator, so run it before dedup rather than after.
+    hb = handbrake_scan(path)
+    all_titles = []
     for num, buf in sorted(playlists.items()):
         info = parse_mpls(buf)
         if not info:
             continue
-        if info["clips"] in seen_clips:   # duplicate/obfuscation playlist
-            continue
-        seen_clips.add(info["clips"])
-        titles.append(Title(
+        v = hb.get(num)   # HandBrake demuxed counts (Blu-ray) override the 0s
+        all_titles.append(Title(
             id=num, duration=info["duration"], chapters=info["chapters"],
-            n_audio=info["n_audio"], n_sub=info["n_sub"],
+            n_audio=v["n_audio"] if v else info["n_audio"],
+            n_sub=v["n_sub"] if v else info["n_sub"],
             cells=info["n_items"], clips=info["clips"], order_key=num,
             video_format=info["video_format"], audio_format=info["audio_format"],
         ))
+    lossless = frozenset(pl for pl, v in hb.items() if v.get("lossless"))
+    titles = dedup_identical_clips(all_titles, lossless)
     titles = dedup_subset_playlists(titles)
     order_by_playall(titles)   # exact ordering when a play-all is present
     disc = Disc(path=path, format="bluray", label=label, titles=titles)
-    disc.hb_map = handbrake_title_map(path)
+    disc.hb_map = {pl: v["index"] for pl, v in hb.items()}
     return disc
 
 
-def _parse_hb_titles(stdout: str) -> dict[int, int]:
-    """Extract {playlist_id: handbrake_title_index} from HandBrakeCLI --json."""
+# Lossless audio codec markers as they appear in HandBrake's audio Description
+# (e.g. "English (DTS-HD MA, 2.0 ch)"). "DTS-HD MA" only — plain "DTS" and
+# "DTS-HD HRA" are lossy; matched lowercase.
+_LOSSLESS_AUDIO = ("truehd", "dts-hd ma", "flac", "lpcm", "pcm", "alac")
+
+
+def _has_lossless(audio_list: list) -> bool:
+    for a in audio_list:
+        desc = f"{a.get('Description', '')} {a.get('CodecName', '')}".lower()
+        if any(m in desc for m in _LOSSLESS_AUDIO):
+            return True
+    return False
+
+
+def _parse_hb_scan(stdout: str) -> dict[int, dict]:
+    """Parse HandBrakeCLI --json scan output into
+    {playlist_id: {"index", "n_audio", "n_sub", "lossless"}}.
+
+    HandBrake reports each Blu-ray title's `.mpls` id (`Playlist`), its own
+    title index (`Index`, the `-t N` to rip), and the demuxed `AudioList` /
+    `SubtitleList` — an accurate stream count without our parsing the fragile
+    MPLS STN table ourselves, plus whether any audio track is lossless. One scan
+    yields the rip index, the stream-richness signal, and the master/duplicate
+    tiebreak."""
     i = stdout.find("JSON Title Set:")
     if i < 0:
         return {}
@@ -350,20 +402,30 @@ def _parse_hb_titles(stdout: str) -> dict[int, int]:
         data = json.loads(stdout[start:end])
     except json.JSONDecodeError:
         return {}
-    mapping = {}
+    scan = {}
     for t in data.get("TitleList", []):
         pl, idx = t.get("Playlist"), t.get("Index")
         if pl is None or idx is None:
             continue
         try:
-            mapping[int(pl)] = int(idx)
+            scan[int(pl)] = {"index": int(idx),
+                             "n_audio": len(t.get("AudioList", [])),
+                             "n_sub": len(t.get("SubtitleList", [])),
+                             "lossless": _has_lossless(t.get("AudioList", []))}
         except (ValueError, TypeError):
             continue
-    return mapping
+    return scan
 
 
-def handbrake_title_map(path: Path) -> dict[int, int]:
-    """Map BD playlist .mpls id -> HandBrake title index (the `-t N` to rip).
+def _parse_hb_titles(stdout: str) -> dict[int, int]:
+    """{playlist_id: handbrake_title_index} — the index-only view for ripping."""
+    return {pl: v["index"] for pl, v in _parse_hb_scan(stdout).items()}
+
+
+def handbrake_scan(path: Path) -> dict[int, dict]:
+    """Scan a Blu-ray once with HandBrake, returning per-playlist
+    {"index", "n_audio", "n_sub"} (see `_parse_hb_scan`). One subprocess yields
+    both the rip title index and the stream-richness signal.
 
     HandBrake enumerates relevant playlists; that numbering differs from raw
     .mpls ids and from a player's title-object list (e.g. VLC). Best-effort:
@@ -372,7 +434,8 @@ def handbrake_title_map(path: Path) -> dict[int, int]:
     """
     if not shutil.which("HandBrakeCLI"):
         log.warning("HandBrakeCLI not on PATH; Blu-ray output will use raw "
-                    ".mpls ids, which do NOT match HandBrake's -t numbers")
+                    ".mpls ids, which do NOT match HandBrake's -t numbers, and "
+                    "titles carry no audio/subtitle stream counts")
         return {}
     try:
         proc = run(["HandBrakeCLI", "-i", str(path), "-t", "0", "--scan",
@@ -380,10 +443,10 @@ def handbrake_title_map(path: Path) -> dict[int, int]:
     except subprocess.TimeoutExpired:
         log.warning("HandBrake scan timed out on %s", path.name)
         return {}
-    mapping = _parse_hb_titles(proc.stdout)
-    if not mapping:
+    scan = _parse_hb_scan(proc.stdout)
+    if not scan:
         log.warning("HandBrake scan yielded no titles for %s", path.name)
-    return mapping
+    return scan
 
 
 def rip_title_number(disc: Disc, title: Title) -> int:

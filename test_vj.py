@@ -157,6 +157,53 @@ class CollisionTests(Base):
         self.assertEqual(review.gaps(self.conn)["gaps"], [])
 
 
+class StreamSignatureComputeTests(Base):
+    def _seed(self):
+        state.upsert_episodes(
+            self.conn, [ep(1, k, f"E{k}", 1320.0) for k in range(1, 5)])
+        # four episodes at 5A/2S + one episode-length extra at 1A/0S
+        ts = [Title(id=k, duration=1320.0, chapters=[1320.0],
+                    n_audio=5, n_sub=2, kind="episode-candidate")
+              for k in range(1, 5)]
+        ts.append(Title(id=9, duration=1350.0, chapters=[1350.0],
+                        n_audio=1, n_sub=0, kind="episode-candidate"))
+        return self.add_disc(ts)
+
+    def test_run_streams_flags_the_odd_layout(self):
+        did = self._seed()
+        res = compute.run_streams(self.conn, auto_args())
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["evidence"], 5)     # all five titles get a row
+        self.assertEqual(res["flagged"], 1)      # one is extra-like
+        tid9 = state.title_id(self.conn, did, 9)
+        ev = [e for e in state.evidence_for_title(self.conn, tid9)
+              if e["category"] == "stream-signature"][0]
+        self.assertIn("extra-like", ev["verdict"])
+        self.assertIsNone(ev["episode_id"])      # no episode identity claimed
+
+    def test_no_signal_when_counts_absent(self):
+        # a Blu-ray scanned without HandBrake: every title has 0/0 -> no rows
+        state.upsert_episodes(self.conn, [ep(1, 1, "A", 1320.0)])
+        ts = [Title(id=k, duration=1320.0, chapters=[1320.0],
+                    n_audio=0, n_sub=0) for k in range(1, 4)]
+        self.add_disc(ts)
+        res = compute.run_streams(self.conn, auto_args())
+        self.assertEqual(res["evidence"], 0)
+
+    def test_gaps_flags_extra_like_proposed_episode(self):
+        did = self._seed()
+        compute.run_streams(self.conn, auto_args())
+        tid9 = state.title_id(self.conn, did, 9)
+        # metadata-only align could propose the extra as an episode
+        state.set_assignment(self.conn, tid9,
+                             [state.episode_id(self.conn, 1, 4)],
+                             status="proposed", decided_by="heuristic:align")
+        row = [x for x in review.gaps(self.conn)["gaps"]
+               if x["title_id"] == tid9][0]
+        self.assertEqual(row["stream"]["class"], "extra")
+        self.assertIn("extra", row["reason"])
+
+
 class PoolTests(Base):
     def test_include_specials_widens_season_pool(self):
         from discs import Disc
