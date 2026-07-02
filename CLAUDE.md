@@ -137,6 +137,27 @@ Three sources of canonical episode ORDER, cheapest first:
   auto-trusted. (Clipless synthetic/DVD play-alls can't be checked → trusted as
   before.) Do NOT "fix" this by ordering on clip id — clip numbering is not
   broadcast order in general (the whole reason `order_by_playall` exists).
+- **Do NOT try to detect the "full" play-all statically — it often isn't a
+  playlist at all.** Investigated on the real TNG S1D1 disc (2026-07): there is
+  NO 3-episode play-all `.mpls`. The six longest playlists are duplicate copies
+  of Farpoint itself (91.4 min, clips 00000/00084); `mpls 0` (91.1 min, clips
+  00001/00002/00064) is a genuine but PARTIAL play-all of only E02+E03. The
+  disc's on-screen "Play All" (which does start with Farpoint) is implemented in
+  the **navigation layer** (HDMV movie objects / menu button commands chaining
+  playlists), invisible to an `.mpls` parser. So we aren't picking the wrong
+  playlist — the full order simply isn't in one. And no static signal cleanly
+  separates a **feature-length single episode outside the play-all** (Farpoint,
+  ~2x, own clips) from a **whole-disc play-all authored as one monolithic clip**
+  (Avatar B1D1 `mpls 1000` = 226 min, single clip `01010`, also disjoint) or a
+  **combined two-parter** (~2x, own clips): duration and clip-disjointness look
+  identical. Two attempts to fix it — a duration-band "stray" check and a
+  clip-coverage check — both **regressed Avatar (57→55/61, scrambled) and fired
+  on every Avatar/Korra disc** (their book-play-alls are 150-226 min single
+  clips) and were reverted. Leave the play-all detector as-is; TNG is handled by
+  the surfacing below + the confirmed-anchor re-align (`run align` pins confirmed
+  titles) + OCR. Blu-ray authoring is a zoo — deliberate obfuscation and awkward
+  mastering are indistinguishable and often both on one disc; don't chase a
+  static heuristic here, it will re-regress the play-all discs.
 - **How untrustworthy order surfaces (evidence-first, not auto):** `gaps`/
   `status` report per-disc "⚠ order unverified" from `assess_ordering`, and
   `gaps` flags an unclaimed *episode-length* candidate as a `‼` anomaly
