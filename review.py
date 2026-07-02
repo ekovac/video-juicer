@@ -95,7 +95,7 @@ def order_warnings(conn) -> list[dict]:
             continue
         ok, reason = assess_ordering(discs[did], asgs)
         if not ok:
-            warns.append({"disc_id": did, "disc": discs[did].label,
+            warns.append({"disc_id": did, "disc": state.disc_name(discs[did].path),
                           "titles": len(asgs), "reason": reason})
     return warns
 
@@ -133,7 +133,8 @@ def _title_label(conn, tid: int) -> dict:
         "SELECT t.id, t.title_number, t.duration, t.kind, d.id AS disc_id, "
         "d.label, d.path FROM title t JOIN disc d ON d.id=t.disc_id "
         "WHERE t.id=?", (tid,)).fetchone()
-    return {"title_id": r["id"], "disc_id": r["disc_id"], "disc": r["label"],
+    return {"title_id": r["id"], "disc_id": r["disc_id"],
+            "disc": state.disc_name(r["path"]), "label": r["label"],
             "title_number": r["title_number"], "kind": r["kind"],
             "minutes": round(r["duration"] / 60, 1)}
 
@@ -330,9 +331,9 @@ def board(conn, season: int | None = None, disc_id: int | None = None) -> dict:
                 "minutes": round(t["duration"] / 60, 1), "kind": t["kind"],
                 "assignment": asg, "evidence": ev, "conflict": conflict,
                 "frames": state.frame_categories(conn, t["id"])})
-        discs.append({"disc": d["label"], "disc_id": d["id"],
-                      "season": d["season_hint"], "order_warning": warns.get(d["id"]),
-                      "titles": titles})
+        discs.append({"disc": state.disc_name(d["path"]), "label": d["label"],
+                      "disc_id": d["id"], "season": d["season_hint"],
+                      "order_warning": warns.get(d["id"]), "titles": titles})
     summary = summarize(conn)
     seasons = summary["seasons"]
     if season is not None:

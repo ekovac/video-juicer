@@ -126,6 +126,16 @@ CREATE INDEX IF NOT EXISTS ix_frame_title ON frame(title_id);
 # ---------------------------------------------------------------------------
 
 
+def disc_name(path: str | Path) -> str:
+    """Canonical human/display name for a disc: its file basename. Volume labels
+    (disc.label, read from the filesystem) are routinely blank, wrong, or
+    identical across every disc in a set, so the image filename / backup-dir name
+    — which the user controls — is the reliable identifier. Drops a disc-image
+    extension; leaves backup-dir names as-is."""
+    p = Path(path)
+    return p.stem if p.suffix.lower() in (".iso", ".img", ".udf", ".nrg") else p.name
+
+
 def connect(path: str | Path) -> sqlite3.Connection:
     """Open (creating + migrating) the state DB. Rows come back as dict-likes."""
     conn = sqlite3.connect(str(path))

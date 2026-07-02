@@ -193,7 +193,7 @@ def cmd_scan(args) -> int:
     conn.close()
 
     human = "\n".join(
-        f"scanned disc {d['disc_id']}: {Path(d['path']).name} "
+        f"scanned disc {d['disc_id']}: {state.disc_name(d['path'])} "
         f"[{d['format']}] {d['titles']} titles"
         + (f" (S{d['season_hint']}" if d['season_hint'] else "")
         + (f"D{d['disc_hint']})" if d['disc_hint'] else

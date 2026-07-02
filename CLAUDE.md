@@ -71,6 +71,13 @@ in env for `init`.
   behind the play-all/stream-signature logic. This is the canonical unit-test trap.
 - **TMDB runtimes are integer minutes** (some `null`); direct runtime matching
   needs ~±90 s tolerance, hence the calibration + `valid_episode_lengths` band.
+- **Volume labels are unreliable; the file basename is canonical.** Many box
+  sets have blank, wrong, or *identical* filesystem volume labels across every
+  disc (VB S2 labels both discs `VENTURE_BROS_SEASON_2`). So display and disc
+  identity use the image filename / backup-dir basename (`state.disc_name`,
+  `.iso` stripped), never `disc.label`. Hint parsing already agrees — it reads
+  `disc.path.name` before `disc.label`. The volume label is kept only as
+  secondary info in JSON.
 - **CSS-encrypted DVDs**: these ISOs are expected pre-decrypted; if libdvdread
   reports encryption and IFO reads fail, error out pointing at libdvdcss rather
   than emitting garbage.
