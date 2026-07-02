@@ -55,6 +55,18 @@ def order_warnings(conn) -> list[dict]:
     for did, asgs in by_disc.items():
         if len(asgs) <= 1:
             continue
+        # a disc whose episode titles are all adjudicated (confirmed/rejected)
+        # has its order settled by those decisions — metadata order no longer
+        # matters, so don't nag about it
+        cands = conn.execute(
+            "SELECT COUNT(*) c FROM title WHERE disc_id=? AND kind='episode-candidate'",
+            (did,)).fetchone()["c"]
+        decided = conn.execute(
+            "SELECT COUNT(*) c FROM assignment a JOIN title t ON t.id=a.title_id "
+            "WHERE t.disc_id=? AND t.kind='episode-candidate' "
+            "AND a.status IN ('confirmed','rejected')", (did,)).fetchone()["c"]
+        if cands and decided >= cands:
+            continue
         ok, reason = assess_ordering(discs[did], asgs)
         if not ok:
             warns.append({"disc_id": did, "disc": discs[did].label,
@@ -170,10 +182,10 @@ def gaps(conn, threshold: float = 0.5) -> dict:
         a = state.get_assignment(conn, tid)
         status = a["status"] if a else "unresolved"
         conflict, eps = _conflict(conn, tid, threshold)
-        if status == "confirmed" and not conflict:
-            continue
-        if status == "rejected":
-            continue
+        if status in ("confirmed", "rejected"):
+            continue          # adjudicated — the decision stands over any
+                              # evidence disagreement (which is expected: the
+                              # human/agent chose one source over another)
         if status == "proposed" and not conflict:
             continue          # a clean proposal isn't a gap until reviewed
         lbl = _title_label(conn, tid)
