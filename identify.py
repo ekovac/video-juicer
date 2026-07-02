@@ -167,8 +167,27 @@ def assess_ordering(disc: Disc, assignments: list["Assignment"],
                            "cross-disc numbering is unanchored and can drop or "
                            "shift a title; recommend --ocr-identify")
         return True, "DVD title order"
-    if any(t.kind == "play-all" for t in disc.titles):
+    playalls = [t for t in disc.titles if t.kind == "play-all" and t.clips]
+    if playalls:
+        # A play-all vouches for the order of the episodes it CONCATENATES. If a
+        # disc has episode-length titles NOT in the play-all (a feature-length
+        # pilot authored separately — Star Trek: TNG "Encounter at Farpoint"),
+        # the play-all doesn't order those, and the aligner can drop/shift a
+        # title around them (TNG S1 went +1). So a play-all is full corroboration
+        # only when it covers every clip-bearing episode title. (Clipless
+        # synthetic/DVD titles can't be checked -> trust as before.)
+        pa = max(playalls, key=lambda t: len(t.clips))
+        clipset = set(pa.clips)
+        clipped = [a for a in assignments if a.title.clips]
+        uncovered = [a for a in clipped if not set(a.title.clips) <= clipset]
+        if clipped and uncovered:
+            return False, (f"play-all covers only {len(clipped) - len(uncovered)}"
+                           f"/{len(clipped)} episode titles ({len(uncovered)} "
+                           f"authored outside it) — order not fully corroborated; "
+                           f"corroborate with OCR")
         return True, "play-all corroborates order"
+    if any(t.kind == "play-all" for t in disc.titles):
+        return True, "play-all corroborates order"   # clipless (DVD) play-all
     if sum(1 for e in eps if re.search(r"\(\d+\)\s*$", e.name)) >= 2:
         return True, "multi-part titles corroborate order"
     if min_gap <= tol:                 # two episodes runtime-indistinguishable

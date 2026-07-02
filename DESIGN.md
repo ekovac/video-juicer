@@ -175,7 +175,12 @@ UNIX tool with structured output and no hidden state.** Concretely:
 - `vj status <state.db>` — summary counts (confirmed / proposed / conflict /
   unresolved) per season.
 - `vj gaps <state.db>` — **the agent worklist**: every title that's `conflict`
-  or `unresolved`, with its competing evidence.
+  or `unresolved`, with its competing evidence. Also surfaces two evidence-native
+  risk flags (not auto-actions): per-disc **order-unverified** warnings
+  (`assess_ordering`, incl. a play-all that doesn't cover every episode title)
+  and **episode-length-unclaimed** anomalies (an ~episode-length leftover — the
+  tell of a dropped/shifted episode). Both nudge the reviewer/agent to
+  corroborate that disc with `run ocr`; anomalies and conflicts sort to the top.
 - `vj show <state.db> --title T | --episode E` — all evidence + current
   assignment for one thing; reports whether an OCR frame is on file.
 - `vj frame <state.db> --title T [--out FILE]` — dump the retained OCR frame to

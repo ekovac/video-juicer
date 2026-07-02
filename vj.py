@@ -247,6 +247,8 @@ def cmd_status(args) -> int:
              f"  assignments: {r['assignments_by_status'] or '(none)'}"]
     for s in r["seasons"]:
         lines.append(f"  S{s['season']:02d}: {s['matched']}/{s['total']} episodes matched")
+    for w in r.get("order_warnings", []):
+        lines.append(f"  ⚠ {w['disc']}: order unverified — {w['reason']}")
     emit(args, r, human="\n".join(lines))
     return 0
 
@@ -259,8 +261,12 @@ def cmd_gaps(args) -> int:
     conn.close()
     lines = [f"{r['n_gaps']} title(s) need attention, "
              f"{r['n_missing']} episode(s) missing"]
+    for w in r.get("order_warnings", []):
+        lines.append(f"  ⚠ order unverified: {w['disc']} ({w['titles']} titles) "
+                     f"— {w['reason']}")
     for g in r["gaps"]:
-        lines.append(f"  title {g['title_id']} ({g['disc']} t{g['title_number']}, "
+        mark = "‼ " if g.get("anomaly") else ""
+        lines.append(f"  {mark}title {g['title_id']} ({g['disc']} t{g['title_number']}, "
                      f"{g['minutes']}m): {g['reason']}")
         for e in g["evidence"]:
             lines.append(f"      [{e['category']}] {e['episode'] or '—'} "

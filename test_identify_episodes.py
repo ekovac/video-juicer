@@ -547,6 +547,38 @@ class OrderabilityTest(unittest.TestCase):
         d.titles[0].kind = "play-all"
         ok, why = ie.assess_ordering(d, self._asgs(d, [(1440, 200)] * 5))
         self.assertTrue(ok)
+
+    def _clip_asg(self, d, tid, rt, clips, num):
+        t = title(tid, rt)
+        t.clips = clips
+        return ie.Assignment(d, t, [ie.Episode(1, num, f"E{num}", rt)], 5, "high")
+
+    def test_bluray_partial_playall_uncorroborated(self):
+        # play-all covers 2 of 3 episode titles; a feature-length pilot is
+        # authored outside it (TNG "Encounter at Farpoint") -> not full
+        # corroboration, even though a play-all exists
+        d = disc([], fmt="bluray")
+        pa = title(0, 5520)
+        pa.clips = ("00001", "00002", "00064")
+        pa.kind = "play-all"
+        d.titles = [pa]
+        asgs = [self._clip_asg(d, 1, 5460, ("00000", "00084"), 1),   # pilot, outside
+                self._clip_asg(d, 2, 2760, ("00001", "00064"), 2),
+                self._clip_asg(d, 3, 2760, ("00002", "00064"), 3)]
+        ok, why = ie.assess_ordering(d, asgs)
+        self.assertFalse(ok)
+        self.assertIn("authored outside", why)
+
+    def test_bluray_full_playall_with_clips_corroborates(self):
+        # play-all covers every clip-bearing episode title -> trusted
+        d = disc([], fmt="bluray")
+        pa = title(0, 8280)
+        pa.clips = ("00001", "00002", "00003")
+        pa.kind = "play-all"
+        d.titles = [pa]
+        asgs = [self._clip_asg(d, i, 2760, (f"0000{i}",), i) for i in (1, 2, 3)]
+        ok, why = ie.assess_ordering(d, asgs)
+        self.assertTrue(ok)
         self.assertIn("play-all", why)
 
 

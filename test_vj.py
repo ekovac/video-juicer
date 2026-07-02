@@ -316,6 +316,35 @@ class TextGateTests(unittest.TestCase):
         self.assertFalse(any(tr.frame_has_text(s) for s in scenes[:15]))  # scenes pruned
 
 
+class AnomalyTests(Base):
+    def test_episode_length_leftover_flagged(self):
+        # an unclaimed episode-length candidate = the tell of a dropped/shifted
+        # episode (TNG D1's Farpoint-displaced title) -> anomaly-flagged in gaps
+        state.upsert_episodes(self.conn, [ep(1, 1, "A", 1320.0),
+                                          ep(1, 2, "B", 1320.0), ep(1, 3, "C", 1320.0)])
+        t = title(1, 1320, [660, 660])
+        t.kind = "episode-candidate"
+        did = self.add_disc([t])
+        tid = state.title_id(self.conn, did, 1)
+        state.put_evidence(self.conn, tid, "runtime-align", episode_id=None,
+                           verdict="not an episode (leftover)", confidence=0.0)
+        hit = [g for g in review.gaps(self.conn)["gaps"] if g["title_id"] == tid][0]
+        self.assertTrue(hit["anomaly"])
+        self.assertIn("episode-length", hit["reason"])
+
+    def test_short_extra_not_flagged(self):
+        # a genuinely short extra is not episode-length -> no anomaly
+        state.upsert_episodes(self.conn, [ep(1, 1, "A", 1320.0), ep(1, 2, "B", 1320.0)])
+        t = title(1, 300, [300])           # 5 min featurette
+        t.kind = "episode-candidate"
+        did = self.add_disc([t])
+        tid = state.title_id(self.conn, did, 1)
+        state.put_evidence(self.conn, tid, "runtime-align", episode_id=None,
+                           verdict="not an episode (leftover)", confidence=0.0)
+        hits = [g for g in review.gaps(self.conn)["gaps"] if g["title_id"] == tid]
+        self.assertFalse(hits and hits[0]["anomaly"])
+
+
 class PlayTests(Base):
     def test_mrl(self):
         self.assertEqual(vj._play_mrl("dvd", "/x.iso", 4), "dvd:///x.iso#4")

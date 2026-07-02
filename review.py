@@ -14,6 +14,76 @@ import json
 import sqlite3
 
 import state
+from discs import Assignment
+from identify import assess_ordering
+
+
+def _disc_assignments(conn):
+    """{disc_id: (Disc, [Assignment sorted by play order])} from current
+    proposed/confirmed assignments, with per-title delta from runtime-align
+    evidence — the shape `assess_ordering` needs."""
+    discs = {r["id"]: state.load_disc(conn, r["id"]) for r in state.list_discs(conn)}
+    out = {did: [] for did in discs}
+    rows = conn.execute(
+        "SELECT a.episode_ids_json, e.payload_json, t.disc_id, t.title_number "
+        "FROM assignment a JOIN title t ON t.id=a.title_id "
+        "LEFT JOIN evidence e ON e.title_id=t.id AND e.category='runtime-align' "
+        "WHERE a.status IN ('proposed','confirmed')").fetchall()
+    for r in rows:
+        eids = json.loads(r["episode_ids_json"])
+        if not eids:
+            continue
+        eps = [state.episode_by_id(conn, x) for x in eids]
+        disc = discs[r["disc_id"]]
+        title = next((t for t in disc.titles if t.id == r["title_number"]), None)
+        if title is None:
+            continue
+        delta = (json.loads(r["payload_json"]).get("delta", 0.0)
+                 if r["payload_json"] else 0.0)
+        out[r["disc_id"]].append(Assignment(disc, title, eps, delta, "medium"))
+    for did in out:
+        out[did].sort(key=lambda a: a.title.order_key)
+    return discs, out
+
+
+def order_warnings(conn) -> list[dict]:
+    """Discs whose episode ORDER can't be corroborated from metadata alone
+    (`assess_ordering`) — so their proposals are position guesses that a second
+    evidence source (OCR) should confirm. Surfaced, not acted on."""
+    discs, by_disc = _disc_assignments(conn)
+    warns = []
+    for did, asgs in by_disc.items():
+        if len(asgs) <= 1:
+            continue
+        ok, reason = assess_ordering(discs[did], asgs)
+        if not ok:
+            warns.append({"disc_id": did, "disc": discs[did].label,
+                          "titles": len(asgs), "reason": reason})
+    return warns
+
+
+def _season_medians(conn) -> dict[int, float]:
+    """Median episode runtime per season (for the episode-length anomaly)."""
+    med = {}
+    for s in conn.execute("SELECT DISTINCT season FROM episode WHERE season>0"):
+        rts = [r["runtime"] for r in conn.execute(
+            "SELECT runtime FROM episode WHERE season=? AND runtime IS NOT NULL",
+            (s["season"],))]
+        if rts:
+            med[s["season"]] = sorted(rts)[len(rts) // 2]
+    return med
+
+
+def _episode_length(duration: float, medians: dict[int, float],
+                    tol: float = 0.15) -> bool:
+    """Is a title's duration ~a single episode (or clean multiple) of some
+    season's median? Catches a dropped/unmatched episode masquerading as an
+    extra."""
+    for m in medians.values():
+        for k in (1, 2, 3):
+            if abs(duration - k * m) <= tol * m:
+                return True
+    return False
 
 
 def _sxxeyy(season, number) -> str:
@@ -77,7 +147,7 @@ def summarize(conn) -> dict:
     n_titles = conn.execute("SELECT COUNT(*) c FROM title").fetchone()["c"]
     return {"ok": True, "show": proj.get("show_name"),
             "titles": n_titles, "assignments_by_status": by_status,
-            "seasons": seasons}
+            "seasons": seasons, "order_warnings": order_warnings(conn)}
 
 
 # ---------------------------------------------------------------------------
@@ -89,7 +159,10 @@ def gaps(conn, threshold: float = 0.5) -> dict:
     """Titles needing attention + episodes still missing.
 
     A title is a gap if it has no sticky/proposed assignment, or its evidence
-    conflicts. Confirmed titles with agreeing evidence drop out."""
+    conflicts. Confirmed titles with agreeing evidence drop out. An episode-
+    length title left unclaimed is flagged as an anomaly (a dropped/unmatched
+    episode — the tell of a same-runtime alignment shift)."""
+    medians = _season_medians(conn)
     title_gaps = []
     for t in conn.execute("SELECT id FROM title ORDER BY id"):
         tid = t["id"]
@@ -103,17 +176,28 @@ def gaps(conn, threshold: float = 0.5) -> dict:
             continue
         if status == "proposed" and not conflict:
             continue          # a clean proposal isn't a gap until reviewed
+        lbl = _title_label(conn, tid)
         if not ev and status == "unresolved":
             # no evidence at all: only a gap if it's a plausible episode title
-            lbl = _title_label(conn, tid)
             if lbl["kind"] not in ("episode-candidate", "unknown"):
                 continue
-        reason = ("conflict: evidence names >1 episode" if conflict
-                  else "no evidence yet" if not ev
-                  else f"{status}, awaiting decision")
-        g = _title_label(conn, tid)
-        g.update(status=status, conflict=conflict, reason=reason, evidence=ev)
-        title_gaps.append(g)
+        # an unclaimed episode-length candidate is a high-signal anomaly
+        unclaimed = status in ("unresolved",) and not (
+            a and json.loads(a["episode_ids_json"]))
+        anomaly = (unclaimed and lbl["kind"] == "episode-candidate"
+                   and _episode_length(lbl["minutes"] * 60, medians))
+        if conflict:
+            reason = "conflict: evidence names >1 episode"
+        elif anomaly:
+            reason = ("episode-length title unclaimed — likely a dropped/shifted "
+                      "episode; corroborate this disc with `run ocr`")
+        elif not ev:
+            reason = "no evidence yet"
+        else:
+            reason = f"{status}, awaiting decision"
+        lbl.update(status=status, conflict=conflict, anomaly=bool(anomaly),
+                   reason=reason, evidence=ev)
+        title_gaps.append(lbl)
 
     # episodes claimed by no assignment
     claimed: set = set()
@@ -124,8 +208,12 @@ def gaps(conn, threshold: float = 0.5) -> dict:
         "SELECT id,season,number FROM episode WHERE season>0 ORDER BY season,number")
         if e["id"] not in claimed]
 
+    warns = order_warnings(conn)
+    # sort anomalies + conflicts to the top of the worklist
+    title_gaps.sort(key=lambda g: (not g.get("anomaly"), not g["conflict"], g["title_id"]))
     return {"ok": True, "gaps": title_gaps, "missing_episodes": missing,
-            "n_gaps": len(title_gaps), "n_missing": len(missing)}
+            "order_warnings": warns, "n_gaps": len(title_gaps),
+            "n_missing": len(missing)}
 
 
 # ---------------------------------------------------------------------------

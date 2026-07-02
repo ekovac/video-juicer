@@ -119,6 +119,25 @@ Three sources of canonical episode ORDER, cheapest first:
   multi-part "(1)/(2)" names appear in sequence, OR runtimes are uniquely
   separable (min pairwise gap > tol) with small alignment deltas. Else
   → "unverifiable", recommend OCR.
+- **A play-all only vouches for the episodes it CONCATENATES.** On Blu-ray, if a
+  disc has clip-bearing episode titles NOT covered by the play-all (a feature-
+  length pilot authored separately — Star Trek: TNG "Encounter at Farpoint",
+  clips 00000/00084 vs the play-all's 00001/00002/…), the play-all doesn't order
+  them and the monotonic aligner can drop/shift a title around them (TNG S1 went
+  +1 across the whole season, a title silently dropped). So `assess_ordering`
+  treats a play-all as full corroboration only when it covers every clip-bearing
+  episode title; a partial play-all → unverifiable → surfaced (below), not
+  auto-trusted. (Clipless synthetic/DVD play-alls can't be checked → trusted as
+  before.) Do NOT "fix" this by ordering on clip id — clip numbering is not
+  broadcast order in general (the whole reason `order_by_playall` exists).
+- **How untrustworthy order surfaces (evidence-first, not auto):** `gaps`/
+  `status` report per-disc "⚠ order unverified" from `assess_ordering`, and
+  `gaps` flags an unclaimed *episode-length* candidate as a `‼` anomaly
+  ("likely a dropped/shifted episode") — the tell of exactly this failure,
+  promoted from a buried leftover to the top of the worklist. The human/agent
+  then chooses to `run ocr` on that disc, whose title-card evidence conflicts
+  with runtime-align → a normal `gaps` conflict to adjudicate. `vj auto` reads
+  the same signals and acts; nothing is auto-decided in the manual flow.
 - `--auto` runs metadata, then escalates to `--ocr-identify` ONLY when
   unverifiable AND `vlm_available` AND a 2-playlist `probe_card_presence`
   (skips first/last to dodge premiere/finale quirks) finds on-screen titles.
