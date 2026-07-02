@@ -146,8 +146,9 @@ def run_align(conn, args) -> dict:
 
 
 def _ocr_targets(conn, args) -> list[tuple[int, int]]:
-    """Resolve --title/--disc into [(disc_id, title_db_id)] to OCR, in play
-    order per disc so the adaptive card anchor is learned once per disc."""
+    """Resolve --title/--disc/--all into [(disc_id, title_db_id)] to OCR,
+    ordered by disc then play order so the adaptive card anchor is learned once
+    per disc (grouping --all by disc keeps that per-disc anchor threading)."""
     targets: list[tuple[int, int]] = []
     if args.title:
         for tid in args.title:
@@ -155,6 +156,11 @@ def _ocr_targets(conn, args) -> list[tuple[int, int]]:
             if r is None:
                 raise KeyError(f"no title with id {tid}")
             targets.append((r["disc_id"], r["id"]))
+    elif getattr(args, "all", False):
+        rows = conn.execute(
+            "SELECT id, disc_id FROM title WHERE kind='episode-candidate' "
+            "ORDER BY disc_id, order_key, title_number").fetchall()
+        targets = [(r["disc_id"], r["id"]) for r in rows]
     elif args.disc is not None:
         rows = conn.execute(
             "SELECT id FROM title WHERE disc_id=? AND kind='episode-candidate' "
@@ -173,7 +179,7 @@ def run_ocr(conn, args) -> dict:
     targets = _ocr_targets(conn, args)
     if not targets:
         return {"ok": False, "error": "no-targets",
-                "message": "specify --title <id> (repeatable) or --disc <id>"}
+                "message": "specify --title <id> (repeatable), --disc <basename|id>, or --all"}
     seasons, specials = _season_pools(conn)
     all_eps = [e for n in sorted(seasons) for e in seasons[n]] + specials
 
@@ -241,7 +247,7 @@ def run_synopsis(conn, args) -> dict:
     targets = _ocr_targets(conn, args)   # same target resolution as OCR
     if not targets:
         return {"ok": False, "error": "no-targets",
-                "message": "specify --title <id> (repeatable) or --disc <id>"}
+                "message": "specify --title <id> (repeatable), --disc <basename|id>, or --all"}
     seasons, specials = _season_pools(conn)
     all_eps = [e for n in sorted(seasons) for e in seasons[n]] + specials
 

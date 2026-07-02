@@ -390,6 +390,22 @@ class AnomalyTests(Base):
         self.assertFalse(hits and hits[0]["anomaly"])
 
 
+class OcrTargetTests(Base):
+    def test_all_covers_every_candidate_grouped_by_disc(self):
+        import types
+        t1 = title(1, 1320, [660, 660]); t1.kind = "episode-candidate"
+        t2 = title(2, 1320, [660, 660]); t2.kind = "episode-candidate"
+        t2.order_key = 1
+        d1 = self.add_disc([t1, t2], path="/x/d1.iso")
+        t3 = title(1, 1320, [660, 660]); t3.kind = "episode-candidate"
+        tx = title(3, 300, [300]); tx.kind = "extra"        # not a candidate
+        d2 = self.add_disc([t3, tx], path="/x/d2.iso")
+        args = types.SimpleNamespace(title=None, all=True, disc=None)
+        tgts = compute._ocr_targets(self.conn, args)
+        self.assertEqual(len(tgts), 3)                       # 3 candidates, extra skipped
+        self.assertEqual([d for d, _ in tgts], sorted(d for d, _ in tgts))  # disc-grouped
+
+
 class DiscResolveTests(Base):
     def test_resolve_disc(self):
         import vj

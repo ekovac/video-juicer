@@ -725,6 +725,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--list", action="store_true",
                        help="list available heuristics and exit")
     p_run.add_argument("--disc", help="restrict to one disc (basename or id)")
+    p_run.add_argument("--all", action="store_true",
+                       help="ocr/synopsis: every episode-candidate title on all "
+                            "discs (fast now that the text-region gate prunes "
+                            "scene frames)")
     p_run.add_argument("--title", type=int, action="append",
                        help="restrict to a title (id); repeatable (ocr/synopsis)")
     p_run.add_argument("--vlm-model", default="qwen3-vl:2B")
