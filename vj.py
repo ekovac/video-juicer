@@ -159,8 +159,9 @@ def cmd_run(args) -> int:
 
 def _run_human(heuristic: str, r: dict) -> str:
     if heuristic == "align":
+        anc = f", {r['anchors']} confirmed anchor(s)" if r.get("anchors") else ""
         return (f"align: {r['evidence']} episode evidence rows, "
-                f"{r['leftovers']} leftovers across {r['discs']} disc(s)")
+                f"{r['leftovers']} leftovers across {r['discs']} disc(s){anc}")
     if heuristic == "elimination":
         lines = [f"elimination: recovered {r['recovered']} title(s)"
                  + (f" — {r['note']}" if r.get("note") else "")]

@@ -245,13 +245,33 @@ def _gap_title_cost(t: Title) -> float:
     return 150.0 + 300.0 * max(0.0, t.evidence)
 
 
-def align(cands: list[tuple[Disc, Title]], episodes: list[Episode]
+ANCHOR_MATCH = -1_000_000.0   # cost of a pinned (candidate -> episode) match
+# tiny penalty for skipping an episode WHILE candidates remain to place (an
+# interior gap). Leading/trailing gaps are free; this only breaks ties among
+# equally-good (within-tolerance) matches toward a CONTIGUOUS episode run, so an
+# anchor shifts the whole run instead of pinning one title and leaving holes.
+GAP_INTERIOR = 20.0
+
+
+def align(cands: list[tuple[Disc, Title]], episodes: list[Episode],
+          anchors: Optional[dict] = None
           ) -> tuple[list[Assignment], list[tuple[Disc, Title]], list[Episode]]:
-    """Monotonic alignment. Returns (assignments, leftover_titles, missed_eps)."""
+    """Monotonic alignment. Returns (assignments, leftover_titles, missed_eps).
+
+    `anchors` pins candidate index -> episode index (from confirmed human/agent
+    assignments): the DP must route the path through each pin (regardless of the
+    runtime delta), can't gap an anchored candidate or episode, and can't match
+    an anchored candidate/episode to anything else. So confirming one title and
+    re-running align re-frames the rest of the season around it — no hand-bumping
+    every downstream episode."""
+    anchors = anchors or {}
+    anchored_ep = {j: i for i, j in anchors.items()}   # episode index -> cand index
     scale = runtime_scale(cands, episodes)
     if scale != 1.0:
         log.info("runtime calibration: TMDB runtimes scaled by %.2f "
                  "(broadcast-slot vs actual runtime)", scale)
+    if anchors:
+        log.info("aligning with %d confirmed anchor(s)", len(anchors))
     m, n = len(cands), len(episodes)
     INF = float("inf")
     dp = [[INF] * (n + 1) for _ in range(m + 1)]
@@ -262,22 +282,31 @@ def align(cands: list[tuple[Disc, Title]], episodes: list[Episode]
             cur = dp[i][j]
             if cur == INF:
                 continue
-            if i < m:  # disc title is an extra
+            if i < m and i not in anchors:  # extra — but not an anchored title
                 c = cur + _gap_title_cost(cands[i][1])
                 if c < dp[i + 1][j]:
                     dp[i + 1][j], bt[i + 1][j] = c, "gapA"
-            if j < n:  # TMDB episode missing from discs
-                c = cur + GAP_EPISODE
+            if j < n and j not in anchored_ep:  # missing — but not an anchored ep
+                interior = 0.0 if (i == 0 or i == m) else GAP_INTERIOR
+                c = cur + GAP_EPISODE + interior
                 if c < dp[i][j + 1]:
                     dp[i][j + 1], bt[i][j + 1] = c, "gapB"
             if i < m and j < n:
                 t = cands[i][1]
-                c = cur + _match_cost(t.duration, episodes[j].runtime,
-                                      t.evidence, scale)
-                if c < dp[i + 1][j + 1]:
-                    dp[i + 1][j + 1], bt[i + 1][j + 1] = c, "match"
-                if j + 1 < n and episodes[j].runtime and episodes[j + 1].runtime:
-                    # one disc title covering two episodes (two-parter)
+                pinned = anchors.get(i)
+                # a pin forbids matching this cand/ep to anything but its partner
+                forbidden = ((pinned is not None and pinned != j)
+                             or (j in anchored_ep and anchored_ep[j] != i))
+                if not forbidden:
+                    c = cur + (ANCHOR_MATCH if pinned == j
+                               else _match_cost(t.duration, episodes[j].runtime,
+                                                t.evidence, scale))
+                    if c < dp[i + 1][j + 1]:
+                        dp[i + 1][j + 1], bt[i + 1][j + 1] = c, "match"
+                # two-parter merge — never across/with an anchored cand or episode
+                if (i not in anchors and j not in anchored_ep
+                        and (j + 1) not in anchored_ep
+                        and j + 1 < n and episodes[j].runtime and episodes[j + 1].runtime):
                     rt = episodes[j].runtime + episodes[j + 1].runtime
                     c = cur + _match_cost(t.duration, rt, t.evidence, scale) + 30.0
                     if c < dp[i + 1][j + 2]:

@@ -391,6 +391,16 @@ Three sources of canonical episode ORDER, cheapest first:
   (hit on Korra: 7 unique episodes/season instead of 12-14). Scan the whole
   season (ideally the whole series) before `run align`. OCR, by contrast, is
   per-title and safe to run disc-by-disc.
+- **`run align` honors adjudications: confirmed = anchor, rejected = excluded.**
+  A `confirmed` title is a hard PIN in the DP (`align`'s `anchors`): the path
+  must route through it regardless of runtime delta, and can't gap or re-match
+  it. A `rejected` title is dropped from the candidate set. So the fix for a
+  same-runtime alignment shift is: confirm ONE title correctly and re-run
+  `align` — a `GAP_INTERIOR` tie-break makes the aligner prefer a *contiguous*
+  episode run, so the anchor shifts the whole run instead of pinning one title
+  and leaving holes. No hand-bumping every downstream episode. (`GAP_INTERIOR`
+  is tiny — it only breaks ties among within-tolerance matches; a real
+  mid-season missing episode is still gapped.)
 - **Don't launch two writers on the same DB at once.** SQLite is in WAL mode and
   each op is transactional, so a single writer is safe and reads never block —
   but two concurrent `vj run`s writing the same file still contend, and an OOM'd

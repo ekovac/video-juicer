@@ -147,6 +147,43 @@ class PoolTests(Base):
                          all_eps)
 
 
+class AlignAnchorComputeTests(Base):
+    def test_confirmed_title_anchors_align_rejected_excluded(self):
+        # 5 same-runtime episodes; a disc with 3 candidates + 1 rejected extra.
+        state.upsert_episodes(self.conn, [ep(1, k, f"E{k}", 1320.0)
+                                          for k in range(1, 6)])
+        cand = [title(1, 1320, [660, 660]), title(2, 1320, [600, 720]),
+                title(3, 1320, [700, 620])]
+        for i, t in enumerate(cand):
+            t.order_key = i
+        rej = title(9, 1320, [500, 820]); rej.order_key = 9
+        did = self.add_disc(cand + [rej], disc_hint=1)
+        # human: the FIRST candidate is really E2 (anchor), and t9 is not an episode
+        t1id = state.title_id(self.conn, did, 1)
+        e2 = state.episode_id(self.conn, 1, 2)
+        state.set_assignment(self.conn, t1id, [e2], status="confirmed",
+                             decided_by="human")
+        state.set_assignment(self.conn, state.title_id(self.conn, did, 9), [],
+                             status="rejected", decided_by="human")
+
+        r = compute.run_align(self.conn, args=None)
+        self.assertGreaterEqual(r["anchors"], 1)
+        # anchored title keeps its confirmed episode in the fresh evidence...
+        a1 = [e for e in state.evidence_for_title(self.conn, t1id)
+              if e["category"] == "runtime-align"][0]
+        self.assertEqual((a1["ep_season"], a1["ep_number"]), (1, 2))
+        # ...and the next candidate shifts to E3 (contiguous around the anchor)
+        t2id = state.title_id(self.conn, did, 2)
+        a2 = [e for e in state.evidence_for_title(self.conn, t2id)
+              if e["category"] == "runtime-align"][0]
+        self.assertEqual((a2["ep_season"], a2["ep_number"]), (1, 3))
+        # rejected title was dropped from the candidate set -> no episode evidence
+        rid = state.title_id(self.conn, did, 9)
+        rev = [e for e in state.evidence_for_title(self.conn, rid)
+               if e["category"] == "runtime-align" and e["episode_id"]]
+        self.assertEqual(rev, [])
+
+
 class ResolveTests(Base):
     def _one_title(self):
         state.upsert_episodes(self.conn, [ep(1, 1, "A", 1320.0), ep(1, 2, "B", 1320.0)])

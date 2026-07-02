@@ -41,6 +41,8 @@ vj play   show.db --title 7 --at-card     # preview a candidate at its title car
 vj confirm show.db --title 7              # accept the proposal
 vj assign  show.db --title 9 --episode S02E05     # or set it yourself
 vj reject  show.db --title 12             # not an episode
+vj run align show.db                      # re-run: confirmed=anchor, rejected=excluded
+                                          #   (fixes a whole shifted run from one confirmation)
 
 # 6. emit outputs from the adjudicated state
 vj export show.db --manifest m.json --rip-script rip.sh --output-prefix /mnt/media

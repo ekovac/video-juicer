@@ -89,23 +89,50 @@ def run_align(conn, args) -> dict:
     seasons, _ = _season_pools(conn)
     all_eps = [e for n in sorted(seasons) for e in seasons[n]]
 
+    # adjudicated titles constrain the aligner: a confirmed title is a hard
+    # ANCHOR (pin its candidate to its episode and re-frame the rest around it);
+    # a rejected title is dropped from the candidate set entirely. So confirming
+    # one fix and re-running align propagates it, no hand-bumping downstream.
+    adjudicated = {}   # title_id -> (status, episode_id | None)
+    for a in conn.execute("SELECT title_id, status, episode_ids_json FROM "
+                          "assignment WHERE status IN ('confirmed','rejected')"):
+        eids = json.loads(a["episode_ids_json"])
+        adjudicated[a["title_id"]] = (a["status"], eids[0] if eids else None)
+
     n_ev = 0
     n_left = 0
+    n_anchor = 0
     for season, group in group_discs(discs):
         pool = seasons.get(season) or all_eps
         if not pool:
             continue
         rts = sorted(e.runtime for e in pool if e.runtime)
         expected = rts[len(rts) // 2] if rts else 1320.0
+        ep_index = {(e.season, e.number): idx for idx, e in enumerate(pool)}
         cands: list[tuple[Disc, object]] = []
+        cand_dbids: list[int] = []
         for d in group:
-            for t in classify_disc(d, expected):
-                cands.append((d, t))
+            ordered = classify_disc(d, expected)
             # persist structural verdicts (kind/order_key) onto title rows
             state.set_classification(conn, path2id[str(d.path)], d.titles)
+            for t in ordered:
+                dbid = state.title_id(conn, path2id[str(d.path)], t.id)
+                if adjudicated.get(dbid, (None,))[0] == "rejected":
+                    continue                      # human said: not an episode
+                cands.append((d, t))
+                cand_dbids.append(dbid)
         if not cands:
             continue
-        assignments, leftovers, _missed = align(cands, pool)
+        anchors = {}
+        for ci, dbid in enumerate(cand_dbids):
+            st = adjudicated.get(dbid)
+            if st and st[0] == "confirmed" and st[1] is not None:
+                ep = state.episode_by_id(conn, st[1])
+                j = ep_index.get((ep.season, ep.number))
+                if j is not None:
+                    anchors[ci] = j
+        n_anchor += len(anchors)
+        assignments, leftovers, _missed = align(cands, pool, anchors=anchors)
 
         for a in assignments:
             tid = _title_db_id(conn, path2id, a.disc, a.title)
@@ -137,7 +164,7 @@ def run_align(conn, args) -> dict:
             n_left += 1
 
     return {"ok": True, "evidence": n_ev, "leftovers": n_left,
-            "discs": len(discs)}
+            "anchors": n_anchor, "discs": len(discs)}
 
 
 # ---------------------------------------------------------------------------

@@ -548,6 +548,39 @@ class OrderabilityTest(unittest.TestCase):
         ok, why = ie.assess_ordering(d, self._asgs(d, [(1440, 200)] * 5))
         self.assertTrue(ok)
 
+
+class AlignAnchorTest(unittest.TestCase):
+    def _cands(self, n, dur=1320):
+        d = disc([], fmt="dvd")
+        return [(d, title(i, dur)) for i in range(n)]
+
+    def test_anchor_shifts_the_whole_contiguous_run(self):
+        # 5 same-runtime titles over 6 episodes: pinning the first title to a
+        # different episode shifts the rest contiguously (no hand-bumping).
+        eps = [ie.Episode(1, k, f"E{k}", 1320) for k in range(1, 7)]
+        cands = self._cands(5)
+        pin_e1 = sorted(a.episodes[0].number
+                        for a in ie.align(cands, eps, anchors={0: 0})[0])
+        pin_e2 = sorted(a.episodes[0].number
+                        for a in ie.align(cands, eps, anchors={0: 1})[0])
+        self.assertEqual(pin_e1, [1, 2, 3, 4, 5])
+        self.assertEqual(pin_e2, [2, 3, 4, 5, 6])
+
+    def test_anchor_honored_despite_bad_runtime(self):
+        # the human said so: pin holds even when the runtime fits another episode
+        eps = [ie.Episode(1, 1, "A", 600), ie.Episode(1, 2, "B", 1320)]
+        d = disc([], fmt="dvd")
+        asg, _, _ = ie.align([(d, title(0, 1320))], eps, anchors={0: 0})
+        self.assertEqual(asg[0].episodes[0].number, 1)
+
+    def test_no_anchors_is_unchanged(self):
+        eps = [ie.Episode(1, k, f"E{k}", 1000 + 400 * k) for k in range(1, 4)]
+        cands = [(disc([], fmt="dvd"), title(i, 1400 + 400 * i)) for i in range(3)]
+        a1 = ie.align(cands, eps)
+        a2 = ie.align(cands, eps, anchors={})
+        self.assertEqual([x.episodes[0].number for x in a1[0]],
+                         [x.episodes[0].number for x in a2[0]])
+
     def _clip_asg(self, d, tid, rt, clips, num):
         t = title(tid, rt)
         t.clips = clips
