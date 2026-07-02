@@ -390,6 +390,18 @@ class AnomalyTests(Base):
         self.assertFalse(hits and hits[0]["anomaly"])
 
 
+class DiscResolveTests(Base):
+    def test_resolve_disc(self):
+        import vj
+        d1 = self.add_disc([title(1, 1320, [660, 660])], path="/x/VENTURE_BROS_S1D1.iso")
+        d2 = self.add_disc([title(1, 1320, [660, 660])], path="/x/VENTURE_BROS_S1D2.iso")
+        self.assertEqual(vj._resolve_disc(self.conn, "VENTURE_BROS_S1D1")[0], d1)
+        self.assertEqual(vj._resolve_disc(self.conn, "s1d2")[0], d2)   # substr, ci
+        self.assertEqual(vj._resolve_disc(self.conn, str(d2))[0], d2)  # integer id
+        self.assertIsNotNone(vj._resolve_disc(self.conn, "nope")[1])   # not found
+        self.assertIsNotNone(vj._resolve_disc(self.conn, "VENTURE")[1])  # ambiguous
+
+
 class BoardTests(Base):
     def test_board_structure_and_render(self):
         import vj

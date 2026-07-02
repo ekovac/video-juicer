@@ -140,6 +140,12 @@ def cmd_run(args) -> int:
                     f"expected one of {sorted(compute.DISPATCH)}")
 
     conn = state.connect(args.db)
+    if getattr(args, "disc", None) is not None:
+        did, derr = _resolve_disc(conn, args.disc)
+        if derr:
+            conn.close()
+            return fail(args, "no-disc", derr)
+        args.disc = did
     try:
         result = compute.DISPATCH[args.heuristic](conn, args)
     finally:
@@ -235,6 +241,28 @@ def _open(args):
     if not Path(args.db).exists():
         return None, fail(args, "no-db", f"state file not found: {args.db}")
     return state.connect(args.db), None
+
+
+def _resolve_disc(conn, value):
+    """Resolve a --disc argument (a disc basename, an integer id, or a unique
+    substring) to a disc id. Returns (disc_id, error_message)."""
+    if value is None:
+        return None, None
+    rows = [(r["id"], state.disc_name(r["path"])) for r in state.list_discs(conn)]
+    v = str(value).strip()
+    exact = [i for i, n in rows if n.lower() == v.lower()]
+    if len(exact) == 1:
+        return exact[0], None
+    if v.isdigit() and any(i == int(v) for i, _ in rows):
+        return int(v), None
+    sub = [(i, n) for i, n in rows if v.lower() in n.lower()]
+    if len(sub) == 1:
+        return sub[0][0], None
+    if len(sub) > 1:
+        return None, (f"disc {value!r} is ambiguous — matches: "
+                      + ", ".join(n for _, n in sub))
+    return None, (f"no disc matching {value!r}; scanned discs: "
+                  + ", ".join(n for _, n in rows) or "(none)")
 
 
 def cmd_status(args) -> int:
@@ -630,10 +658,16 @@ def cmd_board(args) -> int:
     conn, err = _open(args)
     if err:
         return err
+    disc_id = None
+    if args.disc is not None:
+        disc_id, derr = _resolve_disc(conn, args.disc)
+        if derr:
+            conn.close()
+            return fail(args, "no-disc", derr)
     season = None
     if args.season is not None:
         season = int(str(args.season).upper().lstrip("S"))
-    r = review.board(conn, season=season, disc_id=args.disc)
+    r = review.board(conn, season=season, disc_id=disc_id)
     conn.close()
     emit(args, r, human=_board_human(r, show_all=args.all))
     return 0
@@ -690,7 +724,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("db", type=Path, nargs="?", help="existing state file")
     p_run.add_argument("--list", action="store_true",
                        help="list available heuristics and exit")
-    p_run.add_argument("--disc", type=int, help="restrict to one disc (id)")
+    p_run.add_argument("--disc", help="restrict to one disc (basename or id)")
     p_run.add_argument("--title", type=int, action="append",
                        help="restrict to a title (id); repeatable (ocr/synopsis)")
     p_run.add_argument("--vlm-model", default="qwen3-vl:2B")
@@ -728,7 +762,7 @@ def build_parser() -> argparse.ArgumentParser:
                              "assignment + evidence in one table")
     p_board.add_argument("db", type=Path)
     p_board.add_argument("--season", help="limit to one season (N or Sxx)")
-    p_board.add_argument("--disc", type=int, help="limit to one disc (id)")
+    p_board.add_argument("--disc", help="limit to one disc (basename or id)")
     p_board.add_argument("--all", action="store_true",
                          help="show every title incl. unassigned extras")
     p_board.set_defaults(func=cmd_board)
