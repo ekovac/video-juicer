@@ -30,6 +30,7 @@ vj run ocr   show.db --title 205 --include-specials   # ID a leftover as an S00 
 vj resolve show.db
 
 # 5. review + adjudicate what's uncertain
+vj board  show.db                         # rich overview: every title + evidence, one screen
 vj status show.db                         # coverage summary
 vj gaps   show.db                         # the worklist: conflicts + missing eps
 vj show   show.db --title 7               # all evidence for one title

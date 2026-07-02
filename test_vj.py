@@ -390,6 +390,32 @@ class AnomalyTests(Base):
         self.assertFalse(hits and hits[0]["anomaly"])
 
 
+class BoardTests(Base):
+    def test_board_structure_and_render(self):
+        import vj
+        state.set_project(self.conn, tmdb_id=655, show_name="TNG", year=1987)
+        state.upsert_episodes(self.conn, [ep(1, 1, "Pilot", 1320.0),
+                                          ep(1, 2, "Two", 1320.0)])
+        t1 = title(1, 1320, [660, 660]); t1.kind = "episode-candidate"
+        t2 = title(2, 300, [300]); t2.kind = "extra"
+        did = self.add_disc([t1, t2])
+        tid = state.title_id(self.conn, did, 1)
+        e1 = state.episode_id(self.conn, 1, 1)
+        state.put_evidence(self.conn, tid, "runtime-align", episode_id=e1, confidence=0.9)
+        state.put_evidence(self.conn, tid, "title-card-ocr", episode_id=e1,
+                           verdict="read 'Pilot' -> S01E01 (1.00)", confidence=1.0)
+        state.set_assignment(self.conn, tid, [e1], status="confirmed",
+                             decided_by="agent")
+        b = review.board(self.conn, season=1)
+        self.assertEqual(b["discs"][0]["titles"][0]["assignment"]["episodes"], ["S01E01"])
+        self.assertIn("runtime-align", b["discs"][0]["titles"][0]["evidence"])
+        # renders without error; collapses the unassigned extra by default
+        text = vj._board_human(b)
+        self.assertIn("S01E01", text)
+        self.assertIn("+1 extra", text)
+        self.assertIn("Pilot", vj._board_human(b, show_all=True))
+
+
 class PlayTests(Base):
     def test_mrl(self):
         self.assertEqual(vj._play_mrl("dvd", "/x.iso", 4), "dvd:///x.iso#4")

@@ -287,6 +287,61 @@ def gaps(conn, threshold: float = 0.5, accept: float = 0.8) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# board — the whole evidence table, grouped season -> disc -> title
+# ---------------------------------------------------------------------------
+
+
+def board(conn, season: int | None = None, disc_id: int | None = None) -> dict:
+    """A complete human-facing view: every disc's titles with their assignment,
+    status, and all evidence inline — the one command that shows the whole
+    picture instead of stitching status+gaps+show together."""
+    proj = state.get_project(conn)
+    warns = {w["disc_id"]: w["reason"] for w in order_warnings(conn)}
+    discs = []
+    for d in state.list_discs(conn):
+        if disc_id is not None and d["id"] != disc_id:
+            continue
+        if season is not None and d["season_hint"] != season:
+            continue
+        titles = []
+        for t in conn.execute(
+                "SELECT id,title_number,duration,kind FROM title WHERE disc_id=? "
+                "AND kind!='junk' ORDER BY order_key, title_number", (d["id"],)):
+            a = state.get_assignment(conn, t["id"])
+            asg = None
+            if a and json.loads(a["episode_ids_json"]):
+                eps = [_sxxeyy(*conn.execute(
+                    "SELECT season,number FROM episode WHERE id=?", (x,)).fetchone())
+                    for x in json.loads(a["episode_ids_json"])]
+                asg = {"episodes": eps, "status": a["status"],
+                       "decided_by": a["decided_by"]}
+            elif a:
+                asg = {"episodes": [], "status": a["status"],
+                       "decided_by": a["decided_by"]}
+            ev = {}
+            for e in state.evidence_for_title(conn, t["id"]):
+                ev[e["category"]] = {
+                    "episode": (_sxxeyy(e["ep_season"], e["ep_number"])
+                                if e["episode_id"] else None),
+                    "confidence": e["confidence"], "verdict": e["verdict"]}
+            conflict, _ = _conflict(conn, t["id"], 0.5)
+            titles.append({
+                "title_id": t["id"], "pl": t["title_number"],
+                "minutes": round(t["duration"] / 60, 1), "kind": t["kind"],
+                "assignment": asg, "evidence": ev, "conflict": conflict,
+                "frames": state.frame_categories(conn, t["id"])})
+        discs.append({"disc": d["label"], "disc_id": d["id"],
+                      "season": d["season_hint"], "order_warning": warns.get(d["id"]),
+                      "titles": titles})
+    summary = summarize(conn)
+    seasons = summary["seasons"]
+    if season is not None:
+        seasons = [s for s in seasons if s["season"] == season]
+    return {"ok": True, "show": proj.get("show_name"), "year": proj.get("year"),
+            "tmdb_id": proj.get("tmdb_id"), "seasons": seasons, "discs": discs}
+
+
+# ---------------------------------------------------------------------------
 # show
 # ---------------------------------------------------------------------------
 

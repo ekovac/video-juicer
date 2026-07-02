@@ -6,7 +6,7 @@ result. All state lives in a SQLite project file (see DESIGN.md). Verbs:
 
   ingest:      init, scan
   compute:     run <heuristic>            (align, ocr, synopsis)
-  inspect:     status, gaps, show, frame
+  inspect:     board, status, gaps, show, frame
   resolve:     resolve                    (evidence -> proposed assignments)
   adjudicate:  assign, confirm, reject
   auto:        auto                       (scripts align→resolve→ocr→…→resolve)
@@ -546,6 +546,99 @@ def cmd_play(args) -> int:
     return 0
 
 
+_KIND_ABBR = {"episode-candidate": "episode", "play-all": "play-all",
+              "extra": "extra", "unknown": "unknown"}
+_CAT_ABBR = {"runtime-align": "align", "title-card-ocr": "ocr",
+             "synopsis": "syn", "elimination": "elim", "play-all": "pa"}
+_STATUS_SYM = {"confirmed": "✓", "proposed": "●", "rejected": "✗"}
+
+
+def _ocr_snippet(verdict: str) -> str:
+    """Pull the read text out of an OCR verdict like: read 'TEXT' -> SxxEyy."""
+    if verdict and "read " in verdict and "'" in verdict:
+        try:
+            s = verdict.split("'", 1)[1].rsplit("'", 1)[0]
+            s = s.replace("\\n", " ").replace("\n", " ")   # verdict stores a repr
+            s = " ".join(s.split()).strip('"“”').strip()
+            return f' "{s[:24]}{"…" if len(s) > 24 else ""}"'
+        except IndexError:
+            return ""
+    return ""
+
+
+def _evidence_cell(ev: dict) -> str:
+    cells = []
+    for cat, e in ev.items():
+        ab = _CAT_ABBR.get(cat, cat)
+        ep = e["episode"] or "—"
+        conf = f"·{e['confidence']:.2f}" if e["confidence"] is not None else ""
+        snip = _ocr_snippet(e["verdict"]) if cat == "title-card-ocr" else ""
+        cells.append(f"{ab} {ep}{conf}{snip}")
+    return "   ".join(cells)
+
+
+def _board_human(r: dict, show_all: bool = False) -> str:
+    from collections import OrderedDict
+    lines = []
+    head = f"{r['show']} ({r['year']})"
+    if r.get("tmdb_id"):
+        head += f"  {{tmdb-{r['tmdb_id']}}}"
+    lines.append(head)
+    lines.append("  ✓ confirmed  ● proposed  ⚠ conflict  ✗ rejected  · undecided"
+                 "  ◆ frame kept")
+    seasons = {s["season"]: s for s in r["seasons"]}
+    by_season = OrderedDict()
+    for d in r["discs"]:
+        by_season.setdefault(d["season"], []).append(d)
+    for snum, discs in by_season.items():
+        s = seasons.get(snum)
+        cov = f"{s['matched']}/{s['total']} matched" if s else ""
+        title = f"Season {snum:02d}" if snum is not None else "(no season hint)"
+        lines.append(f"\n{title}  ·  {cov}")
+        for d in discs:
+            warn = f"   ⚠ order: {d['order_warning']}" if d["order_warning"] else ""
+            lines.append(f"  ▸ {d['disc']}{warn}")
+            lines.append(f"      {'pl':>3} {'dur':>4}  {'kind':<8} "
+                         f"{'assignment':<20} evidence")
+            hidden = 0
+            for t in d["titles"]:
+                a = t["assignment"]
+                assigned = a and (a["episodes"] or a["status"] == "rejected")
+                # collapse pure disc clutter (unassigned extras) unless --all
+                if not show_all and not assigned and t["kind"] == "extra":
+                    hidden += 1
+                    continue
+                if a and a["episodes"]:
+                    sym = ("⚠" if t["conflict"] and a["status"] == "proposed"
+                           else _STATUS_SYM.get(a["status"], "·"))
+                    by = (a["decided_by"] or "").split(":")[-1]
+                    asg = f"{sym} {'+'.join(a['episodes'])} ({by})"
+                elif a and a["status"] == "rejected":
+                    asg = "✗ rejected"
+                else:
+                    asg = ("⚠ conflict" if t["conflict"] else "· —")
+                fr = " ◆" if t["frames"] else ""
+                lines.append(f"      {t['pl']:>3} {t['minutes']:>3.0f}m  "
+                             f"{_KIND_ABBR.get(t['kind'], t['kind']):<8} "
+                             f"{asg:<20} {_evidence_cell(t['evidence'])}{fr}")
+            if hidden:
+                lines.append(f"      … +{hidden} extra title(s) (--all to show)")
+    return "\n".join(lines)
+
+
+def cmd_board(args) -> int:
+    conn, err = _open(args)
+    if err:
+        return err
+    season = None
+    if args.season is not None:
+        season = int(str(args.season).upper().lstrip("S"))
+    r = review.board(conn, season=season, disc_id=args.disc)
+    conn.close()
+    emit(args, r, human=_board_human(r, show_all=args.all))
+    return 0
+
+
 def cmd_export(args) -> int:
     conn, err = _open(args)
     if err:
@@ -630,6 +723,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_gaps.add_argument("--threshold", type=float, default=0.5,
                         help="min confidence for conflict detection")
     p_gaps.set_defaults(func=cmd_gaps)
+
+    p_board = sub.add_parser("board", help="rich overview: every disc's titles + "
+                             "assignment + evidence in one table")
+    p_board.add_argument("db", type=Path)
+    p_board.add_argument("--season", help="limit to one season (N or Sxx)")
+    p_board.add_argument("--disc", type=int, help="limit to one disc (id)")
+    p_board.add_argument("--all", action="store_true",
+                         help="show every title incl. unassigned extras")
+    p_board.set_defaults(func=cmd_board)
 
     p_show = sub.add_parser("show", help="all evidence + assignment for one thing")
     p_show.add_argument("db", type=Path)

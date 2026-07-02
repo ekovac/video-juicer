@@ -172,6 +172,11 @@ UNIX tool with structured output and no hidden state.** Concretely:
 - `vj run --list` — enumerate available heuristics (agent discovery).
 
 ### Inspect — read-only
+- `vj board <state.db> [--season N] [--disc D] [--all]` — the rich human
+  overview: seasons → discs → per-title rows showing assignment, status symbol,
+  and ALL evidence inline (align/ocr episode + confidence + the OCR read), plus
+  per-disc order warnings. One command for the whole picture instead of stitching
+  status+gaps+show; unassigned extras collapse to a count unless `--all`.
 - `vj status <state.db>` — summary counts (confirmed / proposed / conflict /
   unresolved) per season.
 - `vj gaps <state.db>` — **the agent worklist**: every title needing a decision,
