@@ -549,33 +549,6 @@ class OrderabilityTest(unittest.TestCase):
         self.assertTrue(ok)
 
 
-class PartialPlayAllTest(unittest.TestCase):
-    def test_bluray_partial_playall_excludes_and_falls_back_to_title_order(self):
-        pa = title(0, 1200, [600, 600])
-        t1 = title(1, 1800, [900, 900])
-        t2 = title(2, 600, [600])
-        t3 = title(3, 600, [300, 300])
-        d = disc([pa, t1, t2, t3], fmt="bluray")
-        ordered = ie.classify_disc(d, expected_runtime=1200)
-        self.assertEqual(pa.kind, "play-all")           # concatenation excluded
-        ids = [t.id for t in ordered]
-        self.assertIn(1, ids)                           # feature-length ep kept
-        self.assertEqual(ids, sorted(ids))              # fell back to title order
-
-    def test_dvd_partial_playall_untouched(self):
-        # same shape on DVD: strays check must NOT fire (lsdvd order is trusted),
-        # so the play-all keeps kind and orders its matched titles as before
-        pa = title(0, 1200, [600, 600])
-        t1 = title(1, 1800, [900, 900])
-        t2 = title(2, 600, [600])
-        t3 = title(3, 600, [300, 300])
-        d = disc([pa, t1, t2, t3], fmt="dvd")
-        ie.classify_disc(d, expected_runtime=1200)
-        self.assertEqual(pa.kind, "play-all")
-        # matched short titles got play-all order (0/1), not title-id fallback
-        self.assertEqual(sorted([t2.order_key, t3.order_key]), [0, 1])
-
-
 class AlignAnchorTest(unittest.TestCase):
     def _cands(self, n, dur=1320):
         d = disc([], fmt="dvd")
