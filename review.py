@@ -311,20 +311,23 @@ def board(conn, season: int | None = None, disc_id: int | None = None) -> dict:
             a = state.get_assignment(conn, t["id"])
             asg = None
             if a and json.loads(a["episode_ids_json"]):
-                eps = [_sxxeyy(*conn.execute(
-                    "SELECT season,number FROM episode WHERE id=?", (x,)).fetchone())
-                    for x in json.loads(a["episode_ids_json"])]
-                asg = {"episodes": eps, "status": a["status"],
-                       "decided_by": a["decided_by"]}
+                rows = [conn.execute(
+                    "SELECT season,number,name FROM episode WHERE id=?",
+                    (x,)).fetchone() for x in json.loads(a["episode_ids_json"])]
+                asg = {"episodes": [_sxxeyy(r["season"], r["number"]) for r in rows],
+                       "names": [r["name"] for r in rows],
+                       "status": a["status"], "decided_by": a["decided_by"]}
             elif a:
                 asg = {"episodes": [], "status": a["status"],
                        "decided_by": a["decided_by"]}
             ev = {}
             for e in state.evidence_for_title(conn, t["id"]):
+                payload = json.loads(e["payload_json"] or "{}")
                 ev[e["category"]] = {
                     "episode": (_sxxeyy(e["ep_season"], e["ep_number"])
                                 if e["episode_id"] else None),
-                    "confidence": e["confidence"], "verdict": e["verdict"]}
+                    "confidence": e["confidence"], "verdict": e["verdict"],
+                    "read": payload.get("text")}
             conflict, _ = _conflict(conn, t["id"], 0.5)
             titles.append({
                 "title_id": t["id"], "pl": t["title_number"],

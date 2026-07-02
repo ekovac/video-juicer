@@ -581,28 +581,35 @@ _CAT_ABBR = {"runtime-align": "align", "title-card-ocr": "ocr",
 _STATUS_SYM = {"confirmed": "✓", "proposed": "●", "rejected": "✗"}
 
 
-def _ocr_snippet(verdict: str) -> str:
-    """Pull the read text out of an OCR verdict like: read 'TEXT' -> SxxEyy."""
-    if verdict and "read " in verdict and "'" in verdict:
-        try:
-            s = verdict.split("'", 1)[1].rsplit("'", 1)[0]
-            s = s.replace("\\n", " ").replace("\n", " ")   # verdict stores a repr
-            s = " ".join(s.split()).strip('"“”').strip()
-            return f' "{s[:24]}{"…" if len(s) > 24 else ""}"'
-        except IndexError:
-            return ""
-    return ""
+def _ev_detail(cat: str, e: dict) -> str:
+    """The right-hand detail for an evidence line: the OCR read text, or the
+    align delta/label parenthetical, else the verdict."""
+    if cat == "title-card-ocr":
+        read = " ".join((e.get("read") or "").split()).strip("\"“”' ")
+        return f'"{read}"' if read else "(no text read)"
+    v = e.get("verdict") or ""
+    return v[v.index("("):] if "(" in v else v
 
 
-def _evidence_cell(ev: dict) -> str:
-    cells = []
+def _evidence_lines(ev: dict, indent: str, width: int = 92,
+                    max_lines: int = 3) -> list[str]:
+    """One line per evidence source under the title; a long read (a garbage
+    scene dump) WRAPS across continuation lines instead of truncating, capped so
+    it can't become a wall. A normal title card is a single line."""
+    import textwrap
+    out = []
     for cat, e in ev.items():
         ab = _CAT_ABBR.get(cat, cat)
         ep = e["episode"] or "—"
-        conf = f"·{e['confidence']:.2f}" if e["confidence"] is not None else ""
-        snip = _ocr_snippet(e["verdict"]) if cat == "title-card-ocr" else ""
-        cells.append(f"{ab} {ep}{conf}{snip}")
-    return "   ".join(cells)
+        conf = f"{e['confidence']:.2f}" if e["confidence"] is not None else " — "
+        prefix = f"{indent}{ab:<6} {ep:<7} {conf}   "
+        segs = textwrap.wrap(_ev_detail(cat, e), width=width) or [""]
+        cont = " " * len(prefix)
+        for i, seg in enumerate(segs[:max_lines]):
+            out.append((prefix if i == 0 else cont) + seg)
+        if len(segs) > max_lines:
+            out[-1] += " …"
+    return out
 
 
 def _board_human(r: dict, show_all: bool = False) -> str:
@@ -626,8 +633,6 @@ def _board_human(r: dict, show_all: bool = False) -> str:
         for d in discs:
             warn = f"   ⚠ order: {d['order_warning']}" if d["order_warning"] else ""
             lines.append(f"  ▸ {d['disc']}{warn}")
-            lines.append(f"      {'pl':>3} {'dur':>4}  {'kind':<8} "
-                         f"{'assignment':<20} evidence")
             hidden = 0
             for t in d["titles"]:
                 a = t["assignment"]
@@ -640,15 +645,19 @@ def _board_human(r: dict, show_all: bool = False) -> str:
                     sym = ("⚠" if t["conflict"] and a["status"] == "proposed"
                            else _STATUS_SYM.get(a["status"], "·"))
                     by = (a["decided_by"] or "").split(":")[-1]
-                    asg = f"{sym} {'+'.join(a['episodes'])} ({by})"
+                    name = " & ".join(n for n in (a.get("names") or []) if n)
+                    eps = "+".join(a["episodes"])
+                    asg = (f"{sym} {eps} {name!r} ({by})" if name
+                           else f"{sym} {eps} ({by})")
                 elif a and a["status"] == "rejected":
                     asg = "✗ rejected"
                 else:
-                    asg = ("⚠ conflict" if t["conflict"] else "· —")
-                fr = " ◆" if t["frames"] else ""
-                lines.append(f"      {t['pl']:>3} {t['minutes']:>3.0f}m  "
-                             f"{_KIND_ABBR.get(t['kind'], t['kind']):<8} "
-                             f"{asg:<20} {_evidence_cell(t['evidence'])}{fr}")
+                    asg = ("⚠ conflict" if t["conflict"] else "· undecided")
+                fr = "  ◆ frame" if t["frames"] else ""
+                lines.append(f"      pl{t['pl']:<3} {t['minutes']:>3.0f}m  "
+                             f"{_KIND_ABBR.get(t['kind'], t['kind']):<8}  "
+                             f"{asg}{fr}")
+                lines.extend(_evidence_lines(t["evidence"], "          "))
             if hidden:
                 lines.append(f"      … +{hidden} extra title(s) (--all to show)")
     return "\n".join(lines)
