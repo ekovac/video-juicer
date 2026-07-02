@@ -572,7 +572,8 @@ def verify_title(disc: Disc, title: Title, episodes: list[Episode],
     (learned from an earlier episode on the disc), else nearest either END (cold
     opens and end-cards both land early) — so a card-bearing title early-exits
     after a few reads. The anchor is now only an ordering hint, not a window."""
-    state = {"ep": None, "score": 0.0, "time": None, "frame": None, "text": None}
+    state = {"ep": None, "score": 0.0, "time": None, "frame": None,
+             "text": None, "engine": None}
     use_tess = engine in ("auto", "tesseract")
     use_vlm = engine == "vlm" or (engine == "auto"
                                   and _vlm_reachable(model, host))
@@ -586,7 +587,8 @@ def verify_title(disc: Disc, title: Title, episodes: list[Episode],
     def result():
         if capture is not None:
             capture.update(image=state["frame"], time=state["time"],
-                           text=state["text"], score=state["score"])
+                           text=state["text"], score=state["score"],
+                           engine=state["engine"])
         return state["ep"], state["score"], state["time"]
 
     def ocr_pass(timed, ocr_fn, tag, gate=None, budget=None):
@@ -598,8 +600,8 @@ def verify_title(disc: Disc, title: Title, episodes: list[Episode],
             if gate is not None and not gate(frame):
                 continue
             if budget is not None and calls >= budget:
-                log.info("%s title %d: %s budget (%d) reached; stopping",
-                         disc.path.name, title.id, tag, budget)
+                log.debug("%s title %d: %s budget (%d) reached; stopping",
+                          disc.path.name, title.id, tag, budget)
                 break
             try:
                 text = ocr_fn(frame)
@@ -610,16 +612,16 @@ def verify_title(disc: Disc, title: Title, episodes: list[Episode],
             ep, score = fuzzy_best(text, episodes)
             if score > state["score"]:
                 state["ep"], state["score"], state["time"] = ep, score, ts
+                state["engine"] = tag
                 if capture is not None:   # keep the winning frame for review
                     try:
                         state["frame"], state["text"] = frame.read_bytes(), text
                     except OSError:
                         pass
-            if score >= accept:
-                log.info("%s title %d: verified %r -> S%02dE%02d (%.2f) @%.0fs "
-                         "[%s]", disc.path.name, title.id,
-                         text.splitlines()[0][:60] if text else "",
-                         ep.season, ep.number, score, ts, tag)
+            if score >= accept:   # caller (run_ocr) emits the user-facing line
+                log.debug("%s title %d: %s matched S%02dE%02d (%.2f) @%.0fs",
+                          disc.path.name, title.id, tag, ep.season, ep.number,
+                          score, ts)
                 return ep, score
         return None
 

@@ -215,6 +215,24 @@ def run_ocr(conn, args) -> dict:
                            f"({score:.2f})")
             else:
                 verdict = "no title text read"
+
+            # one clean, interpretable line per title (the read text, the matched
+            # episode + its NAME, engine, and where the card was) — not the old
+            # first-line-of-a-garbled-read dump
+            read = " ".join((capture.get("text") or "").split())[:48]
+            eng = capture.get("engine") or "—"
+            loc = f" @{card_t:.0f}s" if card_t else ""
+            where = f"{state.disc_name(str(disc.path))} t{title.id} (id {tid})"
+            if matched:
+                log.info("ocr %s  →  S%02dE%02d %r  %.2f [%s%s]  read: %r",
+                         where, ep.season, ep.number, ep.name, score, eng, loc, read)
+            elif ep is not None:
+                log.info("ocr %s  →  ? best S%02dE%02d %r  %.2f (below %.2f) [%s]  "
+                         "read: %r", where, ep.season, ep.number, ep.name, score,
+                         args.ocr_accept, eng, read)
+            else:
+                log.info("ocr %s  →  no title-card text found", where)
+
             state.put_evidence(
                 conn, tid, "title-card-ocr", episode_id=ep_id, verdict=verdict,
                 confidence=round(score, 3),
@@ -223,7 +241,8 @@ def run_ocr(conn, args) -> dict:
                     "card_seconds": round(card_t, 1) if card_t else None,
                     "best_guess": (f"S{ep.season:02d}E{ep.number:02d}"
                                    if ep else None),
-                    "accepted": matched, "engine": args.ocr_engine,
+                    "accepted": matched,
+                    "engine": capture.get("engine") or args.ocr_engine,
                     "has_frame": capture.get("image") is not None,
                 },
             )
