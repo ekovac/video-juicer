@@ -221,6 +221,17 @@ def gaps(conn, threshold: float = 0.5, accept: float = 0.8) -> dict:
             claims[f["episode_id"]].append((t["order_key"], t["id"]))
     primary = {eid: sorted(lst)[0][1] for eid, lst in claims.items()}
 
+    # episodes claimed by >1 proposed/confirmed assignment — a collision that
+    # metadata alignment can produce (two titles on the same episode) with no
+    # OCR involved; surface it so a loop catches it too.
+    ep_claimants = defaultdict(list)
+    for a in conn.execute("SELECT title_id, episode_ids_json FROM assignment "
+                          "WHERE status IN ('proposed','confirmed')"):
+        for eid in json.loads(a["episode_ids_json"]):
+            ep_claimants[eid].append(a["title_id"])
+    collision_ep = {tid: eid for eid, tids in ep_claimants.items()
+                    if len(tids) > 1 for tid in tids}
+
     title_gaps = []
     for t in conn.execute("SELECT id FROM title ORDER BY id"):
         tid = t["id"]
@@ -252,6 +263,15 @@ def gaps(conn, threshold: float = 0.5, accept: float = 0.8) -> dict:
         elif conflict:
             suggestion = {"action": "review",
                           "why": "sources disagree, no corroborated OCR read"}
+        elif tid in collision_ep:
+            eid = collision_ep[tid]
+            r = conn.execute("SELECT season,number FROM episode WHERE id=?",
+                             (eid,)).fetchone()
+            others = [x for x in ep_claimants[eid] if x != tid]
+            suggestion = {"action": "review", "why":
+                          f"{_sxxeyy(r['season'], r['number'])} is also claimed by "
+                          f"title(s) {', '.join(map(str, others))} — pick one, "
+                          f"reject the rest (OCR the disc to tell them apart)"}
         elif anomaly:
             suggestion = {"action": "run-ocr", "why":
                           "episode-length but unidentified — likely a dropped/"
@@ -264,8 +284,8 @@ def gaps(conn, threshold: float = 0.5, accept: float = 0.8) -> dict:
             suggestion = {"action": "review", "why": f"{status}, awaiting decision"}
 
         lbl.update(status=status, conflict=conflict, anomaly=bool(anomaly),
-                   ocr=f, suggestion=suggestion, reason=suggestion["why"],
-                   evidence=ev)
+                   collision=tid in collision_ep, ocr=f, suggestion=suggestion,
+                   reason=suggestion["why"], evidence=ev)
         title_gaps.append(lbl)
 
     # episodes claimed by no assignment

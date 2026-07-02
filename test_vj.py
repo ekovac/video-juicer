@@ -125,6 +125,38 @@ class AlignEvidenceTests(Base):
         self.assertEqual(got, {1: (1, 1), 2: (1, 2), 3: (1, 3)})
 
 
+class CollisionTests(Base):
+    def test_same_episode_collision_flagged(self):
+        # two proposed assignments to the same episode (metadata collision, no
+        # OCR) -> both surfaced as review, each pointing at the other
+        state.upsert_episodes(self.conn, [ep(1, 1, "A", 1320.0), ep(1, 2, "B", 1320.0)])
+        t1 = title(1, 1320, [660, 660]); t1.kind = "episode-candidate"
+        t2 = title(2, 1320, [600, 720]); t2.kind = "episode-candidate"
+        did = self.add_disc([t1, t2])
+        a, b = state.title_id(self.conn, did, 1), state.title_id(self.conn, did, 2)
+        e1 = state.episode_id(self.conn, 1, 1)
+        for tid in (a, b):
+            state.set_assignment(self.conn, tid, [e1], status="proposed",
+                                 decided_by="heuristic:runtime-align")
+        g = {x["title_id"]: x for x in review.gaps(self.conn)["gaps"]}
+        self.assertTrue(g[a]["collision"] and g[b]["collision"])
+        self.assertEqual(g[a]["suggestion"]["action"], "review")
+        self.assertIn("also claimed", g[a]["suggestion"]["why"])
+
+    def test_no_collision_when_distinct(self):
+        state.upsert_episodes(self.conn, [ep(1, 1, "A", 1320.0), ep(1, 2, "B", 1320.0)])
+        t1 = title(1, 1320, [660, 660]); t1.kind = "episode-candidate"
+        t2 = title(2, 1320, [600, 720]); t2.kind = "episode-candidate"
+        did = self.add_disc([t1, t2])
+        a, b = state.title_id(self.conn, did, 1), state.title_id(self.conn, did, 2)
+        state.set_assignment(self.conn, a, [state.episode_id(self.conn, 1, 1)],
+                             status="proposed", decided_by="heuristic:runtime-align")
+        state.set_assignment(self.conn, b, [state.episode_id(self.conn, 1, 2)],
+                             status="proposed", decided_by="heuristic:runtime-align")
+        # clean, distinct proposals -> not gaps at all
+        self.assertEqual(review.gaps(self.conn)["gaps"], [])
+
+
 class PoolTests(Base):
     def test_include_specials_widens_season_pool(self):
         from discs import Disc

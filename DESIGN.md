@@ -189,6 +189,9 @@ UNIX tool with structured output and no hidden state.** Concretely:
       `{action: reject}`;
     - a duplicate (another title corroborates the same episode with an earlier
       play position) → `{action: reject}`;
+    - a collision — >1 proposed/confirmed assignment on the same episode, even
+      with no OCR (a metadata alignment can produce this) → `{action: review}`
+      naming the other claimants;
     - an episode-length title with no usable read → `{action: run-ocr}` (the
       dropped/shifted-episode tell);
     - else → `{action: review}`.
