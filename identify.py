@@ -107,12 +107,40 @@ def classify_disc(disc: Disc, expected_runtime: float) -> list[Title]:
     ordered: list[Title] = []
     if play_all:
         pa, matched = play_all
-        pa.kind = "play-all"
-        for order, t in enumerate(matched):
-            t.evidence += 1.0
-            t.order_key = order
-        log.info("%s: play-all is title %d (%d episodes by chapter match)",
-                 disc.path.name, pa.id, len(matched))
+        pa.kind = "play-all"          # a concatenation, never an episode candidate
+        # ORDER from it only if it's a COMPLETE, statically-identifiable play-all.
+        # A feature-length title (>= 1.5x the episode length) left OUT of it means
+        # we can't identify the full play-all by inspection (Star Trek: TNG's
+        # "Encounter at Farpoint" is authored outside the E02+E03 play-all) — so
+        # trusting its order mis-frames the uncovered episode. Exclude the play-
+        # all either way, but fall back to disc order when it's partial.
+        # (Duration, not stream signature: Blu-ray carries no audio/sub counts,
+        # and a ~1x extra — VB S1D2's 21-min extra — must NOT count as a missed
+        # episode.)
+        # Blu-ray ONLY: the partial-play-all mis-ordering is a Blu-ray problem
+        # (playlist order is unreliable, so order is derived from the play-all).
+        # DVD title order IS broadcast order, so the play-all is corroborative
+        # there — leave that path untouched (no VB / Broken Saints regression,
+        # esp. Broken Saints' varied 9-49 min episodes which could false-trigger).
+        med = sorted(t.duration for t in matched)[len(matched) // 2]
+        mids = {id(o) for o in matched}
+        strays = ([t for t in disc.titles if t.kind != "junk" and t is not pa
+                   and id(t) not in mids and t.duration >= 1.5 * med]
+                  if disc.format == "bluray" else [])
+        if strays:
+            log.info("%s: play-all title %d covers %d titles but misses %d "
+                     "feature-length title(s) — excluding it but NOT trusting its "
+                     "order; falling back to playlist/title order", disc.path.name,
+                     pa.id, len(matched), len(strays))
+            for t in disc.titles:        # deterministic fallback: disc/playlist id
+                if t.kind != "junk" and t is not pa:
+                    t.order_key = t.id
+        else:
+            for order, t in enumerate(matched):
+                t.evidence += 1.0
+                t.order_key = order
+            log.info("%s: play-all is title %d (%d episodes by chapter match)",
+                     disc.path.name, pa.id, len(matched))
 
     in_band = [t for t in disc.titles
                if t.kind == "unknown" and lo <= t.duration <= hi]
