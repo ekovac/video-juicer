@@ -502,8 +502,6 @@ def extract_frames(video: Path, workdir: Path,
     return sorted(workdir.glob("frame_*.jpg"))
 
 
-ANCHOR_RADIUS = 90.0   # seconds either side of a learned card location
-
 
 def tesseract_text(frame: Path) -> str:
     """Fast CPU OCR of a frame via Tesseract. ~60-95 ms/frame; returns "" on no
@@ -533,48 +531,63 @@ def _vlm_reachable(model: str, host: str) -> bool:
 
 def verify_title(disc: Disc, title: Title, episodes: list[Episode],
                  model: str, host: str, workdir: Path,
-                 window: float = 150.0, front_window: float = 280.0,
-                 fallback_window: float = 720.0, accept: float = 0.8,
-                 anchor: Optional[float] = None, engine: str = "auto",
-                 capture: Optional[dict] = None, text_filter: bool = True
+                 accept: float = 0.8, anchor: Optional[float] = None,
+                 engine: str = "auto", capture: Optional[dict] = None,
+                 text_filter: bool = True, vlm_budget: int = 80
                  ) -> tuple[Optional[Episode], float, Optional[float]]:
-    """OCR a title's title-card window against the season's episode names.
+    """Identify a title by OCRing its title card against the episode names.
 
-    Returns (episode, score, card_seconds) — card_seconds is where the
-    matching card was found, so a caller can learn the per-disc location.
+    Returns (episode, score, card_seconds) — card_seconds is where the matching
+    card was found, so a caller can learn the per-disc location.
 
-    Scanning is cheap-first. If `anchor` (an absolute second offset, learned
-    from earlier episodes on the same disc) is given, a tight window around it
-    is scanned first, frames ordered outward from the anchor so the card is
-    usually the first few tried. On a miss it falls back to a broad pass — the
-    front (0..front_window, cold-open shows) and the end (window before the
-    end, Venture Bros. style) — and finally the NO-CARD widen of the front to
-    fallback_window for recap-delayed premieres. So the first episode or two
-    on a disc pay full cost; once the location is known the rest are cheap."""
+    Windowless (SD MPEG-2 decodes at ~2 ms/frame, so extracting a whole 50-min
+    title is ~10 s): rip+extract every frame once, then three tiers cheap-first:
+      1. **Tesseract** over all frames — plain block cards read outright, ANYWHERE
+         in the title (no window to miss them); returns on the first accept.
+      2. an OCR-free **text-region gate** (`frame_has_text`, PaddleOCR/EAST)
+         prunes text-less scene frames from the expensive VLM pass.
+      3. the **VLM** reads the gate survivors, capped at `vlm_budget` calls so a
+         card-less title can't run away (a missed read is recovered later by
+         elimination).
+    Frames are processed in a card-likely ORDER — nearest a known `anchor`
+    (learned from an earlier episode on the disc), else nearest either END (cold
+    opens and end-cards both land early) — so a card-bearing title early-exits
+    after a few reads. The anchor is now only an ordering hint, not a window."""
     state = {"ep": None, "score": 0.0, "time": None, "frame": None, "text": None}
     use_tess = engine in ("auto", "tesseract")
     use_vlm = engine == "vlm" or (engine == "auto"
                                   and _vlm_reachable(model, host))
-    # OCR-free text-region gate for the (expensive) VLM pass — prunes scene
-    # frames so the VLM only sees plausible card frames. Fails open (keeps the
-    # frame) if unavailable; lazily imported so cv2 isn't a hard dep of the
-    # metadata path.
     has_text = None
     if text_filter and use_vlm:
         try:
             from text_region import frame_has_text as has_text
-        except Exception:  # noqa: BLE001 — cv2 missing etc.
+        except Exception:  # noqa: BLE001 — cv2/rapidocr missing
             has_text = None
 
-    def ocr_pass(timed, ocr_fn, tag):
-        """OCR every frame with one engine; return (ep, score) on the first
-        accept-match, updating the running best."""
+    def result():
+        if capture is not None:
+            capture.update(image=state["frame"], time=state["time"],
+                           text=state["text"], score=state["score"])
+        return state["ep"], state["score"], state["time"]
+
+    def ocr_pass(timed, ocr_fn, tag, gate=None, budget=None):
+        """OCR frames in order, skipping gate failures; update the running best
+        and return (ep, score) on the first accept. `budget` caps the OCR calls
+        actually made (gate-skipped frames don't count)."""
+        calls = 0
         for frame, ts in timed:
+            if gate is not None and not gate(frame):
+                continue
+            if budget is not None and calls >= budget:
+                log.info("%s title %d: %s budget (%d) reached; stopping",
+                         disc.path.name, title.id, tag, budget)
+                break
             try:
                 text = ocr_fn(frame)
             except Exception as e:  # noqa: BLE001
                 log.error("%s failed on %s: %s", tag, frame.name, e)
                 continue
+            calls += 1
             ep, score = fuzzy_best(text, episodes)
             if score > state["score"]:
                 state["ep"], state["score"], state["time"] = ep, score, ts
@@ -591,75 +604,27 @@ def verify_title(disc: Disc, title: Title, episodes: list[Episode],
                 return ep, score
         return None
 
-    def scan(start, length, anchor_time=None):
-        start = max(0.0, start)
-        length = min(length, title.duration - start)
-        if length <= 0:
-            return None
-        video = rip_window(disc, title, start, length, workdir)
-        if not video:
-            return None
-        try:
-            frames = extract_frames(video, workdir)
-            timed = [(f, start + i * FRAME_INTERVAL) for i, f in enumerate(frames)]
-            if anchor_time is not None:   # try frames nearest the anchor first
-                timed.sort(key=lambda ft: abs(ft[1] - anchor_time))
-            # Pass 1: fast Tesseract sweep — reads plain block cards outright
-            # and returns "" instantly on text-less scene frames.
-            if use_tess:
-                hit = ocr_pass(timed, tesseract_text, "tesseract")
-                if hit:
-                    return hit
-            # Pass 2: VLM fallback. A stylized card (Venture Bros' script
-            # titles) is one Tesseract returns "" for — same as a scene frame —
-            # so we must NOT gate the fallback on "did Tesseract see text" (that
-            # skips the card frame and misses it, as VB did). Instead, an
-            # OCR-free EAST text-region gate prunes frames that bear NO text at
-            # all (safe: it fires on stylized cards too, unlike Tesseract). It's
-            # recall-first — text cards score ~1.0 — and guarded: if it would
-            # prune the whole window, keep the window. Anchor-sorted so a known
-            # anchor still hits the card first.
-            if use_vlm and state["score"] < accept:
-                vlm_timed = timed
-                if has_text is not None:
-                    kept = [ft for ft in timed if has_text(ft[0])]
-                    if kept:                 # guard: never prune to nothing
-                        if len(kept) < len(timed):
-                            log.info("%s title %d: text-gate kept %d/%d frames "
-                                     "for VLM", disc.path.name, title.id,
-                                     len(kept), len(timed))
-                        vlm_timed = kept
-                hit = ocr_pass(
-                    vlm_timed, lambda f: ollama_chat(model, VLM_PROMPT, f, host),
-                    "vlm")
-                if hit:
-                    return hit
-        finally:
-            video.unlink(missing_ok=True)
-        return None
+    # 1. extract every frame of the whole title, once (then free the rip)
+    video = rip_window(disc, title, 0.0, title.duration, workdir)
+    if not video:
+        return result()
+    try:
+        frames = extract_frames(video, workdir)
+    finally:
+        video.unlink(missing_ok=True)
+    timed = [(f, i * FRAME_INTERVAL) for i, f in enumerate(frames)]
+    if anchor is not None:                       # nearest the learned card first
+        timed.sort(key=lambda ft: abs(ft[1] - anchor))
+    else:                                        # else nearest either end first
+        timed.sort(key=lambda ft: min(ft[1], title.duration - ft[1]))
 
-    def result():
-        if capture is not None:
-            capture.update(image=state["frame"], time=state["time"],
-                           text=state["text"], score=state["score"])
-        return state["ep"], state["score"], state["time"]
-
-    if anchor is not None:
-        if scan(anchor - ANCHOR_RADIUS, 2 * ANCHOR_RADIUS, anchor_time=anchor):
-            return result()
-        log.info("%s title %d: anchor @%.0fs missed; broad scan",
-                 disc.path.name, title.id, anchor)
-
-    for start, length in [(0.0, front_window),
-                          (title.duration - window, window + 60.0)]:
-        if scan(start, length):
-            return result()
-    # NO-CARD fallback: nothing in the primary band — widen the front.
-    if title.duration > front_window + 5:
-        log.info("%s title %d: no card in primary band; widening front scan",
-                 disc.path.name, title.id)
-        if scan(front_window, min(fallback_window, title.duration) - front_window):
-            return result()
+    # 2. cheap Tesseract sweep (plain cards, anywhere) -> return on accept
+    if use_tess and ocr_pass(timed, tesseract_text, "tesseract"):
+        return result()
+    # 3. VLM the gate survivors, budget-capped
+    if use_vlm and state["score"] < accept:
+        ocr_pass(timed, lambda f: ollama_chat(model, VLM_PROMPT, f, host),
+                 "vlm", gate=has_text, budget=vlm_budget)
     return result()
 
 

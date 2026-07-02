@@ -269,11 +269,16 @@ Three sources of canonical episode ORDER, cheapest first:
   (`think:false` is a no-op for this model on Ollama 0.30.3.)
 - **Sample frames at ≤2 s** — cards are on screen ~2-4 s; a 4-8 s stride
   phase-skips them and looks like "show has no titles". `extract_frames`=1.5 s.
-- **Card location varies by show**: VB at the end (~21:40, stylized script —
-  Tesseract fails, VLM needed); Enterprise mid, cold-open-delayed (140-374 s,
-  premieres later); Avatar/Korra/MOTU early (~15-80 s). `verify_title` learns
-  the per-disc location (adaptive anchor) so only the first episode pays full
-  cost; NO-CARD widens the front window as a fallback.
+- **Card location varies by show** and there are NO windows any more: VB at the
+  end (~21:40, stylized — VLM needed); Enterprise mid, cold-open-delayed
+  (140-374 s); TNG ~360 s (past the old 280 s front window — a concrete miss the
+  windowless design fixed); Avatar/Korra/MOTU early (~15-80 s). `verify_title` is
+  **windowless**: it rips+extracts the WHOLE title once (SD decodes ~2 ms/frame,
+  so even a 50-min title is ~10 s), Tesseract-sweeps every frame, then gate+VLMs
+  the survivors (budget-capped) — processing frames nearest a learned `anchor`
+  first (else nearest either END), so a card-bearing title early-exits and only
+  the first episode on a disc pays discovery cost. This replaced the old
+  front/tail/widen windows, which could miss a card outside their bands (TNG).
 - `fuzzy_best`: word-boundary substring; a distinctive multi-word/long title is
   conclusive; a short single-word title (Dawn, Jet, ORB) matches only if the
   frame isn't dominated by credit/reasoning markers (`_INCIDENTAL_MARKERS`),
