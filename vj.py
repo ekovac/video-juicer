@@ -264,10 +264,15 @@ def cmd_gaps(args) -> int:
     for w in r.get("order_warnings", []):
         lines.append(f"  ⚠ order unverified: {w['disc']} ({w['titles']} titles) "
                      f"— {w['reason']}")
+    _sig = {"assign": "→ ASSIGN", "reject": "→ REJECT",
+            "run-ocr": "→ run ocr", "review": "→ review"}
     for g in r["gaps"]:
-        mark = "‼ " if g.get("anomaly") else ""
-        lines.append(f"  {mark}title {g['title_id']} ({g['disc']} t{g['title_number']}, "
-                     f"{g['minutes']}m): {g['reason']}")
+        s = g["suggestion"]
+        act = _sig.get(s["action"], s["action"])
+        if s["action"] == "assign":
+            act += f" {s['episode']}"
+        lines.append(f"  title {g['title_id']} ({g['disc']} t{g['title_number']}, "
+                     f"{g['minutes']}m)  {act}  ({s['why']})")
         for e in g["evidence"]:
             lines.append(f"      [{e['category']}] {e['episode'] or '—'} "
                          f"{e['verdict'] or ''} ({e['confidence']})")

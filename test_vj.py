@@ -332,6 +332,51 @@ class AnomalyTests(Base):
         self.assertTrue(hit["anomaly"])
         self.assertIn("episode-length", hit["reason"])
 
+    def _ep_cand(self, tid, dur, disc_id=None, path="/d/x.iso", disc_hint=1):
+        t = title(tid, dur, [dur / 2, dur / 2])
+        t.kind = "episode-candidate"
+        return self.add_disc([t], disc_hint=disc_hint, path=path)
+
+    def test_suggest_assign_when_ocr_corroborates(self):
+        state.upsert_episodes(self.conn, [ep(1, 1, "Pilot", 1320.0)])
+        did = self._ep_cand(1, 1320)
+        tid = state.title_id(self.conn, did, 1)
+        e1 = state.episode_id(self.conn, 1, 1)
+        state.put_evidence(self.conn, tid, "title-card-ocr", episode_id=e1,
+                           verdict="read Pilot", confidence=1.0)
+        g = [x for x in review.gaps(self.conn)["gaps"] if x["title_id"] == tid][0]
+        self.assertEqual(g["suggestion"]["action"], "assign")
+        self.assertEqual(g["suggestion"]["episode"], "S01E01")
+
+    def test_suggest_reject_when_duration_mismatches(self):
+        # a 5-min featurette whose card names a 22-min episode -> reject impostor
+        state.upsert_episodes(self.conn, [ep(1, 1, "Pilot", 1320.0)])
+        did = self._ep_cand(1, 300)                      # 5 min title
+        tid = state.title_id(self.conn, did, 1)
+        e1 = state.episode_id(self.conn, 1, 1)
+        state.put_evidence(self.conn, tid, "title-card-ocr", episode_id=e1,
+                           verdict="named Pilot", confidence=1.0)
+        g = [x for x in review.gaps(self.conn)["gaps"] if x["title_id"] == tid][0]
+        self.assertEqual(g["suggestion"]["action"], "reject")
+        self.assertIn("doesn't fit", g["suggestion"]["why"])
+
+    def test_suggest_reject_duplicate_keeps_primary(self):
+        state.upsert_episodes(self.conn, [ep(1, 1, "Pilot", 1320.0)])
+        # two titles both OCR-corroborate S01E01; earlier order_key wins
+        t_lo = title(1, 1320, [660, 660]); t_lo.kind = "episode-candidate"; t_lo.order_key = 0
+        t_hi = title(9, 1320, [660, 660]); t_hi.kind = "episode-candidate"; t_hi.order_key = 9
+        did = self.add_disc([t_lo, t_hi])
+        e1 = state.episode_id(self.conn, 1, 1)
+        lo = state.title_id(self.conn, did, 1)
+        hi = state.title_id(self.conn, did, 9)
+        for x in (lo, hi):
+            state.put_evidence(self.conn, x, "title-card-ocr", episode_id=e1,
+                               verdict="Pilot", confidence=1.0)
+        gs = {x["title_id"]: x["suggestion"] for x in review.gaps(self.conn)["gaps"]}
+        self.assertEqual(gs[lo]["action"], "assign")     # primary kept
+        self.assertEqual(gs[hi]["action"], "reject")     # duplicate rejected
+        self.assertIn("duplicate", gs[hi]["why"])
+
     def test_short_extra_not_flagged(self):
         # a genuinely short extra is not episode-length -> no anomaly
         state.upsert_episodes(self.conn, [ep(1, 1, "A", 1320.0), ep(1, 2, "B", 1320.0)])

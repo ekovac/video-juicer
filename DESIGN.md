@@ -174,13 +174,22 @@ UNIX tool with structured output and no hidden state.** Concretely:
 ### Inspect — read-only
 - `vj status <state.db>` — summary counts (confirmed / proposed / conflict /
   unresolved) per season.
-- `vj gaps <state.db>` — **the agent worklist**: every title that's `conflict`
-  or `unresolved`, with its competing evidence. Also surfaces two evidence-native
-  risk flags (not auto-actions): per-disc **order-unverified** warnings
-  (`assess_ordering`, incl. a play-all that doesn't cover every episode title)
-  and **episode-length-unclaimed** anomalies (an ~episode-length leftover — the
-  tell of a dropped/shifted episode). Both nudge the reviewer/agent to
-  corroborate that disc with `run ocr`; anomalies and conflicts sort to the top.
+- `vj gaps <state.db>` — **the agent worklist**: every title needing a decision,
+  each with its competing evidence AND a **`suggestion`** a trivial loop can act
+  on (so a lightweight model adjudicates with no external reasoning):
+    - OCR names an episode, its DURATION corroborates, sole/primary claimant →
+      `{action: assign, episode}`;
+    - OCR names an episode but the duration doesn't fit it (a featurette or
+      play-all flashing a title — TNG's "Encounter at Farpoint" featurette) →
+      `{action: reject}`;
+    - a duplicate (another title corroborates the same episode with an earlier
+      play position) → `{action: reject}`;
+    - an episode-length title with no usable read → `{action: run-ocr}` (the
+      dropped/shifted-episode tell);
+    - else → `{action: review}`.
+  The adjudicator loop is just `vj gaps --json | … | vj assign|reject`. Also
+  surfaces per-disc **order-unverified** warnings (`assess_ordering`, incl. a
+  play-all not covering every episode title). Actionable suggestions sort first.
 - `vj show <state.db> --title T | --episode E` — all evidence + current
   assignment for one thing; reports whether an OCR frame is on file.
 - `vj frame <state.db> --title T [--out FILE]` — dump the retained OCR frame to

@@ -12,10 +12,36 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections import defaultdict
 
 import state
 from discs import Assignment
 from identify import assess_ordering
+
+# A title-card read is only trustworthy if the title's DURATION also fits the
+# episode it names — otherwise a featurette or a play-all that flashes an episode
+# title on screen (Star Trek: TNG's "Encounter at Farpoint" featurette; a
+# Neutral-Zone play-all) would be taken for the episode. This is the signal a
+# lightweight adjudicator needs to reject impostors without external reasoning.
+DURATION_TOL = 180.0  # seconds
+
+
+def _ocr_finding(conn, tid: int) -> dict | None:
+    """The title-card-ocr verdict for a title + whether its duration
+    corroborates the episode it names. None if there's no OCR read."""
+    rows = [e for e in state.evidence_for_title(conn, tid)
+            if e["category"] == "title-card-ocr" and e["episode_id"]]
+    if not rows:
+        return None
+    e = rows[0]
+    dur = conn.execute("SELECT duration FROM title WHERE id=?", (tid,)).fetchone()["duration"]
+    rt = conn.execute("SELECT runtime FROM episode WHERE id=?",
+                      (e["episode_id"],)).fetchone()["runtime"]
+    return {"episode_id": e["episode_id"],
+            "episode": _sxxeyy(e["ep_season"], e["ep_number"]),
+            "confidence": e["confidence"] or 0.0,
+            "corroborates": rt is not None and abs(dur - rt) <= DURATION_TOL,
+            "minutes": round(dur / 60, 1)}
 
 
 def _disc_assignments(conn):
@@ -167,48 +193,78 @@ def summarize(conn) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def gaps(conn, threshold: float = 0.5) -> dict:
-    """Titles needing attention + episodes still missing.
+def gaps(conn, threshold: float = 0.5, accept: float = 0.8) -> dict:
+    """Titles needing attention + episodes still missing, each with a suggested
+    action a simple adjudicator can act on (`vj assign` / `vj reject`).
 
-    A title is a gap if it has no sticky/proposed assignment, or its evidence
-    conflicts. Confirmed titles with agreeing evidence drop out. An episode-
-    length title left unclaimed is flagged as an anomaly (a dropped/unmatched
-    episode — the tell of a same-runtime alignment shift)."""
+    Per non-adjudicated episode-candidate title, using its title-card-ocr read:
+      - OCR names an episode, duration corroborates, sole/primary claimant
+        → suggest **assign** that episode;
+      - OCR names an episode but the duration doesn't fit it (a featurette /
+        play-all flashing a title) → suggest **reject**;
+      - a duplicate — another title corroborates the same episode with a better
+        (earlier) play position → suggest **reject** the duplicate;
+      - an episode-length title with no usable read → an anomaly, suggest OCR;
+      - otherwise (sources disagree, low confidence) → **review**."""
     medians = _season_medians(conn)
+
+    # corroborated OCR claims per episode -> pick a primary, others are dups
+    findings = {}
+    claims = defaultdict(list)
+    for t in conn.execute("SELECT id, order_key FROM title WHERE kind='episode-candidate'"):
+        f = _ocr_finding(conn, t["id"])
+        if f is None:
+            continue
+        findings[t["id"]] = f
+        if f["corroborates"] and f["confidence"] >= accept:
+            claims[f["episode_id"]].append((t["order_key"], t["id"]))
+    primary = {eid: sorted(lst)[0][1] for eid, lst in claims.items()}
+
     title_gaps = []
     for t in conn.execute("SELECT id FROM title ORDER BY id"):
         tid = t["id"]
-        ev = _evidence_view(conn, tid)
         a = state.get_assignment(conn, tid)
         status = a["status"] if a else "unresolved"
-        conflict, eps = _conflict(conn, tid, threshold)
         if status in ("confirmed", "rejected"):
-            continue          # adjudicated — the decision stands over any
-                              # evidence disagreement (which is expected: the
-                              # human/agent chose one source over another)
-        if status == "proposed" and not conflict:
-            continue          # a clean proposal isn't a gap until reviewed
+            continue          # adjudicated — the decision stands
+        ev = _evidence_view(conn, tid)
+        conflict, _eps = _conflict(conn, tid, threshold)
         lbl = _title_label(conn, tid)
-        if not ev and status == "unresolved":
-            # no evidence at all: only a gap if it's a plausible episode title
-            if lbl["kind"] not in ("episode-candidate", "unknown"):
-                continue
-        # an unclaimed episode-length candidate is a high-signal anomaly
-        unclaimed = status in ("unresolved",) and not (
-            a and json.loads(a["episode_ids_json"]))
-        anomaly = (unclaimed and lbl["kind"] == "episode-candidate"
+        f = findings.get(tid)
+        unclaimed = not (a and json.loads(a["episode_ids_json"]))
+        anomaly = (unclaimed and lbl["kind"] == "episode-candidate" and not f
                    and _episode_length(lbl["minutes"] * 60, medians))
-        if conflict:
-            reason = "conflict: evidence names >1 episode"
+
+        # decide the suggestion (and whether this title is even a gap)
+        if f and f["confidence"] >= accept:
+            if not f["corroborates"]:
+                suggestion = {"action": "reject", "why":
+                              f"OCR read {f['episode']} but {lbl['minutes']}m "
+                              f"doesn't fit that episode — featurette/clip or play-all"}
+            elif primary.get(f["episode_id"]) != tid:
+                suggestion = {"action": "reject", "why":
+                              f"duplicate of {f['episode']} "
+                              f"(title {primary[f['episode_id']]} kept)"}
+            else:
+                suggestion = {"action": "assign", "episode": f["episode"], "why":
+                              "title-card OCR, duration corroborates"}
+        elif conflict:
+            suggestion = {"action": "review",
+                          "why": "sources disagree, no corroborated OCR read"}
         elif anomaly:
-            reason = ("episode-length title unclaimed — likely a dropped/shifted "
-                      "episode; corroborate this disc with `run ocr`")
-        elif not ev:
-            reason = "no evidence yet"
+            suggestion = {"action": "run-ocr", "why":
+                          "episode-length but unidentified — likely a dropped/"
+                          "shifted episode; OCR this disc to corroborate"}
+        elif status == "proposed" and not conflict:
+            continue          # clean metadata proposal, no OCR issue — not a gap
+        elif not ev and lbl["kind"] not in ("episode-candidate", "unknown"):
+            continue          # a plain extra with no evidence — not a gap
         else:
-            reason = f"{status}, awaiting decision"
+            suggestion = {"action": "review", "why": f"{status}, awaiting decision"}
+
         lbl.update(status=status, conflict=conflict, anomaly=bool(anomaly),
-                   reason=reason, evidence=ev)
+                   ocr=f, suggestion=suggestion, reason=suggestion["why"],
+                   evidence=ev)
         title_gaps.append(lbl)
 
     # episodes claimed by no assignment
@@ -221,8 +277,10 @@ def gaps(conn, threshold: float = 0.5) -> dict:
         if e["id"] not in claimed]
 
     warns = order_warnings(conn)
-    # sort anomalies + conflicts to the top of the worklist
-    title_gaps.sort(key=lambda g: (not g.get("anomaly"), not g["conflict"], g["title_id"]))
+    # actionable (assign/reject) first, then review/run-ocr, by title id
+    _order = {"assign": 0, "reject": 1, "run-ocr": 2, "review": 3}
+    title_gaps.sort(key=lambda g: (_order.get(g["suggestion"]["action"], 4),
+                                   g["title_id"]))
     return {"ok": True, "gaps": title_gaps, "missing_episodes": missing,
             "order_warnings": warns, "n_gaps": len(title_gaps),
             "n_missing": len(missing)}
