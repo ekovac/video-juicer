@@ -200,14 +200,16 @@ def run_streams(conn, args) -> dict:
             continue
         # Cluster over episode-length titles only. Exclude play-alls (they carry
         # a legitimately richer/leaner layout — e.g. an added commentary track —
-        # so they'd read as the odd one out) and any concatenation far longer
-        # than its peers (a whole-disc monolith). classify_disc excludes play-alls
-        # from its nudge the same way; keep the two in step.
+        # so they'd read as the odd one out). Then drop any concatenation far
+        # longer than its peers (a whole-disc monolith) — but base that length
+        # cut on titles that actually CARRY stream counts, so a disc with many
+        # short count-less extra playlists (TNG: six 18-min menu loops) can't
+        # drag the median down and exclude the real episodes.
         cands = [t for t in disc.titles
                  if t.duration >= STREAM_FLOOR and t.kind != "play-all"]
-        if cands:
-            durs = sorted(t.duration for t in cands)
-            med = durs[len(durs) // 2]
+        counted = sorted(t.duration for t in cands if t.n_audio or t.n_sub)
+        if len(counted) >= 2:
+            med = counted[len(counted) // 2]
             cands = [t for t in cands if t.duration <= 1.6 * med]
         maj, verdict = stream_signature(cands)
         if not verdict:

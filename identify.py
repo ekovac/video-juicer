@@ -94,14 +94,18 @@ def stream_signature(titles: list[Title]) -> tuple[Optional[tuple], dict]:
     """The disc's majority (n_audio, n_sub) stream layout and each title's
     relation to it. Real episodes on a disc share an audio/subtitle layout
     (e.g. 5 audio / 2 subtitle); an episode-*length* extra — a featurette or an
-    alternate cut that fools runtime matching — usually carries fewer streams.
-    So a title whose layout disagrees with its peers' is likely not an episode.
+    alternate cut that fools runtime matching — usually carries FEWER streams.
+    So a title strictly poorer than its peers is likely not an episode.
 
-    Returns (majority | None, {title.id: "episode" | "extra"}). The verdict map
-    is empty (no usable signal) when fewer than two titles carry any stream
-    count (a Blu-ray scanned with no HandBrake) or every title shares one layout
-    — only a genuine split yields verdicts. DVD counts come from lsdvd, Blu-ray
-    from the HandBrake scan; titles with no counts are ignored, not treated as 0.
+    Returns (majority | None, {title.id: "episode" | "extra"}). A title is
+    "extra" only when it is strictly poorer than the majority (≤ in both audio
+    and subtitle, < in at least one) — never merely *different*: a real episode
+    authored with an EXTRA track (TNG Blu-ray episodes vary 11 vs 12 subtitle
+    tracks) is richer, not an extra, so it stays "episode". The verdict map is
+    empty (no usable signal) when fewer than two titles carry any stream count
+    (a Blu-ray scanned with no HandBrake), no title is strictly poorer, or every
+    title shares one layout. DVD counts come from lsdvd, Blu-ray from the
+    HandBrake scan; titles with no counts are ignored, not treated as 0.
     """
     usable = [t for t in titles if t.n_audio or t.n_sub]
     if len(usable) < 2:
@@ -110,10 +114,15 @@ def stream_signature(titles: list[Title]) -> tuple[Optional[tuple], dict]:
     for t in usable:
         sigs[(t.n_audio, t.n_sub)] = sigs.get((t.n_audio, t.n_sub), 0) + 1
     majority = max(sigs, key=lambda s: sigs[s])
-    if sigs[majority] < 2 or not any(s != majority for s in sigs):
-        return majority, {}          # unanimous / no clear majority -> no split
-    verdict = {t.id: ("episode" if (t.n_audio, t.n_sub) == majority else "extra")
-               for t in usable}
+    ma, ms = majority
+
+    def poorer(t: Title) -> bool:   # fewer streams than the episode norm
+        return (t.n_audio <= ma and t.n_sub <= ms
+                and (t.n_audio < ma or t.n_sub < ms))
+
+    if sigs[majority] < 2 or not any(poorer(t) for t in usable):
+        return majority, {}          # no strictly-poorer title -> nothing to flag
+    verdict = {t.id: ("extra" if poorer(t) else "episode") for t in usable}
     return majority, verdict
 
 

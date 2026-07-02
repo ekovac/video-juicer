@@ -89,7 +89,24 @@ in env for `init`.
   review, and an unidentified episode-length leftover's dropped/-episode anomaly
   is strengthened or softened by whether its layout matches the disc's episodes.
   `run streams` excludes play-alls (legitimately richer — commentary track) and
-  concatenations (>1.6× median) from the clustering, matching `classify_disc`.
+  concatenations from the clustering, matching `classify_disc`; the concatenation
+  length cut (>1.6×median) is taken over titles that CARRY counts, so a disc with
+  many count-less short extra playlists (TNG: six 18-min menu loops per disc)
+  can't drag the median down and exclude the real episodes.
+  - **A title is flagged only when STRICTLY POORER than the majority (≤ audio and
+    ≤ sub, < one), never merely different.** Real episodes vary in richness: TNG
+    Blu-ray authors most S1 episodes 8A/11S but Farpoint (E01) and E14 at 8A/12S
+    (a bonus subtitle) — a *richer* layout is an episode with extra tracks, not an
+    extra, so it must not be flagged. Only a genuinely lean title (TNG S1D1 pl 4,
+    a 1A/11S single-audio extra among 8A episodes) is.
+  - **Stream layout does NOT separate a duplicate authoring from the episode it
+    duplicates when both are full-quality.** TNG S1D4 pl 40 (the distinct-clip
+    duplicate that gives the aligner slack — see the play-all notes) is 8A/12S,
+    identical to the real E14 it copies, so streams can't tell them apart; the
+    stream signal is orthogonal to that ordering bug, which stays on
+    assess_ordering + confirmed-anchor re-align + OCR. (Contrast the Avatar case,
+    where the duplicate was a *stripped* 1A/0S copy — there streams DO separate
+    them, and `dedup_identical_clips` keeps the master.)
 - **TMDB runtimes are integer minutes** (some `null`); direct runtime matching
   needs ~±90 s tolerance, hence the calibration + `valid_episode_lengths` band.
 - **Volume labels are unreliable; the file basename is canonical.** Many box

@@ -538,6 +538,23 @@ class StreamSignatureTest(unittest.TestCase):
         eps = [title(i, 1400, n_audio=0, n_sub=0) for i in range(1, 4)]
         self.assertEqual(ie.stream_signature(eps), (None, {}))
 
+    def test_richer_episode_is_not_flagged(self):
+        # TNG case: most episodes 8A/11S, but real E01/E14 are 8A/12S (a bonus
+        # subtitle). Richer-than-majority is NOT an extra; only strictly-poorer is.
+        norm = [title(i, 2700, n_audio=8, n_sub=11) for i in range(1, 5)]
+        richer = title(9, 2700, n_audio=8, n_sub=12)     # extra subtitle track
+        lean = title(10, 1400, n_audio=1, n_sub=11)      # a real (poorer) extra
+        maj, verdict = ie.stream_signature(norm + [richer, lean])
+        self.assertEqual(verdict.get(10), "extra")       # strictly poorer -> flagged
+        self.assertEqual(verdict.get(9), "episode")      # richer -> NOT flagged
+
+    def test_only_strictly_poorer_flagged(self):
+        # a single-audio extra among 8-audio episodes IS strictly poorer
+        norm = [title(i, 2700, n_audio=8, n_sub=11) for i in range(1, 5)]
+        lean = title(9, 1400, n_audio=1, n_sub=11)       # 1 audio -> extra
+        maj, verdict = ie.stream_signature(norm + [lean])
+        self.assertEqual(verdict.get(9), "extra")
+
     def test_rip_title_dvd_is_identity(self):
         d = disc([title(3, 1320)], fmt="dvd")
         self.assertEqual(ie.rip_title_number(d, d.titles[0]), 3)
