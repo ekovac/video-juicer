@@ -207,7 +207,11 @@ UNIX tool with structured output and no hidden state.** Concretely:
   — launch a player on the title assigned to an episode (or any title by id, to
   preview a candidate before adjudicating). `--at-card` seeks to the retained
   OCR frame's timestamp. DVD title selection is exact (`dvd:///path#N`); Blu-ray
-  opens at the disc's main title (the MRL can't select a playlist).
+  selects the exact title by playing its `.m2ts` clip files directly out of the
+  BDMV backup dir (its libbluray title index doesn't match our `.mpls` id, and a
+  disc's "Play All" may not even be a playlist — see CLAUDE.md), which works in
+  any player (vlc or mpv). A Blu-ray *image* (no BDMV dir) falls back to the
+  disc's main title. `--player` picks the player; seek flags are player-aware.
 
 ### Resolve — evidence → proposed assignments (the bridge)
 - `vj resolve <state.db> [--threshold C]` — for each title whose evidence

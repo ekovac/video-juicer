@@ -514,9 +514,23 @@ class BoardTests(Base):
 
 
 class PlayTests(Base):
-    def test_mrl(self):
-        self.assertEqual(vj._play_mrl("dvd", "/x.iso", 4), "dvd:///x.iso#4")
-        self.assertTrue(vj._play_mrl("bluray", "/bd", 1).startswith("bluray:///bd"))
+    def test_dvd_argv(self):
+        row = {"format": "dvd", "path": "/x.iso", "title_number": 4, "clips_json": "[]"}
+        argv, note = vj._play_argv("vlc", row, 0)
+        self.assertEqual(argv, ["vlc", "dvd:///x.iso#4"])
+
+    def test_bluray_image_falls_back(self):
+        # no BDMV dir -> can't select the title, falls back to the disc MRL
+        row = {"format": "bluray", "path": "/no/such/bd", "title_number": 1,
+               "clips_json": '["00000"]'}
+        argv, note = vj._play_argv("mpv", row, 0)
+        self.assertTrue(any("bluray:///no/such/bd" in a for a in argv))
+        self.assertIn("main title", note)
+
+    def test_start_flag_per_player(self):
+        self.assertEqual(vj._start_args("vlc", 40), ["--start-time", "40"])
+        self.assertEqual(vj._start_args("mpv", 40), ["--start=40"])
+        self.assertEqual(vj._start_args("vlc", 0), [])
 
     def _play_json(self, *cli):
         out, err = io.StringIO(), io.StringIO()
@@ -531,7 +545,7 @@ class PlayTests(Base):
         tid = state.title_id(self.conn, did, 1)
         rc, out = self._play_json("--title", str(tid), "--print")
         self.assertEqual(rc, 0)
-        self.assertEqual(out["mrl"], "dvd:///d/x.iso#1")
+        self.assertIn("dvd:///d/x.iso#1", out["command"])
         self.assertFalse(out["launched"])
 
     def test_play_by_episode_uses_assignment(self):

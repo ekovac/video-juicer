@@ -493,13 +493,37 @@ def cmd_auto(args) -> int:
     return 0
 
 
-def _play_mrl(fmt: str, path: str, title_number: int) -> str:
-    """A player MRL selecting one title. DVD title selection is reliable via the
-    `#N` fragment; Blu-ray playlist selection isn't exposed on the MRL, so BD
-    opens the disc at its main title (the caller warns)."""
+def _start_args(player: str, sec: float) -> list[str]:
+    """Seek flag, per player (vlc: --start-time N; mpv: --start=N)."""
+    if not sec:
+        return []
+    mpv = "mpv" in os.path.basename(player).lower()
+    return [f"--start={int(sec)}"] if mpv else ["--start-time", str(int(sec))]
+
+
+def _play_argv(player: str, row, start: float) -> tuple[list[str], str]:
+    """Build the player command for one title, plus a note.
+
+    Blu-ray title selection isn't reliably expressible as an MRL — the disc's
+    libbluray title index doesn't match our `.mpls` id (same mismatch as
+    HandBrake), and a disc's "Play All" may not even be a playlist. But for a
+    BDMV backup DIR we already know the title's ordered CLIPS, so we play the
+    `.m2ts` files directly — exact, and works in any player (vlc or mpv). DVD
+    uses the reliable `dvd://…#N` title fragment; a Blu-ray IMAGE (no BDMV dir)
+    falls back to the disc's main title."""
+    fmt, path = row["format"], row["path"]
     if fmt == "dvd":
-        return f"dvd://{path}#{title_number}"
-    return f"bluray://{path}"
+        return [player, f"dvd://{path}#{row['title_number']}"] + _start_args(player, start), ""
+    stream = Path(path) / "BDMV" / "STREAM"
+    clips = [str(stream / f"{c}.m2ts")
+             for c in json.loads(row["clips_json"] or "[]")]
+    clips = [c for c in clips if Path(c).is_file()]
+    if clips:
+        return ([player] + clips + _start_args(player, start),
+                f"Blu-ray: playing the title's {len(clips)} .m2ts clip(s) directly")
+    return ([player, f"bluray://{path}"] + _start_args(player, start),
+            "Blu-ray image (no BDMV dir): opens the disc's main title — can't "
+            "select this title from an image")
 
 
 def cmd_play(args) -> int:
@@ -509,7 +533,7 @@ def cmd_play(args) -> int:
     # resolve target -> a title row
     if args.title is not None:
         row = conn.execute(
-            "SELECT t.id, t.title_number, d.path, d.format FROM title t "
+            "SELECT t.id, t.title_number, t.clips_json, d.path, d.format FROM title t "
             "JOIN disc d ON d.id=t.disc_id WHERE t.id=?", (args.title,)).fetchone()
         if row is None:
             conn.close()
@@ -549,29 +573,23 @@ def cmd_play(args) -> int:
             start = max(0.0, f["source_time"] - 5.0)
     conn.close()
 
-    mrl = _play_mrl(row["format"], row["path"], row["title_number"])
-    argv = [args.player, mrl]
-    if start:
-        argv += ["--start-time", str(int(start))]
-    warn = (" (Blu-ray: opens at the disc's main title — VLC can't select a "
-            "playlist from the MRL; pick it from the title menu)"
-            if row["format"] == "bluray" else "")
-
+    argv, note = _play_argv(args.player, row, start)
+    tail = f"  ({note})" if note else ""
     if args.print:
-        emit(args, {"ok": True, "command": argv, "mrl": mrl, "launched": False,
-                    "title_id": tid, "note": warn.strip() or None},
-             human="would run: " + " ".join(shlex.quote(a) for a in argv) + warn)
+        emit(args, {"ok": True, "command": argv, "launched": False,
+                    "title_id": tid, "note": note or None},
+             human="would run: " + " ".join(shlex.quote(a) for a in argv) + tail)
         return 0
     if not shutil.which(args.player):
         return fail(args, "no-player", f"player not on PATH: {args.player}")
     import subprocess
     subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                      start_new_session=True)
-    emit(args, {"ok": True, "command": argv, "mrl": mrl, "launched": True,
-                "title_id": tid, "note": warn.strip() or None},
+    emit(args, {"ok": True, "command": argv, "launched": True,
+                "title_id": tid, "note": note or None},
          human=f"launched {args.player}: title {row['title_number']} on "
-               f"{Path(row['path']).name}"
-               + (f" @{int(start)}s" if start else "") + warn)
+               f"{state.disc_name(row['path'])}"
+               + (f" @{int(start)}s" if start else "") + tail)
     return 0
 
 
