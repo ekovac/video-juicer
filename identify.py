@@ -287,10 +287,19 @@ ANCHOR_MATCH = -1_000_000.0   # cost of a pinned (candidate -> episode) match
 # equally-good (within-tolerance) matches toward a CONTIGUOUS episode run, so an
 # anchor shifts the whole run instead of pinning one title and leaving holes.
 GAP_INTERIOR = 20.0
+# SOFT background (packaging) penalty: routing a disc's title onto an episode the
+# box says isn't on that disc costs this much. It's one-sided (in-set = 0) and
+# advisory: bigger than the per-episode runtime-delta spread (≤ ~40 within the
+# match tolerance), so packaging decides among runtime-plausible episodes — the
+# same-runtime ambiguity it exists to break — but FINITE, so a runtime-impossible
+# in-set episode (cost = inf) still yields to an out-of-set match. That is what
+# "route outside the set only if runtimes strongly disagree" means here.
+BG_OUT_PENALTY = 100.0
 
 
 def align(cands: list[tuple[Disc, Title]], episodes: list[Episode],
-          anchors: Optional[dict] = None
+          anchors: Optional[dict] = None,
+          background: Optional[dict] = None
           ) -> tuple[list[Assignment], list[tuple[Disc, Title]], list[Episode]]:
     """Monotonic alignment. Returns (assignments, leftover_titles, missed_eps).
 
@@ -299,8 +308,14 @@ def align(cands: list[tuple[Disc, Title]], episodes: list[Episode],
     runtime delta), can't gap an anchored candidate or episode, and can't match
     an anchored candidate/episode to anything else. So confirming one title and
     re-running align re-frames the rest of the season around it — no hand-bumping
-    every downstream episode."""
+    every downstream episode.
+
+    `background` is a SOFT constraint from box packaging: {cand index -> set of
+    allowed episode indices}. A candidate present in the dict pays BG_OUT_PENALTY
+    for matching an episode outside its allowed set — advisory, not a hard pin
+    (see BG_OUT_PENALTY). Candidates absent from the dict are unconstrained."""
     anchors = anchors or {}
+    background = background or {}
     anchored_ep = {j: i for i, j in anchors.items()}   # episode index -> cand index
     scale = runtime_scale(cands, episodes)
     if scale != 1.0:
@@ -333,10 +348,13 @@ def align(cands: list[tuple[Disc, Title]], episodes: list[Episode],
                 # a pin forbids matching this cand/ep to anything but its partner
                 forbidden = ((pinned is not None and pinned != j)
                              or (j in anchored_ep and anchored_ep[j] != i))
+                allowed = background.get(i)
                 if not forbidden:
+                    bg = (BG_OUT_PENALTY if allowed is not None and j not in allowed
+                          else 0.0)
                     c = cur + (ANCHOR_MATCH if pinned == j
                                else _match_cost(t.duration, episodes[j].runtime,
-                                                t.evidence, scale))
+                                                t.evidence, scale) + bg)
                     if c < dp[i + 1][j + 1]:
                         dp[i + 1][j + 1], bt[i + 1][j + 1] = c, "match"
                 # two-parter merge — never across/with an anchored cand or episode
@@ -344,7 +362,10 @@ def align(cands: list[tuple[Disc, Title]], episodes: list[Episode],
                         and (j + 1) not in anchored_ep
                         and j + 1 < n and episodes[j].runtime and episodes[j + 1].runtime):
                     rt = episodes[j].runtime + episodes[j + 1].runtime
-                    c = cur + _match_cost(t.duration, rt, t.evidence, scale) + 30.0
+                    # a merged double is penalised if EITHER half is out-of-set
+                    bg = (BG_OUT_PENALTY if allowed is not None
+                          and (j not in allowed or (j + 1) not in allowed) else 0.0)
+                    c = cur + _match_cost(t.duration, rt, t.evidence, scale) + 30.0 + bg
                     if c < dp[i + 1][j + 2]:
                         dp[i + 1][j + 2], bt[i + 1][j + 2] = c, "merge2"
     # backtrack

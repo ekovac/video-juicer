@@ -197,7 +197,40 @@ def summarize(conn) -> dict:
     n_titles = conn.execute("SELECT COUNT(*) c FROM title").fetchone()["c"]
     return {"ok": True, "show": proj.get("show_name"),
             "titles": n_titles, "assignments_by_status": by_status,
-            "seasons": seasons, "order_warnings": order_warnings(conn)}
+            "seasons": seasons, "order_warnings": order_warnings(conn),
+            "packaging": _packaging_status(conn)}
+
+
+def _packaging_status(conn) -> list[dict]:
+    """Per-disc box-packaging hints and how the current assignments line up with
+    them: `outside` = episodes assigned on the disc the box DIDN'T list (the soft
+    aligner overrode the hint — worth a look), `missing` = listed episodes not yet
+    assigned there. A pre-scan hint reports scanned=False."""
+    bg = state.all_background(conn)
+    if not bg:
+        return []
+    name2id = {state.disc_name(r["path"]): r["id"] for r in state.list_discs(conn)}
+    out = []
+    for name, asserted in sorted(bg.items()):
+        aset = set(asserted)
+        did = name2id.get(name)
+        entry = {"disc": name, "scanned": did is not None,
+                 "asserted": [list(p) for p in asserted]}
+        if did is not None:
+            assigned = set()
+            for t in conn.execute("SELECT id FROM title WHERE disc_id=?", (did,)):
+                a = state.get_assignment(conn, t["id"])
+                if a and a["status"] in ("proposed", "confirmed"):
+                    for eid in json.loads(a["episode_ids_json"]):
+                        ep = conn.execute(
+                            "SELECT season,number FROM episode WHERE id=?",
+                            (eid,)).fetchone()
+                        if ep:
+                            assigned.add((ep["season"], ep["number"]))
+            entry["outside"] = [list(p) for p in sorted(assigned - aset)]
+            entry["missing"] = [list(p) for p in sorted(aset - assigned)]
+        out.append(entry)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -417,6 +450,12 @@ def show_title(conn, tid: int) -> dict:
                       "decided_by": a["decided_by"], "note": a["note"]}
     lbl.update(assignment=assignment, evidence=_evidence_view(conn, tid),
                frames=state.frame_categories(conn, tid))
+    tr = conn.execute(
+        "SELECT text,windows,length FROM transcript WHERE title_id=?",
+        (tid,)).fetchone()
+    if tr:
+        lbl["transcript"] = {"windows": tr["windows"], "length": tr["length"],
+                             "text": tr["text"]}
     lbl["ok"] = True
     return lbl
 

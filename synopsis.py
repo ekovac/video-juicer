@@ -25,6 +25,7 @@ so when in doubt we return nothing.
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import time
@@ -107,9 +108,29 @@ def transcribe(wav: Path, model_size: str = WHISPER_MODEL) -> str:
     return " ".join(s.text.strip() for s in segments).strip()
 
 
+def full_transcript(disc: Disc, title: Title, workdir: Path) -> str:
+    """Rip + transcribe the ENTIRE title audio — the default, and preferred over
+    windowing. Plot-distinctive dialogue is strewn throughout an episode, so a few
+    sampled windows can phase-skip the very lines that identify it; whisper
+    base.en on CPU runs faster than realtime, and we only reach the synopsis path
+    after the (far costlier) OCR fallback has already failed, so a whole-episode
+    pass is affordable. (The cold-open "previously on" recap is a minor risk — it
+    injects a little prior-episode plot — but it's tiny next to a full episode and
+    the judge keys on specific in-episode events, not stray recap lines.)"""
+    wav = workdir / f"aud_{title.id}_full.wav"
+    if not rip_audio(disc, title, 0.0, title.duration, wav):
+        return ""
+    try:
+        return transcribe(wav)
+    finally:
+        wav.unlink(missing_ok=True)
+
+
 def sample_transcript(disc: Disc, title: Title, workdir: Path,
                       fractions=SAMPLE_FRACTIONS, length=SAMPLE_LENGTH) -> str:
-    """Rip + transcribe a few windows spread across a title; join the text.
+    """Rip + transcribe a few windows spread across a title; join the text. The
+    OPT-IN fast path (`--synopsis-windows N`); the default is `full_transcript`,
+    which doesn't risk missing the identifying lines between windows.
 
     Spreading the samples (not one long block) captures plot-distinctive
     dialogue from different acts, which is what the synopsis judge keys on."""
@@ -128,17 +149,68 @@ def sample_transcript(disc: Disc, title: Title, workdir: Path,
     return "\n".join(parts).strip()
 
 
-def _ollama_text(model: str, prompt: str, host: str, retries: int = 3) -> str:
-    """One text-only Ollama chat with retries (mirrors identify.ollama_chat's
-    resilience to the daemon's OOM-restart, minus the image payload)."""
+def _anthropic_text(model: str, prompt: str) -> str:
+    """One text-only Anthropic Messages call. A quick swap for the Ollama judge:
+    a Claude-id model routes here (via `_ollama_text`) so `run synopsis
+    --judge-model claude-sonnet-5` uses a frontier judge with no other changes.
+    Needs ANTHROPIC_API_KEY in the env; same text→_extract_json output contract."""
+    key = os.environ.get("ANTHROPIC_API_KEY")
+    if not key:
+        raise RuntimeError("ANTHROPIC_API_KEY not set (needed for a claude judge)")
+    # No `temperature`: it's deprecated on current Claude models (a 400), and
+    # they're near-deterministic at greedy defaults anyway.
     body = json.dumps({
+        "model": model, "max_tokens": 2048,
+        "messages": [{"role": "user", "content": prompt}],
+    }).encode()
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/messages", data=body,
+        headers={"content-type": "application/json", "x-api-key": key,
+                 "anthropic-version": "2023-06-01"})
+    with urllib.request.urlopen(req, timeout=300) as resp:
+        data = json.loads(resp.read())
+    parts = [b.get("text", "") for b in data.get("content", [])
+             if b.get("type") == "text"]
+    return "".join(parts).strip()
+
+
+def _ollama_text(model: str, prompt: str, host: str, retries: int = 3) -> str:
+    """One text-only chat with retries (mirrors identify.ollama_chat's resilience
+    to the daemon's OOM-restart, minus the image payload). A `claude-*` model id
+    routes to the Anthropic backend instead — the retry/backoff also rides out a
+    429/503/529 rate-limit or overload there."""
+    is_claude = model.startswith("claude")
+    # Ollama defaults num_ctx to 2048 and SILENTLY truncates a longer prompt to
+    # its TAIL — on a full-episode transcript (~5k+ tokens) that drops most of the
+    # dialogue the judge needs, and it abstains on every title (observed on the
+    # Magicians full-transcript run). Size the window to the prompt + response
+    # budget so the whole transcript is seen; cap at 32k (qwen2.5's native ctx).
+    # num_predict caps TOTAL output tokens (thinking + answer). 2048 suffices for
+    # a non-thinking judge's JSON, but a THINKING model (gemma4) spends most of it
+    # reasoning and returns empty content if cut off mid-thought — bump it via
+    # VJ_JUDGE_NUM_PREDICT for those. It's a cap not a target, so a larger value is
+    # near-free for the non-thinking path (it stops as soon as the JSON is done).
+    num_predict = int(os.environ.get("VJ_JUDGE_NUM_PREDICT", "2048"))
+    approx = len(prompt) // 4 + num_predict         # ~4 chars/token + response room
+    num_ctx = min(32768, max(4096, -(-approx // 4096) * 4096))  # round up to 4k
+    payload = {
         "model": model, "stream": False,
         "messages": [{"role": "user", "content": prompt}],
-        "options": {"temperature": 0, "num_predict": 2048},
-    }).encode()
+        "options": {"temperature": 0, "num_predict": num_predict, "num_ctx": num_ctx},
+    }
+    # VJ_JUDGE_THINK=false runs a thinking-capable model (gemma4) in NON-thinking
+    # mode — worth it because for this task thinking reasons its way to confident-
+    # wrong recurring-arc matches (observed: gemma4 thinking 1/4, worse than a
+    # non-thinking judge). Only sent when set, so the default path is unchanged.
+    think = os.environ.get("VJ_JUDGE_THINK")
+    if think is not None:
+        payload["think"] = think.strip().lower() not in ("false", "0", "no", "off")
+    body = json.dumps(payload).encode()
     delays = [5, 15, 30]
     for attempt in range(retries + 1):
         try:
+            if is_claude:
+                return _anthropic_text(model, prompt)
             req = urllib.request.Request(
                 f"{host}/api/chat", data=body,
                 headers={"Content-Type": "application/json"})

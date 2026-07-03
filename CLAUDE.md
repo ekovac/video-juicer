@@ -44,7 +44,7 @@ Layout:
 - `wiki.py` — read episode plot summaries from a local Wikipedia **multistream**
   dump (offline synopsis source; see the synopsis note below).
 - `state.py` — SQLite data layer (schema, row⇄dataclass mappers, evidence upsert,
-  frame BLOBs, assignment ops).
+  frame BLOBs, assignment ops, `transcript` cache, `background` packaging hints).
 - `compute.py` — `vj run <heuristic>`: wraps the heuristics as evidence producers.
 - `review.py` — inspect (`status`/`gaps`/`show`), `resolve` (evidence→proposals),
   adjudicate (`assign`/`confirm`/`reject`). Conflict computed here.
@@ -52,11 +52,12 @@ Layout:
 - `vj.py` — the CLI entry point wiring all verbs.
 
 Run (per-verb; see README for the full flow): `vj init db --tmdb-id <id>` →
-`vj scan db <discs>` → `vj run align db` → `vj run streams db` (optional; flags
-episode-length extras by audio/subtitle layout) → `vj run ocr db --disc N` (or,
-for a no-title-card show, `vj enrich wikipedia db --snapshot … --index … --page
-…` then `vj run synopsis db`) → `vj resolve db` → review/adjudicate →
-`vj export db --manifest … --rip-script …`.
+`vj scan db <discs>` → (optional `vj hint disc db --disc … --season N --episodes
+1-4` to feed box-packaging into align) → `vj run align db` → `vj run streams db`
+(optional; flags episode-length extras by audio/subtitle layout) → `vj run ocr db
+--disc N` (or, for a no-title-card show, `vj enrich wikipedia db --snapshot …
+--index … --page …` then `vj run synopsis db`) → `vj resolve db` →
+review/adjudicate → `vj export db --manifest … --rip-script …`.
 Tests: `python3 -m unittest test_identify_episodes test_vj` (no discs/network).
 Needs `lsdvd`,`7z`; OCR also needs `ffmpeg`/`mencoder` + Ollama; `TMDB_API_KEY`
 in env for `init`.
@@ -409,10 +410,45 @@ Three sources of canonical episode ORDER, cheapest first:
 
 `vj run synopsis` identifies a title by *content*, not position — the escalation
 for a **no-title-card, order-unverified** show (Blu-ray, same-runtime episodes;
-OCR has nothing to read). It whisper-transcribes a few sampled audio windows
-(`spread_fractions` places them in the 20–80% interior band, away from the
-"previously on" recap and end credits; `--synopsis-windows/-length` tune it) and
-a 2-stage LLM judge matches the dialogue against each candidate's plot synopsis.
+OCR has nothing to read). It whisper-transcribes the episode audio and a 2-stage
+LLM judge matches the dialogue against each candidate's plot synopsis.
+
+- **Transcribe the WHOLE episode by default (2026-07); windowing is opt-in.**
+  Identifying dialogue is strewn throughout an episode, so sampling a few windows
+  can phase-skip the very lines that name it — proven on Magicians S1D1 title 165
+  (E02): the windowed sample caught only "freeze our tits off" (Julia's freezer
+  initiation) and Sonnet mis-read it as the Antarctica episode (E07, confidently
+  1.0); the FULL transcript shows the whole E02 plot and Sonnet gets it right.
+  `full_transcript` rips+whispers the whole title (whisper base.en is
+  faster-than-realtime, and we only reach synopsis after the costlier OCR path
+  already failed, so it's affordable). `--synopsis-windows N` opts back into the
+  faster sampled path (`sample_transcript`). Recap risk (the cold-open "previously
+  on" injects a little prior-episode plot) is tiny next to a full episode and the
+  judge keys on specific in-episode events.
+- **Transcripts are CACHED in the DB (`transcript` table) and inspectable.**
+  Whisper is the expensive part and is judge-independent, so `run_synopsis` stores
+  each title's transcript keyed by its sampling params `(windows, length)` — full
+  mode is `(0,0)`. A second run (e.g. to swap the judge model) reuses it and only
+  re-does the cheap judge call; `--retranscribe` forces a fresh pass. `vj show
+  <title>` surfaces the transcript for a human/agent. Keyed by the surrogate
+  title_id and cascades on re-scan (a re-scanned disc's dialogue may differ).
+- **Multi-episode guard: don't full-transcribe a play-all.** `run_synopsis` skips
+  any candidate longer than **1.5× the disc-local median** candidate duration — a
+  play-all/concatenation holds several episodes' dialogue and can't match ONE
+  episode (and full-ripping a 102-min title is pure waste). 1.5× (tighter than
+  run_streams' 1.6×) because here the long titles are still IN the sample and
+  inflate the median; assumes episodes are the majority, needs ≥3 candidates.
+  This surfaced two long titles mis-classified as `episode-candidate` on Magicians
+  S1D1 (76m, 102m) that the windowed path had silently sampled 120s of.
+- **Ollama num_ctx/num_predict must be SIZED to the prompt for this path.** Ollama
+  defaults `num_ctx` to 2048 and SILENTLY truncates a longer prompt to its TAIL —
+  a full-episode transcript (~5k+ tokens) then loses the dialogue and the judge
+  abstains on EVERY title (observed: full-transcript qwen abstained 4/4 until
+  fixed). `_ollama_text` now sizes `num_ctx` to `len(prompt)//4 + num_predict`
+  rounded up to 4k, capped 32k (qwen2.5's native ctx). `VJ_JUDGE_NUM_PREDICT`
+  (default 2048) bumps the output cap for a THINKING judge (gemma4) whose thinking
+  would otherwise exhaust it and return empty content; `VJ_JUDGE_THINK=false`
+  sends Ollama's `think:false` to run a thinking model in non-thinking mode.
 
 - **The judge is only as good as the synopsis, and TMDB's are often too generic.**
   On The Magicians, TMDB's E01 overview is a series-premise blurb
@@ -441,6 +477,32 @@ a 2-stage LLM judge matches the dialogue against each candidate's plot synopsis.
   `run_synopsis` had defaulted the judge to `--vlm-model` (a 2B *vision* model) —
   fixed. Judge accuracy is also model-sensitive: qwen2.5:14b got E01 where a
   weaker model didn't.
+- **The judge is the bottleneck — a frontier judge is the lever (built).** A
+  `claude-*` `--judge-model` (e.g. `claude-sonnet-5`, `claude-haiku-4-5-20251001`)
+  routes `synopsis._ollama_text` to the Anthropic Messages API via
+  `ANTHROPIC_API_KEY` instead of Ollama (no `temperature` — deprecated on current
+  Claude models). Controlled comparison on Magicians S1D1 (E01–E04), IDENTICAL
+  cached full transcripts + Wikipedia synopses, only the judge swapped:
+  **Sonnet 4/4, Haiku 4/4, qwen2.5:14b 2/4 (windowed 3/4), gemma4 1/4 thinking /
+  0/4 non-thinking.** The tell: gemma's own evidence text often *describes the
+  right episode* but ranks the wrong number — a ranking-fidelity gap that scales
+  with instruct-model size, exactly what CLAUDE.md predicted ("ranking quality,
+  not the assignment or the transcript, is the bottleneck"). More context (num_ctx
+  fix) and full transcripts did NOT rescue the weak local judges; a stronger judge
+  did. Haiku ties Sonnet here, so it's the recommended API judge.
+- **Cost/latency: Haiku ≈ $1 per 96-episode series, run it SYNCHRONOUSLY.** ~8.5k
+  input + ~250 output tokens/judge-call (measured), one call/episode, at Haiku's
+  $1/$5 per-Mtok → ~$0.93 for 96 episodes (~1¢/episode; whisper is local/free).
+  The Batch API is 50% off but async (typ. <1h, ceiling 24h) — **rejected for this
+  workflow**: whisper already dominates wall-clock so the discount buys nothing,
+  and the poll-cycle latency is annoying for the spot-check/experiment loop. Run
+  the judge synchronously (~10 min for 96 titles, deterministic).
+- **Local ceiling is 16 GB VRAM (see the hardware memory).** A 14B Q4 (~9-10 GB,
+  qwen2.5:14b-instruct) fits and is the best offline judge tested; 32B (~20 GB) /
+  72B (~40 GB) spill to CPU and are too slow, so "a bigger local model" is not the
+  lever. The productive local lever is instead constraining the candidate pool
+  (feed the packaging/background hint into the synopsis pool — NOT YET BUILT; it
+  would have fenced qwen off its off-disc E05 pick and gemma off E09/E12).
 - **Magnet failure mode — synopsis is a corroborator, not a reliable identifier
   on ensemble shows.** Full-series Magicians run (Wikipedia source, qwen2.5:14b):
   AGREE 38 / DIFFER 25 / abstain 30 vs the metadata order. But the DIFFERs are
@@ -540,6 +602,20 @@ a 2-stage LLM judge matches the dialogue against each candidate's plot synopsis.
   and leaving holes. No hand-bumping every downstream episode. (`GAP_INTERIOR`
   is tiny — it only breaks ties among within-tolerance matches; a real
   mid-season missing episode is still gapped.)
+- **Box-packaging hints: `vj hint disc` feeds a SOFT constraint into `align`.**
+  Box sets print an episode→disc mapping; `vj hint disc <db> --disc <name>
+  --season N --episodes 1-4` (and/or `--titles "A" "B"`, resolved to numbers via
+  TMDB at entry) records it. Stored in the `background` table keyed by disc
+  **basename** — NOT by disc.id and NOT cascaded, so it survives a re-scan (which
+  DELETEs+recreates the disc row) and a re-scanned disc re-adopts it. `run_align`
+  builds a per-candidate allowed-episode-index set and passes it to `align`, which
+  charges `BG_OUT_PENALTY` (100, one-sided) for routing a disc's title onto an
+  episode the box doesn't list. Soft/advisory by design: big enough to break the
+  same-runtime ambiguity it exists for, but FINITE — a runtime-impossible in-set
+  episode (cost ∞) still yields to an out-of-set match, and a `confirmed`
+  adjudication is still the hard override. `vj status` shows a `📦` line per disc
+  with `outside` (assigned but not on the box — align overrode the hint) and
+  `missing` (listed but unassigned) so a mismatch is visible.
 - **Don't launch two writers on the same DB at once.** SQLite is in WAL mode and
   each op is transactional, so a single writer is safe and reads never block —
   but two concurrent `vj run`s writing the same file still contend, and an OOM'd
@@ -561,12 +637,13 @@ a 2-stage LLM judge matches the dialogue against each candidate's plot synopsis.
   OpenAI, Groq, Together, a local vLLM, and Ollama's own `/v1`. Select by
   flag/env (`--llm-backend {ollama,openai}` + `VJ_LLM_BASE`/`VJ_LLM_KEY`), default
   Ollama.
-  - **Text judge first — easy (~an afternoon), low risk, high value.** The judge
-    is model-sensitive (qwen2.5:14b got Magicians E01 where weaker models didn't),
-    so a 70B/frontier judge via a provider could push accuracy up; a bigger model
-    helps here more than anywhere. Only extra work vs. plumbing: catch HTTP
-    429/503 (rate limits) in the retry/backoff, which today only handles Ollama's
-    OOM-restart connection errors.
+  - **Text judge: DONE for Anthropic (2026-07), OpenAI-compat still open.** A
+    `claude-*` `--judge-model` already routes `_ollama_text` to the Anthropic
+    Messages API (`ANTHROPIC_API_KEY`; retry/backoff widened for 429/503/529) and
+    is the recommended judge (Haiku 4/4 on Magicians S1D1 for ~$1/series — see the
+    synopsis section). The remaining backlog is the *generic* OpenAI-compatible
+    adapter (`/v1/chat/completions`) for HF/Groq/vLLM/etc., which the Anthropic
+    branch does NOT cover (different endpoint + response shape).
   - **VLM/OCR path — moderate/hard (~+1 day), medium risk.** The API glue is easy
     (OpenAI vision uses an `image_url` `data:` URI part), but the real cost is
     **re-validating a hosted vision model** against the title-card corpus —

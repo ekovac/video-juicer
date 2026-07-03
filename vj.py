@@ -161,6 +161,102 @@ def cmd_enrich(args) -> int:
     return 0
 
 
+def _parse_ranges(spec: str) -> list[int]:
+    """'1-4,6,8-9' -> [1,2,3,4,6,8,9] (sorted, deduped). Raises ValueError on junk."""
+    out: set[int] = set()
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            a, b = part.split("-", 1)
+            lo, hi = int(a), int(b)
+            if hi < lo:
+                raise ValueError(f"backwards range {part!r}")
+            out.update(range(lo, hi + 1))
+        else:
+            out.add(int(part))
+    return sorted(out)
+
+
+def _match_ep_title(eps, needle: str, season):
+    """Resolve a packaging title string to an Episode by name (casefold exact,
+    then unique substring), optionally scoped to a season. Returns the Episode or
+    raises ValueError naming the ambiguity so a typo isn't silently mismapped."""
+    pool = [e for e in eps if season is None or e.season == season]
+    key = needle.strip().casefold()
+    exact = [e for e in pool if (e.name or "").strip().casefold() == key]
+    if len(exact) == 1:
+        return exact[0]
+    if len(exact) > 1:
+        raise ValueError(f"title {needle!r} matches several episodes")
+    sub = [e for e in pool if key in (e.name or "").strip().casefold()]
+    if len(sub) == 1:
+        return sub[0]
+    if len(sub) > 1:
+        raise ValueError(f"title {needle!r} is ambiguous "
+                         f"({', '.join(f'S{e.season:02d}E{e.number:02d}' for e in sub)})")
+    raise ValueError(f"no episode matching title {needle!r}")
+
+
+def cmd_hint(args) -> int:
+    """Record box-packaging knowledge: which episodes a disc holds. A SOFT signal
+    the aligner prefers but can override on strong runtime disagreement."""
+    if not Path(args.db).exists():
+        return fail(args, "no-db", f"state file not found: {args.db} (run `init`)")
+    conn = state.connect(args.db)
+
+    # resolve --disc to a canonical basename; allow a not-yet-scanned disc
+    did, derr = _resolve_disc(conn, args.disc)
+    prescan = False
+    if did is not None:
+        name = next(state.disc_name(r["path"]) for r in state.list_discs(conn)
+                    if r["id"] == did)
+    elif derr and "ambiguous" in derr:
+        conn.close()
+        return fail(args, "ambiguous-disc", derr)
+    else:
+        name, prescan = state.disc_name(args.disc), True
+
+    eps = state.load_episodes(conn)
+    known = {(e.season, e.number) for e in eps}
+    pairs: list[tuple[int, int]] = []
+    try:
+        if args.episodes:
+            if args.season is None:
+                raise ValueError("--episodes needs --season")
+            pairs += [(args.season, n) for n in _parse_ranges(args.episodes)]
+        for t in (args.titles or []):
+            e = _match_ep_title(eps, t, args.season)
+            pairs.append((e.season, e.number))
+    except ValueError as e:
+        conn.close()
+        return fail(args, "bad-hint", str(e))
+
+    pairs = sorted(set(pairs))
+    if not pairs:
+        conn.close()
+        return fail(args, "empty-hint",
+                    "nothing to record; pass --episodes (with --season) and/or --titles")
+    unknown = [p for p in pairs if p not in known]
+    if unknown:
+        conn.close()
+        return fail(args, "unknown-episode",
+                    "not in this show's episode list (typo?): "
+                    + ", ".join(f"S{s:02d}E{n:02d}" for s, n in unknown))
+
+    state.set_background(conn, name, pairs, source=args.source)
+    conn.close()
+    labels = ", ".join(f"S{s:02d}E{n:02d}" for s, n in pairs)
+    emit(args,
+         {"ok": True, "disc": name, "prescan": prescan,
+          "episodes": [list(p) for p in pairs], "source": args.source},
+         human=(f"recorded packaging hint for {name}: {labels}"
+                + ("\n  (disc not scanned yet — will apply once it is)"
+                   if prescan else "")))
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # ingest: scan
 # ---------------------------------------------------------------------------
@@ -327,6 +423,16 @@ def cmd_status(args) -> int:
         lines.append(f"  S{s['season']:02d}: {s['matched']}/{s['total']} episodes matched")
     for w in r.get("order_warnings", []):
         lines.append(f"  ⚠ {w['disc']}: order unverified — {w['reason']}")
+    for p in r.get("packaging", []):
+        n = len(p["asserted"])
+        tag = "" if p["scanned"] else " (not scanned yet)"
+        lines.append(f"  📦 {p['disc']}: packaging lists {n} episode(s){tag}")
+        if p.get("outside"):
+            eps = ", ".join(f"S{s:02d}E{e:02d}" for s, e in p["outside"])
+            lines.append(f"     ‼ assigned but NOT on the box: {eps}")
+        if p.get("missing"):
+            eps = ", ".join(f"S{s:02d}E{e:02d}" for s, e in p["missing"])
+            lines.append(f"     · listed but unassigned: {eps}")
     emit(args, r, human="\n".join(lines))
     return 0
 
@@ -809,6 +915,23 @@ def build_parser() -> argparse.ArgumentParser:
                                "(American TV series) episodes'); remembered")
     p_enrich.set_defaults(func=cmd_enrich)
 
+    p_hint = sub.add_parser(
+        "hint", help="record box-packaging knowledge (which episodes a disc holds)")
+    p_hint.add_argument("what", choices=["disc"],
+                        help="what the hint is about (only 'disc' for now)")
+    p_hint.add_argument("db", type=Path, help="existing state file")
+    p_hint.add_argument("--disc", required=True,
+                        help="disc basename or id (may be entered before scanning)")
+    p_hint.add_argument("--season", type=int, default=None,
+                        help="season the --episodes numbers belong to")
+    p_hint.add_argument("--episodes", default=None,
+                        help="episode numbers on the disc, e.g. '1-4,6' (needs --season)")
+    p_hint.add_argument("--titles", nargs="+", default=None,
+                        help="episode titles on the disc (resolved to numbers via TMDB)")
+    p_hint.add_argument("--source", default="packaging",
+                        help="provenance label (default: packaging)")
+    p_hint.set_defaults(func=cmd_hint)
+
     p_run = sub.add_parser("run", help="run a heuristic as an evidence producer")
     p_run.add_argument("heuristic", nargs="?", default=None,
                        help="align | ocr | synopsis (or --list)")
@@ -842,14 +965,21 @@ def build_parser() -> argparse.ArgumentParser:
                        default=os.environ.get("OLLAMA_HOST",
                                               "http://localhost:11434"))
     p_run.add_argument("--synopsis-windows", type=int, default=None,
-                       help="synopsis: number of dialogue windows to sample per "
-                            "title (default 3); more sees more plot at more "
-                            "whisper cost")
+                       help="synopsis: opt into SAMPLED transcription with N "
+                            "dialogue windows instead of the default whole-episode "
+                            "pass (faster, but can miss identifying lines between "
+                            "windows)")
     p_run.add_argument("--synopsis-length", type=float, default=None,
-                       help="synopsis: seconds of audio per window (default 40)")
+                       help="synopsis: seconds of audio per window when "
+                            "--synopsis-windows is set (default 40)")
     p_run.add_argument("--judge-model", default=None,
-                       help="synopsis: Ollama TEXT model for the synopsis judge "
-                            "(default a text model, NOT the --vlm-model)")
+                       help="synopsis: TEXT model for the synopsis judge (default "
+                            "a text model, NOT the --vlm-model). A `claude-*` id "
+                            "(e.g. claude-sonnet-5) routes to the Anthropic API "
+                            "via ANTHROPIC_API_KEY instead of Ollama.")
+    p_run.add_argument("--retranscribe", action="store_true",
+                       help="synopsis: force fresh whisper transcription, ignoring "
+                            "any cached transcript (default: reuse the stored one)")
     p_run.add_argument("--synopsis-source", choices=["auto", "wikipedia", "tmdb"],
                        default="auto",
                        help="synopsis: which plot summary to judge against "

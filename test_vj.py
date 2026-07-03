@@ -204,6 +204,115 @@ class StreamSignatureComputeTests(Base):
         self.assertIn("extra", row["reason"])
 
 
+class SynopsisGuardTests(Base):
+    def test_multi_episode_title_is_skipped_not_transcribed(self):
+        # three ~22-min episodes + one ~44-min play-all, all episode-candidates.
+        # The play-all holds two episodes' dialogue, so the synopsis path must
+        # skip it (not full-transcribe 44 min and match it to one episode).
+        state.upsert_episodes(
+            self.conn, [ep(1, k, f"E{k}", 1320.0) for k in range(1, 4)])
+        ts = [Title(id=k, duration=1320.0, chapters=[1320.0], n_audio=2, n_sub=1,
+                    kind="episode-candidate") for k in range(1, 4)]
+        ts.append(Title(id=9, duration=2640.0, chapters=[2640.0], n_audio=2,
+                        n_sub=1, kind="episode-candidate"))   # 2× play-all
+        did = self.add_disc(ts)
+
+        transcribed = []
+        orig_ft, orig_rc = compute.full_transcript, compute.rank_candidates
+        compute.full_transcript = lambda disc, title, wd: (
+            transcribed.append(title.id) or f"dialogue {title.id}")
+        compute.rank_candidates = lambda tr, pool, model, host: ([(pool[0], 6)], "ev")
+        try:
+            args = auto_args(disc=did, title=None, all=False, judge_model=None,
+                             synopsis_windows=None, synopsis_length=None,
+                             retranscribe=False, synopsis_source="tmdb",
+                             include_specials=False)
+            res = compute.run_synopsis(self.conn, args)
+        finally:
+            compute.full_transcript, compute.rank_candidates = orig_ft, orig_rc
+
+        self.assertTrue(res["ok"])
+        self.assertEqual(sorted(transcribed), [1, 2, 3])   # play-all never ripped
+        tid9 = state.title_id(self.conn, did, 9)
+        ev = [e for e in state.evidence_for_title(self.conn, tid9)
+              if e["category"] == "synopsis"][0]
+        self.assertIn("multi-episode", ev["verdict"])
+        self.assertIsNone(ev["episode_id"])                # no identity claimed
+
+    def test_no_guard_below_three_targets(self):
+        # with <3 candidates there's no stable median, so nothing is guarded
+        state.upsert_episodes(
+            self.conn, [ep(1, k, f"E{k}", 1320.0) for k in range(1, 3)])
+        ts = [Title(id=1, duration=1320.0, chapters=[1320.0], n_audio=2, n_sub=1,
+                    kind="episode-candidate"),
+              Title(id=2, duration=5000.0, chapters=[5000.0], n_audio=2, n_sub=1,
+                    kind="episode-candidate")]
+        did = self.add_disc(ts)
+        transcribed = []
+        orig_ft, orig_rc = compute.full_transcript, compute.rank_candidates
+        compute.full_transcript = lambda disc, title, wd: (
+            transcribed.append(title.id) or f"d{title.id}")
+        compute.rank_candidates = lambda tr, pool, model, host: ([(pool[0], 6)], "ev")
+        try:
+            compute.run_synopsis(self.conn, auto_args(
+                disc=did, title=None, all=False, judge_model=None,
+                synopsis_windows=None, synopsis_length=None, retranscribe=False,
+                synopsis_source="tmdb", include_specials=False))
+        finally:
+            compute.full_transcript, compute.rank_candidates = orig_ft, orig_rc
+        self.assertEqual(sorted(transcribed), [1, 2])      # both transcribed
+
+
+class BackgroundHintTests(Base):
+    def test_parse_ranges(self):
+        self.assertEqual(vj._parse_ranges("1-4,6,8-9"), [1, 2, 3, 4, 6, 8, 9])
+        self.assertEqual(vj._parse_ranges("3"), [3])
+        self.assertEqual(vj._parse_ranges(" 2 , 1 "), [1, 2])   # order/space-tolerant
+        with self.assertRaises(ValueError):
+            vj._parse_ranges("4-1")                             # backwards
+
+    def test_background_roundtrip_and_survives_rescan(self):
+        state.set_background(self.conn, "s1d1", [(1, 3), (1, 4)])
+        self.assertEqual(state.get_background(self.conn, "s1d1"), [(1, 3), (1, 4)])
+        # a re-scan DELETEs+recreates the disc row; the basename-keyed hint stays
+        self.add_disc([title(1, 1320, [1320])], path="/d/s1d1.iso")
+        self.add_disc([title(1, 1320, [1320])], path="/d/s1d1.iso")
+        self.assertEqual(state.get_background(self.conn, "s1d1"), [(1, 3), (1, 4)])
+
+    def test_hint_steers_run_align(self):
+        # 4 same-runtime episodes; a 2-title disc the box says holds E3,E4
+        state.upsert_episodes(
+            self.conn, [ep(1, k, f"E{k}", 1320.0) for k in range(1, 5)])
+        # same total runtime (so alignment is ambiguous) but distinct chapter
+        # layouts (so they aren't taken for duplicates and junked)
+        did = self.add_disc([title(1, 1320, [660, 660]),
+                             title(2, 1320, [440, 440, 440])],
+                            path="/d/THE_SHOW_S1D2.iso")
+        state.set_background(self.conn, state.disc_name("/d/THE_SHOW_S1D2.iso"),
+                            [(1, 3), (1, 4)])
+        compute.run_align(self.conn, args=None)
+        got = []
+        for tno in (1, 2):
+            tid = state.title_id(self.conn, did, tno)
+            row = [x for x in state.evidence_for_title(self.conn, tid)
+                   if x["category"] == "runtime-align"][0]
+            got.append(row["ep_number"])
+        self.assertEqual(sorted(got), [3, 4])
+
+    def test_status_flags_assignment_outside_packaging(self):
+        state.upsert_episodes(
+            self.conn, [ep(1, k, f"E{k}", 1320.0) for k in range(1, 5)])
+        did = self.add_disc([title(1, 1320, [1320])], path="/d/s1d1.iso")
+        tid = state.title_id(self.conn, did, 1)
+        # box says E3-E4, but an assignment lands on E1 -> surfaced as 'outside'
+        state.set_background(self.conn, "s1d1", [(1, 3), (1, 4)])
+        state.set_assignment(self.conn, tid, [state.episode_id(self.conn, 1, 1)],
+                             status="proposed", decided_by="heuristic:align")
+        pkg = {p["disc"]: p for p in review.summarize(self.conn)["packaging"]}
+        self.assertEqual(pkg["s1d1"]["outside"], [[1, 1]])
+        self.assertIn([1, 3], pkg["s1d1"]["missing"])
+
+
 class PoolTests(Base):
     def test_include_specials_widens_season_pool(self):
         from discs import Disc

@@ -667,6 +667,31 @@ class AlignAnchorTest(unittest.TestCase):
         self.assertEqual([x.episodes[0].number for x in a1[0]],
                          [x.episodes[0].number for x in a2[0]])
 
+    def test_background_hint_steers_among_same_runtime(self):
+        # 4 identical-runtime episodes, a 2-title disc: the soft packaging hint
+        # decides WHICH pair (the ambiguity it exists to break), in either
+        # direction — so this proves it steers, not just a fixed default.
+        eps = [ie.Episode(1, k, f"E{k}", 1320) for k in range(1, 5)]
+        d = disc([], fmt="bluray")
+        cands = [(d, title(i, 1320)) for i in range(2)]
+        lo = sorted(a.episodes[0].number for a in
+                    ie.align(cands, eps, background={0: {0, 1}, 1: {0, 1}})[0])
+        hi = sorted(a.episodes[0].number for a in
+                    ie.align(cands, eps, background={0: {2, 3}, 1: {2, 3}})[0])
+        self.assertEqual(lo, [1, 2])
+        self.assertEqual(hi, [3, 4])
+
+    def test_background_is_soft_yields_to_hard_runtime(self):
+        # hint says E3, but E3's runtime is impossible for the title while the
+        # E1/E2 slot fits perfectly — the soft penalty yields (route outside the
+        # set on strong runtime disagreement), unlike a confirmed anchor. The two
+        # 1320s pin runtime_scale to 1.0 so the 660s E3 stays genuinely unfittable.
+        eps = [ie.Episode(1, 1, "A", 1320), ie.Episode(1, 2, "B", 1320),
+               ie.Episode(1, 3, "C", 660)]
+        d = disc([], fmt="dvd")
+        asg, _, _ = ie.align([(d, title(0, 1320))], eps, background={0: {2}})
+        self.assertNotEqual(asg[0].episodes[0].number, 3)   # didn't force the hint
+
     def _clip_asg(self, d, tid, rt, clips, num):
         t = title(tid, rt)
         t.clips = clips
@@ -1142,6 +1167,82 @@ class AssignBySynopsisTest(unittest.TestCase):
     def test_empty_rows(self):
         import synopsis
         self.assertEqual(synopsis.assign_by_synopsis([], self._eps([1])), {})
+
+
+class JudgeBackendTest(unittest.TestCase):
+    """The judge dispatch: a `claude-*` model id routes to the Anthropic backend,
+    anything else to Ollama. We stub both HTTP layers so no network is touched."""
+
+    def test_claude_id_routes_to_anthropic(self):
+        import synopsis
+        seen = {}
+        orig = synopsis._anthropic_text
+        synopsis._anthropic_text = lambda m, p: seen.setdefault("model", m) or "{}"
+        try:
+            synopsis._ollama_text("claude-sonnet-5", "hi", "http://x")
+        finally:
+            synopsis._anthropic_text = orig
+        self.assertEqual(seen["model"], "claude-sonnet-5")
+
+    def test_non_claude_stays_on_ollama(self):
+        import synopsis
+        # An Anthropic call would raise (no key path taken); prove it's NOT called
+        # by making it explode and asserting the ollama HTTP path is what runs.
+        synopsis._anthropic_text  # exists
+        calls = {}
+
+        class FakeResp:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self): return b'{"message": {"content": "{}"}}'
+
+        import urllib.request
+        orig = urllib.request.urlopen
+        urllib.request.urlopen = lambda req, timeout=0: (
+            calls.setdefault("url", req.full_url), FakeResp())[1]
+        try:
+            synopsis._ollama_text("qwen2.5:14b-instruct", "hi", "http://h")
+        finally:
+            urllib.request.urlopen = orig
+        self.assertIn("/api/chat", calls["url"])
+
+
+class TranscriptCacheTest(unittest.TestCase):
+    """The whisper transcript is cached in the DB keyed by its sampling params,
+    so a re-run (e.g. to swap the judge) reuses it — but a change to the sampling
+    is a miss that forces a fresh transcription."""
+
+    def _db(self):
+        import state
+        conn = state.connect(":memory:")
+        conn.execute("INSERT INTO disc(id,path,format) VALUES(1,'/d','bluray')")
+        conn.execute("INSERT INTO title(id,disc_id,title_number,duration) "
+                     "VALUES(10,1,1,1500.0)")
+        conn.commit()
+        return state, conn
+
+    def test_roundtrip_and_param_match(self):
+        state, conn = self._db()
+        self.assertIsNone(state.get_transcript(conn, 10))
+        state.put_transcript(conn, 10, "hello world", windows=3, length=40.0)
+        self.assertEqual(state.get_transcript(conn, 10), "hello world")
+        # same params -> hit; different windows or length -> miss
+        self.assertEqual(state.get_transcript(conn, 10, 3, 40.0), "hello world")
+        self.assertIsNone(state.get_transcript(conn, 10, 6, 40.0))
+        self.assertIsNone(state.get_transcript(conn, 10, 3, 60.0))
+
+    def test_upsert_replaces(self):
+        state, conn = self._db()
+        state.put_transcript(conn, 10, "old", 3, 40.0)
+        state.put_transcript(conn, 10, "new", 6, 30.0)
+        self.assertEqual(state.get_transcript(conn, 10, 6, 30.0), "new")
+
+    def test_cascades_on_title_delete(self):
+        state, conn = self._db()
+        state.put_transcript(conn, 10, "gone soon", 3, 40.0)
+        conn.execute("DELETE FROM disc WHERE id=1")  # cascade disc->title->transcript
+        conn.commit()
+        self.assertIsNone(state.get_transcript(conn, 10))
 
 
 class SpreadFractionsTest(unittest.TestCase):

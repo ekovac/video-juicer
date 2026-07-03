@@ -105,6 +105,24 @@ CREATE TABLE IF NOT EXISTS assignment (
     decided_at       TEXT
 );
 
+CREATE TABLE IF NOT EXISTS background (
+    disc_name     TEXT PRIMARY KEY,     -- canonical disc basename (state.disc_name)
+    episodes_json TEXT NOT NULL,        -- [[season, number], …] the box says are here
+    source        TEXT,                 -- provenance, e.g. 'packaging'
+    updated_at    TEXT
+    -- NOT keyed to disc.id and NOT cascaded: human-entered packaging knowledge
+    -- must survive a re-scan (which DELETEs+recreates the disc row). Looked up by
+    -- basename — the canonical disc identity — so a re-scanned disc re-adopts it.
+);
+
+CREATE TABLE IF NOT EXISTS transcript (
+    title_id     INTEGER PRIMARY KEY REFERENCES title(id) ON DELETE CASCADE,
+    text         TEXT NOT NULL,         -- joined whisper transcript of the samples
+    windows      INTEGER NOT NULL,      -- sampling params it was produced with:
+    length       REAL NOT NULL,         --   reuse only when both still match
+    updated_at   TEXT
+);
+
 CREATE TABLE IF NOT EXISTS frame (
     title_id     INTEGER NOT NULL REFERENCES title(id) ON DELETE CASCADE,
     category     TEXT NOT NULL,        -- the OCR-family source that read it
@@ -337,6 +355,73 @@ def set_classification(conn: sqlite3.Connection, disc_id: int,
         "UPDATE title SET kind=?, order_key=? WHERE disc_id=? AND title_number=?",
         [(t.kind, t.order_key, disc_id, t.id) for t in titles],
     )
+    conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# background (soft packaging knowledge: which episodes a disc holds; per basename)
+# ---------------------------------------------------------------------------
+
+
+def set_background(conn: sqlite3.Connection, disc_name: str,
+                   episodes: list[tuple[int, int]], source: str = "packaging") -> None:
+    """Assert which (season, number) episodes a disc holds, per box packaging.
+    Keyed by canonical basename so it survives a re-scan (see the table note)."""
+    conn.execute(
+        "INSERT INTO background(disc_name,episodes_json,source,updated_at) "
+        "VALUES(?,?,?,?) ON CONFLICT(disc_name) DO UPDATE SET "
+        "episodes_json=excluded.episodes_json, source=excluded.source, "
+        "updated_at=excluded.updated_at",
+        (disc_name, json.dumps([[s, n] for s, n in episodes]), source, _now(conn)))
+    conn.commit()
+
+
+def get_background(conn: sqlite3.Connection,
+                   disc_name: str) -> Optional[list[tuple[int, int]]]:
+    """The asserted (season, number) episodes for a disc basename, or None."""
+    r = conn.execute("SELECT episodes_json FROM background WHERE disc_name=?",
+                     (disc_name,)).fetchone()
+    return [tuple(x) for x in json.loads(r["episodes_json"])] if r else None
+
+
+def all_background(conn: sqlite3.Connection) -> dict:
+    """{disc_name: [(season, number), …]} for every asserted disc."""
+    return {r["disc_name"]: [tuple(x) for x in json.loads(r["episodes_json"])]
+            for r in conn.execute("SELECT disc_name,episodes_json FROM background")}
+
+
+# ---------------------------------------------------------------------------
+# transcripts (one per title; the expensive whisper output, judge-independent)
+# ---------------------------------------------------------------------------
+
+
+def get_transcript(conn: sqlite3.Connection, title_id: int,
+                   windows: Optional[int] = None,
+                   length: Optional[float] = None) -> Optional[str]:
+    """The stored transcript for a title, or None. When `windows`/`length` are
+    given, only return a HIT whose sampling params match — a different sampling
+    would read different dialogue, so a mismatch is a miss (re-transcribe)."""
+    r = conn.execute("SELECT text,windows,length FROM transcript WHERE title_id=?",
+                     (title_id,)).fetchone()
+    if r is None:
+        return None
+    if windows is not None and r["windows"] != windows:
+        return None
+    if length is not None and abs(r["length"] - length) > 1e-6:
+        return None
+    return r["text"]
+
+
+def put_transcript(conn: sqlite3.Connection, title_id: int, text: str,
+                   windows: int, length: float) -> None:
+    """Persist a title's whisper transcript (+ the sampling params it used) so a
+    later run — or a human/agent — can reuse it without re-running whisper."""
+    conn.execute(
+        "INSERT INTO transcript(title_id,text,windows,length,updated_at) "
+        "VALUES(?,?,?,?,?) ON CONFLICT(title_id) DO UPDATE SET "
+        "text=excluded.text, windows=excluded.windows, length=excluded.length, "
+        "updated_at=excluded.updated_at",
+        (title_id, text, windows, length, _now(conn)))
     conn.commit()
 
 

@@ -15,6 +15,7 @@ Categories written here:
 from __future__ import annotations
 
 import json
+import statistics
 import tempfile
 from collections import defaultdict
 from pathlib import Path
@@ -24,7 +25,9 @@ from discs import Assignment, Disc, Episode, group_discs, log
 from identify import (align, classify_disc, recover_by_elimination,
                       stream_signature, verify_title)
 import synopsis
-from synopsis import assign_by_synopsis, transcribe_and_rank
+from synopsis import (assign_by_synopsis, full_transcript, rank_candidates,
+                      sample_transcript,
+                      transcribe_and_rank)  # noqa: F401 (public re-export)
 
 # Map align's confidence label to a numeric evidence confidence.
 _CONF = {"high": 0.9, "medium": 0.6, "low": 0.3}
@@ -137,7 +140,22 @@ def run_align(conn, args) -> dict:
                 if j is not None:
                     anchors[ci] = j
         n_anchor += len(anchors)
-        assignments, leftovers, _missed = align(cands, pool, anchors=anchors)
+
+        # soft packaging constraint: each candidate on a disc with an asserted
+        # episode set may only route (cheaply) onto those episodes' pool indices.
+        background = {}
+        for ci, (d, _t) in enumerate(cands):
+            asserted = state.get_background(conn, state.disc_name(d.path))
+            if asserted:
+                allowed = {ep_index[key] for key in asserted if key in ep_index}
+                if allowed:
+                    background[ci] = allowed
+        if background:
+            log.info("season %s: %d candidate(s) constrained by packaging hints",
+                     season, len(background))
+
+        assignments, leftovers, _missed = align(cands, pool, anchors=anchors,
+                                                 background=background)
 
         for a in assignments:
             tid = _title_db_id(conn, path2id, a.disc, a.title)
@@ -387,27 +405,88 @@ def run_synopsis(conn, args) -> dict:
             e.wiki_overview = ""
 
     model = getattr(args, "judge_model", None) or synopsis.JUDGE_MODEL
-    fractions = synopsis.spread_fractions(
-        getattr(args, "synopsis_windows", None) or len(synopsis.SAMPLE_FRACTIONS))
-    length = getattr(args, "synopsis_length", None) or synopsis.SAMPLE_LENGTH
+    retranscribe = getattr(args, "retranscribe", False)
+    # Default: transcribe the WHOLE episode (identifying dialogue is strewn
+    # throughout, so windowing can miss it). `--synopsis-windows N` opts into the
+    # faster sampled path. The cache key records which was used — full mode is
+    # (0, 0) — so a later judge-swap run reuses the right transcript and a switch
+    # between modes is a miss that re-transcribes.
+    win_arg = getattr(args, "synopsis_windows", None)
+    full = win_arg is None
+    if full:
+        cache_windows, cache_length, fractions = 0, 0.0, None
+    else:
+        cache_windows = win_arg
+        cache_length = getattr(args, "synopsis_length", None) or synopsis.SAMPLE_LENGTH
+        fractions = synopsis.spread_fractions(cache_windows)
+
+    # Resolve every target to its (disc, title) up front so we can compute a
+    # per-disc multi-episode guard before spending any whisper time.
+    disc_cache: dict = {}
+    resolved = []      # (disc_id, tid, disc, title)
+    for disc_id, tid in targets:
+        disc = disc_cache.get(disc_id) or state.load_disc(conn, disc_id)
+        disc_cache[disc_id] = disc
+        tn = conn.execute("SELECT title_number FROM title WHERE id=?",
+                          (tid,)).fetchone()["title_number"]
+        title = next(t for t in disc.titles if t.id == tn)
+        resolved.append((disc_id, tid, disc, title))
+
+    # Multi-episode guard: a title far longer than the disc's typical candidate is
+    # a play-all / concatenation (it holds several episodes' dialogue at once), so
+    # it can't be matched to ONE episode — skip it rather than transcribe/judge it.
+    # Threshold = the disc-local median candidate duration ×1.5 (TMDB-independent).
+    # A single episode runs ≤ ~1.3× the typical one (a premiere/finale); a 2-part
+    # concatenation runs ~1.7-1.9× — so 1.5× separates them. The factor is tighter
+    # than run_streams' 1.6× on purpose: run_streams excludes play-alls BEFORE
+    # taking its median, but here they're still in the sample and inflate it, so a
+    # looser cut would let a 2-episode title slip through. Assumes real episodes
+    # are the majority (as run_streams does); needs ≥3 targets for a stable median,
+    # with fewer there's nothing to compare against so no guard.
+    disc_cap: dict = {}
+    by_disc: dict = defaultdict(list)
+    for disc_id, _tid, _disc, title in resolved:
+        by_disc[disc_id].append(title.duration)
+    for disc_id, durs in by_disc.items():
+        disc_cap[disc_id] = (statistics.median(durs) * 1.5
+                             if len(durs) >= 3 else float("inf"))
 
     # --- phase 1: transcribe + rank each title (one judge call each) ---
+    # The transcript is the expensive (CPU whisper) part and is judge-independent,
+    # so it's cached in the DB keyed by its sampling params: a second run — e.g.
+    # to swap the judge model — reuses it and only re-does the cheap judge call.
     recs = []          # (tid, season_key, pool, ranked, evidence)
-    disc_cache: dict = {}
     with tempfile.TemporaryDirectory(prefix="vj-syn-", dir=args.scratch_dir) as tmp:
         workdir = Path(tmp)
-        for disc_id, tid in targets:
-            disc = disc_cache.get(disc_id) or state.load_disc(conn, disc_id)
-            disc_cache[disc_id] = disc
-            tn = conn.execute("SELECT title_number FROM title WHERE id=?",
-                              (tid,)).fetchone()["title_number"]
-            title = next(t for t in disc.titles if t.id == tn)
+        for disc_id, tid, disc, title in resolved:
             pool = _pool_for(disc, seasons, specials, all_eps,
                              getattr(args, "include_specials", False))
-            ranked, evidence = transcribe_and_rank(
-                disc, title, pool, workdir, model, args.ollama_host,
-                fractions=fractions, length=length)
             season_key = disc.season_hint or 0
+
+            if title.duration > disc_cap.get(disc_id, float("inf")):
+                log.info("synopsis: skipping title %d (%.0fm) — multi-episode "
+                         "(> 1.5× disc median), not a single-episode target",
+                         tid, title.duration / 60)
+                recs.append((tid, season_key, pool, [],
+                             f"multi-episode title ({title.duration/60:.0f}m) — "
+                             "not a single-episode synopsis target"))
+                continue
+
+            transcript = None
+            if not retranscribe:
+                transcript = state.get_transcript(conn, tid, cache_windows, cache_length)
+            if transcript is None:
+                if full:
+                    transcript = full_transcript(disc, title, workdir)
+                else:
+                    transcript = sample_transcript(disc, title, workdir,
+                                                   fractions=fractions, length=cache_length)
+                state.put_transcript(conn, tid, transcript, cache_windows, cache_length)
+            if transcript:
+                ranked, evidence = rank_candidates(
+                    transcript, pool, model, args.ollama_host)
+            else:
+                ranked, evidence = [], "no dialogue transcribed"
             recs.append((tid, season_key, pool, ranked, evidence))
 
     # --- phase 2: per-season bijection assignment over the rankings ---
