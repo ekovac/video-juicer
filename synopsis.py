@@ -63,7 +63,6 @@ SAMPLE_LENGTH = 40.0
 # budget reasoning and can return empty content on long synopsis prompts, which
 # reads as an abstention. qwen2.5:14b answers directly with the JSON verdict.
 JUDGE_MODEL = "qwen2.5:14b-instruct"
-ACCEPT = 0.7          # min stage-1 confidence to bother running the contrast
 
 
 def _load_whisper(model_size: str = WHISPER_MODEL):
@@ -167,27 +166,36 @@ def _extract_json(text: str) -> Optional[dict]:
         return None
 
 
+# One call ranks the WHOLE candidate row (the model already sees every synopsis
+# and picks) — so a per-title ranked shortlist costs one call, not one per pair.
+# The rank is what downstream assignment keys on; the model's confidence number
+# is unreliable (0.85–0.95 on flat-wrong picks), the ordering far less so.
+RANK_TOP_K = 6
+
 _STAGE1 = """You are given a dialogue transcript sampled from one unknown TV \
 episode, and a numbered list of candidate episodes with their plot synopses.
 
-Decide which single candidate the transcript most plausibly belongs to. The \
-dialogue will NOT quote the synopsis — judge by whether the events, places and \
-situations in the transcript are CONSISTENT with a synopsis.
+Rank the candidates the transcript most plausibly belongs to, best first, up to \
+{k}. The dialogue will NOT quote the synopsis — judge by whether the events, \
+places and situations in the transcript are CONSISTENT with a synopsis. Even \
+when one candidate clearly fits best, ALSO list your next 2-3 most plausible as \
+lower-ranked entries — a later step assigns each episode to at most one title, \
+so a ranked backup lets a title recover when its top pick is claimed by a better \
+match. Only list candidates with a genuine episode-specific match; return [] if \
+none fits.
 
-CRITICAL: series regulars (main characters who appear in every episode) are NOT \
-evidence. A synopsis and transcript both mentioning a lead character means \
-nothing — every episode has them. Key ONLY on details unique to one episode: \
-distinctive plot events, guest characters, specific named locations, one-off \
-objects or situations. If the transcript is production commentary (people \
-discussing making the show), or fits no synopsis distinctly better than the \
-rest on episode-specific details, choose null.
-
-Also name the SECOND most plausible candidate (never null unless you chose \
-null) — the nearest competitor — so it can be checked against the winner.
+CRITICAL: series regulars (main characters in every episode) are NOT evidence, \
+and neither is the show's recurring premise or its season-long arc — every \
+episode shares those, so they cannot rank one candidate above another. Key ONLY \
+on details unique to a single episode: distinctive plot events, guest \
+characters, specific named locations, one-off objects or situations. If the \
+transcript is production commentary, or surfaces no episode-specific detail at \
+all, return an empty ranking [].
 
 Reply with ONLY a JSON object:
-{{"choice": <candidate number or null>, "runner_up": <second-best number>, \
-"confidence": <0.0-1.0>, "evidence": "<the specific detail that decided it>"}}
+{{"ranking": [<candidate numbers, best first, at most {k}>], \
+"confidence": <0.0-1.0 for the top pick>, \
+"evidence": "<the episode-specific detail behind the top pick>"}}
 
 CANDIDATES:
 {candidates}
@@ -196,97 +204,81 @@ TRANSCRIPT:
 {transcript}
 """
 
-_STAGE2 = """A dialogue transcript from an unknown TV episode could plausibly \
-belong to one of two candidate episodes. Cite ONE concrete detail in the \
-TRANSCRIPT that fits candidate A AND rules OUT candidate B — a plot event, \
-guest character, place, or object that belongs to A's story but not B's.
 
-Anything the two episodes SHARE cannot rule anything out, so it does not count: \
-a recurring main character, the show's usual setting, or generic dialogue is \
-worthless here because it fits both A and B equally. If nothing in the \
-transcript distinguishes A from B, answer false.
-
-Reply with ONLY a JSON object:
-{{"distinguishes": <true|false>, "detail": "<the detail that fits A but not B, or ''>"}}
-
-CANDIDATE A: {a_name} — {a_overview}
-CANDIDATE B: {b_name} — {b_overview}
-
-TRANSCRIPT:
-{transcript}
-"""
-
-
-def judge_by_synopsis(transcript: str, candidates: list[Episode],
-                      model: str = JUDGE_MODEL, host: str = "http://localhost:11434",
-                      accept: float = ACCEPT
-                      ) -> tuple[Optional[Episode], float, str]:
-    """Forced-choice + abstention identity from dialogue vs season synopses.
-
-    Returns (episode, confidence, evidence) or (None, score, reason). Abstains
-    unless: stage-1 names a candidate at confidence >= accept, and a contrastive
-    stage-2 cites a detail that fits the winner AND rules out its nearest
-    competitor (so recurring cast / usual setting / generic banter can't carry a
-    match — they fit both and cancel). Only candidates with a synopsis are
-    offered."""
+def rank_candidates(transcript: str, candidates: list[Episode],
+                    model: str = JUDGE_MODEL, host: str = "http://localhost:11434",
+                    top_k: int = RANK_TOP_K) -> tuple[list, str]:
+    """One judge call → the candidates whose synopsis best fits the transcript,
+    ranked best-first. Returns ([(episode, borda_score)], evidence): score is
+    rank-derived (top_k for 1st, top_k-1 for 2nd, …) so downstream assignment
+    keys on the reliable ORDER, not the model's confidence. ([], reason) when it
+    abstains (empty ranking / no transcript / <2 synopses)."""
     pool = [e for e in candidates if e.synopsis]
     if not transcript:
-        return None, 0.0, "no transcript"
+        return [], "no transcript"
     if len(pool) < 2:
-        return None, 0.0, "need >=2 synopses to discriminate"
-
+        return [], "need >=2 synopses to discriminate"
     listing = "\n".join(
         f"{i+1}. {e.name}: {e.synopsis}" for i, e in enumerate(pool))
     reply = _ollama_text(
-        model, _STAGE1.format(candidates=listing, transcript=transcript), host)
-    obj = _extract_json(reply)
-    if not obj or obj.get("choice") in (None, "null"):
-        return None, 0.0, "judge abstained"
-    try:
-        idx = int(obj["choice"]) - 1
-    except (ValueError, TypeError):
-        return None, 0.0, "unparseable choice"
-    if not 0 <= idx < len(pool):
-        return None, 0.0, "choice out of range"
-    conf = float(obj.get("confidence") or 0.0)
-    chosen = pool[idx]
-    if conf < accept:
-        return None, conf, f"low confidence ({conf:.2f})"
-
-    # find the runner-up (nearest competitor) to contrast against
-    try:
-        ridx = int(obj.get("runner_up")) - 1
-    except (ValueError, TypeError):
-        ridx = -1
-    if not (0 <= ridx < len(pool)) or ridx == idx:
-        return None, conf, "no distinct runner-up to contrast against"
-    runner = pool[ridx]
-
-    # stage 2: the pick must be justified by a detail that fits the winner AND
-    # rules OUT the runner-up. Anything the two share (recurring cast, the usual
-    # setting, generic banter) can't discriminate, so it can't pass here — no
-    # exclusion list needed, it cancels by construction.
-    reply2 = _ollama_text(model, _STAGE2.format(
-        a_name=chosen.name, a_overview=chosen.synopsis,
-        b_name=runner.name, b_overview=runner.synopsis,
-        transcript=transcript), host)
-    obj2 = _extract_json(reply2) or {}
-    if not obj2.get("distinguishes") or not (obj2.get("detail") or "").strip():
-        return None, conf, f"stage-2: nothing distinguishes {chosen.name} from {runner.name}"
-    return chosen, conf, obj2["detail"].strip()
+        model, _STAGE1.format(candidates=listing, transcript=transcript,
+                              k=top_k), host)
+    obj = _extract_json(reply) or {}
+    ranked, seen = [], set()
+    for pos, num in enumerate(obj.get("ranking") or []):
+        try:
+            idx = int(num) - 1
+        except (ValueError, TypeError):
+            continue
+        if 0 <= idx < len(pool) and idx not in seen:
+            seen.add(idx)
+            ranked.append((pool[idx], max(1, top_k - len(ranked))))
+        if len(ranked) >= top_k:
+            break
+    return ranked, (obj.get("evidence") or "").strip() or "judge abstained"
 
 
-def identify_by_synopsis(disc: Disc, title: Title, candidates: list[Episode],
-                         workdir: Path, model: str = JUDGE_MODEL,
-                         host: str = "http://localhost:11434",
-                         fractions=SAMPLE_FRACTIONS, length=SAMPLE_LENGTH
-                         ) -> tuple[Optional[Episode], float, str]:
-    """End-to-end: sample dialogue from a title and judge it against the pool.
-
-    `fractions`/`length` set how many dialogue windows to sample and how long
-    each is — more/longer sees more of the episode at more whisper cost."""
+def transcribe_and_rank(disc: Disc, title: Title, candidates: list[Episode],
+                        workdir: Path, model: str = JUDGE_MODEL,
+                        host: str = "http://localhost:11434",
+                        fractions=SAMPLE_FRACTIONS, length=SAMPLE_LENGTH,
+                        top_k: int = RANK_TOP_K) -> tuple[list, str]:
+    """Sample a title's dialogue and rank it against the pool (one judge call).
+    Returns ([(episode, score)], evidence) — see `rank_candidates`."""
     transcript = sample_transcript(disc, title, workdir,
                                    fractions=fractions, length=length)
     if not transcript:
-        return None, 0.0, "no dialogue transcribed"
-    return judge_by_synopsis(transcript, candidates, model, host)
+        return [], "no dialogue transcribed"
+    return rank_candidates(transcript, candidates, model, host, top_k)
+
+
+def assign_by_synopsis(rows: list, episodes: list[Episode]) -> dict:
+    """Global one-episode-per-title assignment over the ranked judge scores — the
+    fix for the MAGNET failure mode where many titles independently pick the same
+    episode (its synopsis is arc-heavy). Solved as max-weight bipartite matching
+    (Hungarian) so each episode is claimed at most once.
+
+    `rows`: [(title_key, [(episode, score), …])]. Returns {title_key: (episode,
+    score, rank)} for assigned titles — ONLY shortlisted (score>0) pairs, so a
+    title whose whole shortlist is taken by better-fitting titles abstains rather
+    than being forced onto a wrong episode. Order-agnostic (Hungarian), which
+    suits the scrambled-Blu-ray case synopsis escalates for; a play-all-ordered
+    disc could instead use a monotonic DP, but that's not wired yet."""
+    from scipy.optimize import linear_sum_assignment
+    import numpy as np
+    if not rows or not episodes:
+        return {}
+    ep_idx = {(e.season, e.number): j for j, e in enumerate(episodes)}
+    score = np.zeros((len(rows), len(episodes)))
+    rank_at = {}
+    for i, (_key, ranked) in enumerate(rows):
+        for pos, (ep, s) in enumerate(ranked):
+            j = ep_idx.get((ep.season, ep.number))
+            if j is not None:
+                score[i, j] = s
+                rank_at[(i, j)] = pos + 1
+    out = {}
+    for i, j in zip(*linear_sum_assignment(-score)):   # maximise total score
+        if score[i, j] > 0:
+            out[rows[i][0]] = (episodes[j], float(score[i, j]), rank_at[(i, j)])
+    return out

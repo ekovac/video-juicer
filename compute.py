@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import tempfile
+from collections import defaultdict
 from pathlib import Path
 
 import state
@@ -23,7 +24,7 @@ from discs import Assignment, Disc, Episode, group_discs, log
 from identify import (align, classify_disc, recover_by_elimination,
                       stream_signature, verify_title)
 import synopsis
-from synopsis import identify_by_synopsis
+from synopsis import assign_by_synopsis, transcribe_and_rank
 
 # Map align's confidence label to a numeric evidence confidence.
 _CONF = {"high": 0.9, "medium": 0.6, "low": 0.3}
@@ -357,11 +358,17 @@ def run_ocr(conn, args) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# run synopsis — dialogue vs TMDB synopses -> synopsis evidence
+# run synopsis — dialogue vs episode synopses -> synopsis evidence
 # ---------------------------------------------------------------------------
 
 
 def run_synopsis(conn, args) -> dict:
+    """Identify titles by dialogue-vs-synopsis in two phases: (1) transcribe +
+    rank each title against its season's synopses — one judge call per title,
+    returning a ranked shortlist; (2) a per-SEASON global assignment (bijection)
+    over those rankings, so each episode is claimed by at most one title. Phase 2
+    is what kills the magnet failure mode of independent per-title judging (many
+    titles picking one arc-heavy episode) — see synopsis.assign_by_synopsis."""
     targets = _ocr_targets(conn, args)   # same target resolution as OCR
     if not targets:
         return {"ok": False, "error": "no-targets",
@@ -370,48 +377,68 @@ def run_synopsis(conn, args) -> dict:
     all_eps = [e for n in sorted(seasons) for e in seasons[n]] + specials
 
     # which synopsis text the judge sees: 'auto' prefers the richer Wikipedia
-    # summary (Episode.synopsis already does), 'wikipedia'/'tmdb' force one.
+    # summary (Episode.synopsis already does), 'wikipedia'/'tmdb' force one. Apply
+    # once to the shared episode objects up front.
     src = getattr(args, "synopsis_source", "auto") or "auto"
+    for e in all_eps:
+        if src == "wikipedia":
+            e.overview = ""
+        elif src == "tmdb":
+            e.wiki_overview = ""
 
-    def _apply_source(pool):
-        for e in pool:
-            if src == "wikipedia":
-                e.overview = ""            # synopsis -> wiki_overview or nothing
-            elif src == "tmdb":
-                e.wiki_overview = ""       # synopsis -> overview
-        return pool
+    model = getattr(args, "judge_model", None) or synopsis.JUDGE_MODEL
+    fractions = synopsis.spread_fractions(
+        getattr(args, "synopsis_windows", None) or len(synopsis.SAMPLE_FRACTIONS))
+    length = getattr(args, "synopsis_length", None) or synopsis.SAMPLE_LENGTH
 
-    results = []
+    # --- phase 1: transcribe + rank each title (one judge call each) ---
+    recs = []          # (tid, season_key, pool, ranked, evidence)
+    disc_cache: dict = {}
     with tempfile.TemporaryDirectory(prefix="vj-syn-", dir=args.scratch_dir) as tmp:
         workdir = Path(tmp)
         for disc_id, tid in targets:
-            disc = state.load_disc(conn, disc_id)
+            disc = disc_cache.get(disc_id) or state.load_disc(conn, disc_id)
+            disc_cache[disc_id] = disc
             tn = conn.execute("SELECT title_number FROM title WHERE id=?",
                               (tid,)).fetchone()["title_number"]
             title = next(t for t in disc.titles if t.id == tn)
-            pool = _apply_source(_pool_for(disc, seasons, specials, all_eps,
-                                 getattr(args, "include_specials", False)))
-            ep, conf, detail = identify_by_synopsis(
-                disc, title, pool, workdir,
-                getattr(args, "judge_model", None) or synopsis.JUDGE_MODEL,
-                args.ollama_host,
-                fractions=synopsis.spread_fractions(
-                    getattr(args, "synopsis_windows", None)
-                    or len(synopsis.SAMPLE_FRACTIONS)),
-                length=getattr(args, "synopsis_length", None)
-                or synopsis.SAMPLE_LENGTH)
-            ep_id = state.episode_id(conn, ep.season, ep.number) if ep else None
-            verdict = (f"S{ep.season:02d}E{ep.number:02d} ({conf:.2f}): {detail}"
-                       if ep else f"abstained: {detail}")
-            state.put_evidence(
-                conn, tid, "synopsis", episode_id=ep_id, verdict=verdict,
-                confidence=round(conf, 3),
-                payload={"detail": detail,
-                         "best_guess": (f"S{ep.season:02d}E{ep.number:02d}"
-                                        if ep else None)},
-            )
+            pool = _pool_for(disc, seasons, specials, all_eps,
+                             getattr(args, "include_specials", False))
+            ranked, evidence = transcribe_and_rank(
+                disc, title, pool, workdir, model, args.ollama_host,
+                fractions=fractions, length=length)
+            season_key = disc.season_hint or 0
+            recs.append((tid, season_key, pool, ranked, evidence))
+
+    # --- phase 2: per-season bijection assignment over the rankings ---
+    groups: dict = defaultdict(list)
+    for r in recs:
+        groups[r[1]].append(r)
+
+    results = []
+    for season_key, group in groups.items():
+        pool = group[0][2]     # season-scoped episode set (same across the group)
+        assigned = assign_by_synopsis([(tid, ranked) for tid, _, _, ranked, _
+                                       in group], pool)
+        for tid, _sk, _pool, ranked, evidence in group:
+            shortlist = [f"S{e.season:02d}E{e.number:02d}" for e, _ in ranked]
+            if tid in assigned:
+                ep, score, rank = assigned[tid]
+                ep_id = state.episode_id(conn, ep.season, ep.number)
+                conf = round(score / synopsis.RANK_TOP_K, 3)
+                verdict = (f"S{ep.season:02d}E{ep.number:02d} "
+                           f"(rank {rank}/{len(ranked)}): {evidence}")
+                payload = {"rank": rank, "assigned": True, "shortlist": shortlist,
+                           "evidence": evidence}
+            else:
+                ep_id, conf = None, 0.0
+                verdict = (f"abstained — shortlist {shortlist} taken by better "
+                           "fits" if ranked else f"abstained: {evidence}")
+                payload = {"assigned": False, "shortlist": shortlist}
+            state.put_evidence(conn, tid, "synopsis", episode_id=ep_id,
+                               verdict=verdict, confidence=conf, payload=payload)
             results.append({"title_id": tid, "verdict": verdict,
-                            "confidence": round(conf, 3)})
+                            "confidence": conf})
     return {"ok": True, "synopsis": results}
 
 

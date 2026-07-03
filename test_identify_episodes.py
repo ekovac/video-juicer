@@ -1115,6 +1115,35 @@ class VerifyAssignmentTest(unittest.TestCase):
         self.assertEqual([e.number for e in a.episodes], [5])
 
 
+class AssignBySynopsisTest(unittest.TestCase):
+    def _eps(self, nums):
+        return [ie.Episode(3, n, f"E{n}", 2640.0, overview="x") for n in nums]
+
+    def test_kills_the_magnet(self):
+        import synopsis
+        e9, e2, e7 = self._eps([9, 2, 7])
+        # three titles all rank E9 first (the magnet) with different backups
+        rows = [("t1", [(e9, 6), (e2, 5)]),
+                ("t2", [(e9, 6), (e7, 5)]),
+                ("t3", [(e9, 6), (e2, 5), (e7, 4)])]
+        got = {k: v[0].number for k, v in
+               synopsis.assign_by_synopsis(rows, [e9, e2, e7]).items()}
+        self.assertEqual(len(set(got.values())), 3)          # all distinct
+        self.assertEqual(sum(1 for n in got.values() if n == 9), 1)  # E9 once
+
+    def test_taken_shortlist_abstains(self):
+        import synopsis
+        e1, e2 = self._eps([1, 2])
+        rows = [("t1", [(e1, 6)]), ("t2", [(e1, 6)]), ("t3", [(e1, 6)])]
+        a = synopsis.assign_by_synopsis(rows, [e1, e2])
+        self.assertEqual(len(a), 1)          # only one can hold E1; others abstain
+        self.assertEqual(next(iter(a.values()))[0].number, 1)
+
+    def test_empty_rows(self):
+        import synopsis
+        self.assertEqual(synopsis.assign_by_synopsis([], self._eps([1])), {})
+
+
 class SpreadFractionsTest(unittest.TestCase):
     def test_spread(self):
         import synopsis
