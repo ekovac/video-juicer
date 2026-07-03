@@ -441,6 +441,19 @@ a 2-stage LLM judge matches the dialogue against each candidate's plot synopsis.
   `run_synopsis` had defaulted the judge to `--vlm-model` (a 2B *vision* model) —
   fixed. Judge accuracy is also model-sensitive: qwen2.5:14b got E01 where a
   weaker model didn't.
+- **Magnet failure mode — synopsis is a corroborator, not a reliable identifier
+  on ensemble shows.** Full-series Magicians run (Wikipedia source, qwen2.5:14b):
+  AGREE 38 / DIFFER 25 / abstain 30 vs the metadata order. But the DIFFERs are
+  mostly noise: each title is judged INDEPENDENTLY, so nothing stops many titles
+  claiming one episode — 14 episodes soaked up 37 titles (S03E09 alone picked by
+  6), because episodes whose synopsis is heavy on shared season-arc vocabulary
+  (Fillory, the Beast, the main quest) match lots of dialogue. So: trust an AGREE
+  as a confidence boost (S1 order was effectively confirmed), but do NOT treat
+  the raw DIFFER list as a worklist. **The fix (not yet built): a global
+  one-episode-per-title constraint** — solve each disc/season as a bijection
+  (assignment problem) over the judge's per-title scores, the analog of `align`'s
+  monotonic DP and the OCR collision pass. Without it, independent judging always
+  admits magnets. (Added to Future features.)
 
 ## Output / rip workflow
 
@@ -552,6 +565,13 @@ a 2-stage LLM judge matches the dialogue against each candidate's plot synopsis.
     party.
   - Whisper (synopsis transcription) is local `faster-whisper`, not Ollama — leave
     it local (cheap/fast); no reason to route it through a remote backend.
+- **Synopsis bijection constraint (kill the magnet failure mode).** `run synopsis`
+  judges every title independently, so several titles can claim one episode
+  (Magicians: S03E09 picked by 6). Add a per-disc/-season global assignment pass —
+  each candidate episode claimed by at most one title, solved as a bijection over
+  the judge's scores (Hungarian / DP), like `align` and the OCR collision
+  resolution. This is what turns synopsis from a corroborator into a usable
+  order-verifier on ensemble shows. See the synopsis note for the observed data.
 
 ## Claude self-inflicted workflow traps (don't repeat)
 
