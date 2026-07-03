@@ -117,9 +117,10 @@ CREATE TABLE IF NOT EXISTS background (
 
 CREATE TABLE IF NOT EXISTS transcript (
     title_id     INTEGER PRIMARY KEY REFERENCES title(id) ON DELETE CASCADE,
-    text         TEXT NOT NULL,         -- joined whisper transcript of the samples
-    windows      INTEGER NOT NULL,      -- sampling params it was produced with:
+    text         TEXT NOT NULL,         -- the title's dialogue text
+    windows      INTEGER NOT NULL,      -- audio sampling params it was made with:
     length       REAL NOT NULL,         --   reuse only when both still match
+    source       TEXT NOT NULL DEFAULT 'audio',  -- 'subtitle' (CC) | 'audio' (whisper)
     updated_at   TEXT
 );
 
@@ -176,6 +177,10 @@ def _migrate(conn: sqlite3.Connection) -> None:
     if "wiki_overview" not in have:
         conn.execute("ALTER TABLE episode ADD COLUMN "
                      "wiki_overview TEXT NOT NULL DEFAULT ''")
+    tcols = {r["name"] for r in conn.execute("PRAGMA table_info(transcript)")}
+    if tcols and "source" not in tcols:
+        conn.execute("ALTER TABLE transcript ADD COLUMN "
+                     "source TEXT NOT NULL DEFAULT 'audio'")
 
 
 def _now(conn: sqlite3.Connection) -> str:
@@ -397,13 +402,17 @@ def all_background(conn: sqlite3.Connection) -> dict:
 
 def get_transcript(conn: sqlite3.Connection, title_id: int,
                    windows: Optional[int] = None,
-                   length: Optional[float] = None) -> Optional[str]:
-    """The stored transcript for a title, or None. When `windows`/`length` are
-    given, only return a HIT whose sampling params match — a different sampling
-    would read different dialogue, so a mismatch is a miss (re-transcribe)."""
-    r = conn.execute("SELECT text,windows,length FROM transcript WHERE title_id=?",
-                     (title_id,)).fetchone()
+                   length: Optional[float] = None,
+                   source: Optional[str] = None) -> Optional[str]:
+    """The stored transcript for a title, or None. When given, only return a HIT
+    whose `source` and (for audio) sampling params match — a different source or
+    sampling reads different dialogue, so a mismatch is a miss (re-extract)."""
+    r = conn.execute(
+        "SELECT text,windows,length,source FROM transcript WHERE title_id=?",
+        (title_id,)).fetchone()
     if r is None:
+        return None
+    if source is not None and (r["source"] or "audio") != source:
         return None
     if windows is not None and r["windows"] != windows:
         return None
@@ -413,15 +422,17 @@ def get_transcript(conn: sqlite3.Connection, title_id: int,
 
 
 def put_transcript(conn: sqlite3.Connection, title_id: int, text: str,
-                   windows: int, length: float) -> None:
-    """Persist a title's whisper transcript (+ the sampling params it used) so a
-    later run — or a human/agent — can reuse it without re-running whisper."""
+                   windows: int, length: float, source: str = "audio") -> None:
+    """Persist a title's dialogue text (+ how it was produced) so a later run — or
+    a human/agent — can reuse it without re-extracting. `source` is 'subtitle'
+    (closed captions) or 'audio' (whisper); `windows`/`length` are the audio
+    sampling params (0/0 for a full pass or a subtitle transcript)."""
     conn.execute(
-        "INSERT INTO transcript(title_id,text,windows,length,updated_at) "
-        "VALUES(?,?,?,?,?) ON CONFLICT(title_id) DO UPDATE SET "
+        "INSERT INTO transcript(title_id,text,windows,length,source,updated_at) "
+        "VALUES(?,?,?,?,?,?) ON CONFLICT(title_id) DO UPDATE SET "
         "text=excluded.text, windows=excluded.windows, length=excluded.length, "
-        "updated_at=excluded.updated_at",
-        (title_id, text, windows, length, _now(conn)))
+        "source=excluded.source, updated_at=excluded.updated_at",
+        (title_id, text, windows, length, source, _now(conn)))
     conn.commit()
 
 

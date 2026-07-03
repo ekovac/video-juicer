@@ -26,7 +26,8 @@ from identify import (align, classify_disc, recover_by_elimination,
                       stream_signature, verify_title)
 import synopsis
 from synopsis import (assign_by_synopsis, full_transcript, rank_candidates,
-                      sample_transcript,
+                      sample_transcript, subtitle_ocr_transcript,
+                      subtitle_transcript,
                       transcribe_and_rank)  # noqa: F401 (public re-export)
 
 # Map align's confidence label to a numeric evidence confidence.
@@ -406,6 +407,10 @@ def run_synopsis(conn, args) -> dict:
 
     model = getattr(args, "judge_model", None) or synopsis.JUDGE_MODEL
     retranscribe = getattr(args, "retranscribe", False)
+    # Where the dialogue TEXT comes from. 'auto' prefers SUBTITLES (DVD closed
+    # captions — exact words, whole episode, near-instant, no OCR) and falls back
+    # to whisper audio when a title has none; 'subtitle'/'audio' force one.
+    tsrc = getattr(args, "transcript_source", "auto") or "auto"
     # Default: transcribe the WHOLE episode (identifying dialogue is strewn
     # throughout, so windowing can miss it). `--synopsis-windows N` opts into the
     # faster sampled path. The cache key records which was used — full mode is
@@ -419,6 +424,22 @@ def run_synopsis(conn, args) -> dict:
         cache_windows = win_arg
         cache_length = getattr(args, "synopsis_length", None) or synopsis.SAMPLE_LENGTH
         fractions = synopsis.spread_fractions(cache_windows)
+
+    def _audio(d, t, w):
+        return (full_transcript(d, t, w) if full
+                else sample_transcript(d, t, w, fractions=fractions, length=cache_length))
+
+    # Preference-ordered transcript methods for the requested source, each tagged
+    # with its cache key (source, sampling params). 'auto' tries closed captions
+    # (DVD text, instant) → bitmap-subtitle OCR (PGS/VOBSUB via PP-OCR, exact) →
+    # whisper audio. Each extractor self-selects by disc format, returning "" when
+    # it doesn't apply so the chain falls through.
+    methods = []   # (source, cache_windows, cache_length, extractor)
+    if tsrc in ("auto", "subtitle"):
+        methods.append(("cc", 0, 0.0, subtitle_transcript))
+        methods.append(("subtitle-ocr", 0, 0.0, subtitle_ocr_transcript))
+    if tsrc in ("auto", "audio"):
+        methods.append(("audio", cache_windows, cache_length, _audio))
 
     # Resolve every target to its (disc, title) up front so we can compute a
     # per-disc multi-episode guard before spending any whisper time.
@@ -451,11 +472,12 @@ def run_synopsis(conn, args) -> dict:
         disc_cap[disc_id] = (statistics.median(durs) * 1.5
                              if len(durs) >= 3 else float("inf"))
 
-    # --- phase 1: transcribe + rank each title (one judge call each) ---
-    # The transcript is the expensive (CPU whisper) part and is judge-independent,
-    # so it's cached in the DB keyed by its sampling params: a second run — e.g.
-    # to swap the judge model — reuses it and only re-does the cheap judge call.
-    recs = []          # (tid, season_key, pool, ranked, evidence)
+    # --- phase 1: get dialogue text + rank each title (one judge call each) ---
+    # The transcript (subtitle or whisper) is the expensive part and is
+    # judge-independent, so it's cached in the DB keyed by (source, sampling
+    # params): a second run — e.g. to swap the judge model — reuses it and only
+    # re-does the cheap judge call.
+    recs = []          # (tid, season_key, pool, ranked, evidence, source)
     with tempfile.TemporaryDirectory(prefix="vj-syn-", dir=args.scratch_dir) as tmp:
         workdir = Path(tmp)
         for disc_id, tid, disc, title in resolved:
@@ -469,25 +491,34 @@ def run_synopsis(conn, args) -> dict:
                          tid, title.duration / 60)
                 recs.append((tid, season_key, pool, [],
                              f"multi-episode title ({title.duration/60:.0f}m) — "
-                             "not a single-episode synopsis target"))
+                             "not a single-episode synopsis target", None))
                 continue
 
-            transcript = None
-            if not retranscribe:
-                transcript = state.get_transcript(conn, tid, cache_windows, cache_length)
-            if transcript is None:
-                if full:
-                    transcript = full_transcript(disc, title, workdir)
-                else:
-                    transcript = sample_transcript(disc, title, workdir,
-                                                   fractions=fractions, length=cache_length)
-                state.put_transcript(conn, tid, transcript, cache_windows, cache_length)
+            transcript, used = None, None
+            if not retranscribe:   # reuse a cached transcript for the wanted source
+                for src, cw, cl, _fn in methods:
+                    c = state.get_transcript(conn, tid, cw, cl, src)
+                    if c is not None:
+                        transcript, used = c, src
+                        break
+            if transcript is None:   # extract fresh, walking the fallback chain
+                for src, cw, cl, fn in methods:
+                    txt = fn(disc, title, workdir)
+                    if txt:
+                        transcript, used = txt, src
+                        state.put_transcript(conn, tid, txt, cw, cl, src)
+                        break
+                else:   # nothing produced text — cache empty so re-runs don't retry
+                    state.put_transcript(conn, tid, "", cache_windows, cache_length,
+                                         "audio")
+
             if transcript:
                 ranked, evidence = rank_candidates(
                     transcript, pool, model, args.ollama_host)
             else:
-                ranked, evidence = [], "no dialogue transcribed"
-            recs.append((tid, season_key, pool, ranked, evidence))
+                ranked, evidence = [], ("no subtitles found" if tsrc == "subtitle"
+                                        else "no dialogue transcribed")
+            recs.append((tid, season_key, pool, ranked, evidence, used))
 
     # --- phase 2: per-season bijection assignment over the rankings ---
     groups: dict = defaultdict(list)
@@ -497,9 +528,9 @@ def run_synopsis(conn, args) -> dict:
     results = []
     for season_key, group in groups.items():
         pool = group[0][2]     # season-scoped episode set (same across the group)
-        assigned = assign_by_synopsis([(tid, ranked) for tid, _, _, ranked, _
+        assigned = assign_by_synopsis([(tid, ranked) for tid, _, _, ranked, _, _
                                        in group], pool)
-        for tid, _sk, _pool, ranked, evidence in group:
+        for tid, _sk, _pool, ranked, evidence, src_used in group:
             shortlist = [f"S{e.season:02d}E{e.number:02d}" for e, _ in ranked]
             if tid in assigned:
                 ep, score, rank = assigned[tid]
@@ -508,16 +539,17 @@ def run_synopsis(conn, args) -> dict:
                 verdict = (f"S{ep.season:02d}E{ep.number:02d} "
                            f"(rank {rank}/{len(ranked)}): {evidence}")
                 payload = {"rank": rank, "assigned": True, "shortlist": shortlist,
-                           "evidence": evidence}
+                           "evidence": evidence, "source": src_used}
             else:
                 ep_id, conf = None, 0.0
                 verdict = (f"abstained — shortlist {shortlist} taken by better "
                            "fits" if ranked else f"abstained: {evidence}")
-                payload = {"assigned": False, "shortlist": shortlist}
+                payload = {"assigned": False, "shortlist": shortlist,
+                           "source": src_used}
             state.put_evidence(conn, tid, "synopsis", episode_id=ep_id,
                                verdict=verdict, confidence=conf, payload=payload)
             results.append({"title_id": tid, "verdict": verdict,
-                            "confidence": conf})
+                            "confidence": conf, "source": src_used})
     return {"ok": True, "synopsis": results}
 
 

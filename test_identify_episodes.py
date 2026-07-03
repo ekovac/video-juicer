@@ -1207,6 +1207,25 @@ class JudgeBackendTest(unittest.TestCase):
         self.assertIn("/api/chat", calls["url"])
 
 
+class SrtToTextTest(unittest.TestCase):
+    def test_strips_markup_dedups_rollup(self):
+        import synopsis
+        srt = ("1\n00:00:01,702 --> 00:00:03,470\n"
+               "<font face=\"Monospace\">{\\an7}KEEP IT PROFESSIONAL.</font>\n\n"
+               "2\n00:00:03,470 --> 00:00:06,406\n"
+               "KEEP IT PROFESSIONAL.\n"          # roll-up repeat -> dropped
+               "IT&#39;S MY OLD NEMESIS.\n")
+        txt = synopsis.srt_to_text(srt)
+        self.assertEqual(txt, "KEEP IT PROFESSIONAL. IT'S MY OLD NEMESIS.")
+        self.assertNotIn("-->", txt)
+        self.assertNotIn("<font", txt)
+        self.assertNotIn("{", txt)
+
+    def test_empty(self):
+        import synopsis
+        self.assertEqual(synopsis.srt_to_text(""), "")
+
+
 class TranscriptCacheTest(unittest.TestCase):
     """The whisper transcript is cached in the DB keyed by its sampling params,
     so a re-run (e.g. to swap the judge) reuses it — but a change to the sampling
@@ -1236,6 +1255,14 @@ class TranscriptCacheTest(unittest.TestCase):
         state.put_transcript(conn, 10, "old", 3, 40.0)
         state.put_transcript(conn, 10, "new", 6, 30.0)
         self.assertEqual(state.get_transcript(conn, 10, 6, 30.0), "new")
+
+    def test_source_gates_the_hit(self):
+        state, conn = self._db()
+        state.put_transcript(conn, 10, "captions", 0, 0.0, source="subtitle")
+        # asking for the subtitle source hits; asking for audio misses
+        self.assertEqual(state.get_transcript(conn, 10, source="subtitle"), "captions")
+        self.assertIsNone(state.get_transcript(conn, 10, 0, 0.0, "audio"))
+        self.assertEqual(state.get_transcript(conn, 10), "captions")  # source unset = any
 
     def test_cascades_on_title_delete(self):
         state, conn = self._db()

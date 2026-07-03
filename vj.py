@@ -978,8 +978,13 @@ def build_parser() -> argparse.ArgumentParser:
                             "(e.g. claude-sonnet-5) routes to the Anthropic API "
                             "via ANTHROPIC_API_KEY instead of Ollama.")
     p_run.add_argument("--retranscribe", action="store_true",
-                       help="synopsis: force fresh whisper transcription, ignoring "
+                       help="synopsis: force fresh transcript extraction, ignoring "
                             "any cached transcript (default: reuse the stored one)")
+    p_run.add_argument("--transcript-source", choices=["auto", "subtitle", "audio"],
+                       default="auto",
+                       help="synopsis: dialogue source — auto prefers DVD closed "
+                            "captions (exact, whole-episode, near-instant) and "
+                            "falls back to whisper audio; subtitle/audio force one")
     p_run.add_argument("--synopsis-source", choices=["auto", "wikipedia", "tmdb"],
                        default="auto",
                        help="synopsis: which plot summary to judge against "

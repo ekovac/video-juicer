@@ -24,6 +24,7 @@ so when in doubt we return nothing.
 """
 from __future__ import annotations
 
+import html
 import json
 import os
 import re
@@ -80,18 +81,24 @@ def rip_audio(disc: Disc, title: Title, start: float, length: float,
     """Rip one bounded audio-only window to 16 kHz mono wav (whisper's format).
 
     Blu-ray reads via ffmpeg's `bluray:` protocol (same as rip_window's video).
-    DVD title-audio extraction is a follow-up — libdvdread has no ffmpeg
-    protocol, so it needs a mencoder path; return None for now so the caller
-    skips DVD discs cleanly."""
+    DVD has no ffmpeg protocol (libdvdread), so it goes through mplayer's DVD
+    reader — the same `dvd://<id> -dvd-device <path>` addressing rip_window uses
+    for video — decoding the primary audio track straight to a 16 kHz mono wav
+    (`-vc null -vo null` skips the video work). `-endpos` is ABSOLUTE in mplayer
+    (unlike mencoder, where it's a length), so it's start+length here."""
     out.unlink(missing_ok=True)
-    if disc.format != "bluray":
-        log.warning("synopsis: DVD audio rip not implemented (%s title %d)",
-                    disc.path.name, title.id)
-        return None
-    cmd = ["ffmpeg", "-y", "-loglevel", "error",
-           "-playlist", str(title.id), "-ss", str(int(start)),
-           "-i", f"bluray:{disc.path}", "-t", str(int(length)),
-           "-map", "0:a:0", "-ac", "1", "-ar", "16000", str(out)]
+    if disc.format == "dvd":
+        cmd = ["mplayer", f"dvd://{title.id}", "-dvd-device", str(disc.path),
+               "-ss", str(int(start)), "-endpos", str(int(start + length)),
+               "-vc", "null", "-vo", "null",
+               "-ao", f"pcm:fast:file={out}",
+               "-format", "s16le", "-channels", "1", "-srate", "16000",
+               "-noconfig", "all", "-really-quiet"]
+    else:
+        cmd = ["ffmpeg", "-y", "-loglevel", "error",
+               "-playlist", str(title.id), "-ss", str(int(start)),
+               "-i", f"bluray:{disc.path}", "-t", str(int(length)),
+               "-map", "0:a:0", "-ac", "1", "-ar", "16000", str(out)]
     try:
         run(cmd, timeout=int(length) * 4 + 120)
     except subprocess.TimeoutExpired:
@@ -106,6 +113,139 @@ def transcribe(wav: Path, model_size: str = WHISPER_MODEL) -> str:
     model = _load_whisper(model_size)
     segments, _ = model.transcribe(str(wav), language="en", beam_size=1)
     return " ".join(s.text.strip() for s in segments).strip()
+
+
+_SRT_TAG = re.compile(r"<[^>]+>|\{[^}]*\}")   # <font…>, ASS {\an7}, etc.
+
+
+def srt_to_text(srt: str) -> str:
+    """Flatten an SRT into plain dialogue: drop index+timestamp lines, strip
+    markup, unescape entities, and collapse the roll-up caption repetition (CC
+    re-emits each line across several cues) by dropping a line identical to the
+    one before it."""
+    out: list[str] = []
+    for block in srt.replace("\r", "").split("\n\n"):
+        for row in block.splitlines():
+            if "-->" in row or row.strip().isdigit():
+                continue
+            text = html.unescape(_SRT_TAG.sub("", row)).strip()
+            if text and (not out or text != out[-1]):
+                out.append(text)
+    return " ".join(out).strip()
+
+
+def subtitle_transcript(disc: Disc, title: Title, workdir: Path) -> str:
+    """Pull the episode's dialogue from its SUBTITLES — better than whisper (exact
+    words, whole episode) and near-instant (no audio decode, no transcription).
+
+    DVD path: the MPEG-2 video carries EIA-608 closed captions as TEXT (no OCR).
+    Stream-copy the title to a local mpg (preserving the video user-data;
+    `-nosound` keeps it small) then let ffmpeg's `subcc` decoder emit an SRT.
+    Returns "" when there are no captions (→ caller falls back to audio) or on a
+    non-DVD disc — Blu-ray subtitles are PGS bitmaps (would need OCR), a follow-up."""
+    if disc.format != "dvd":
+        return ""
+    mpg = workdir / f"cc_{title.id}.mpg"
+    srt = workdir / f"cc_{title.id}.srt"
+    for p in (mpg, srt):
+        p.unlink(missing_ok=True)
+    try:
+        run(["mencoder", f"dvd://{title.id}", "-dvd-device", str(disc.path),
+             "-nosound", "-ovc", "copy", "-of", "mpeg", "-o", str(mpg),
+             "-really-quiet"], timeout=900)
+        if not (mpg.exists() and mpg.stat().st_size > 0):
+            return ""
+        # movie source exposes closed captions as a second output (subcc)
+        run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi",
+             "-i", f"movie={mpg}[out+subcc]", "-map", "0:1", str(srt)],
+            timeout=900)
+        if not srt.exists() or srt.stat().st_size == 0:
+            return ""
+        return srt_to_text(srt.read_text(errors="replace"))
+    except (subprocess.TimeoutExpired, OSError) as e:
+        log.warning("synopsis: subtitle extract failed (%s) %s title %d",
+                    e, disc.path.name, title.id)
+        return ""
+    finally:
+        for p in (mpg, srt):
+            p.unlink(missing_ok=True)
+
+
+def _probe_video_size(source: list) -> Optional[tuple]:
+    """(width, height) of the first video stream, via ffprobe (header read only)."""
+    try:
+        r = run(["ffprobe", "-hide_banner", "-v", "error", "-select_streams",
+                 "v:0", "-show_entries", "stream=width,height",
+                 "-of", "csv=p=0:s=x", *source], timeout=120)
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    parts = r.stdout.strip().split("x")
+    try:
+        return int(parts[0]), int(parts[1])
+    except (ValueError, IndexError):
+        return None
+
+
+def subtitle_ocr_transcript(disc: Disc, title: Title, workdir: Path) -> str:
+    """OCR the BITMAP subtitle track (Blu-ray PGS or DVD VOBSUB) into dialogue —
+    the fallback when there are no closed captions (BD never carries CC; some DVD
+    sets don't either). ffmpeg renders ONLY the subtitle stream onto a black
+    canvas (the video is never decoded, so it's fast), `mpdecimate` keeps just the
+    frames where the caption changed, and PP-OCR (RapidOCR) reads each — markedly
+    more accurate than tesseract, especially on low-res VOBSUB.
+
+    Blu-ray reads via the `bluray:` protocol directly; DVD has no ffmpeg protocol
+    so mplayer first dumps the title's raw program stream (which carries the
+    subpicture) to a local file. Returns "" if there's no subtitle track / OCR
+    backend, so the caller falls through to whisper."""
+    from text_region import ocr_text, paddle_available
+    if disc.format not in ("bluray", "dvd") or not paddle_available():
+        return ""
+    frames = workdir / f"subf_{title.id}"
+    frames.mkdir(exist_ok=True)
+    vob = workdir / f"sub_{title.id}.vob"
+    dur = int(title.duration) + 2 if title.duration else 3600
+    try:
+        if disc.format == "bluray":
+            src_in = ["-playlist", str(title.id), "-i", f"bluray:{disc.path}"]
+            size = _probe_video_size(["-playlist", str(title.id),
+                                      f"bluray:{disc.path}"])
+        else:   # DVD: dump the raw program stream (keeps the subpicture stream)
+            vob.unlink(missing_ok=True)
+            run(["mplayer", f"dvd://{title.id}", "-dvd-device", str(disc.path),
+                 "-dumpstream", "-dumpfile", str(vob), "-really-quiet"],
+                timeout=dur * 2 + 300)
+            if not (vob.exists() and vob.stat().st_size > 0):
+                return ""
+            src_in = ["-i", str(vob)]
+            size = _probe_video_size([str(vob)])
+        if not size:
+            return ""
+        w, h = size
+        # render subs on black, keep only changed frames (one per distinct caption)
+        run(["ffmpeg", "-hide_banner", "-y", *src_in, "-t", str(dur),
+             "-filter_complex",
+             f"color=black:s={w}x{h}:r=2[bg];[bg][0:s:0]overlay=shortest=1,mpdecimate",
+             "-fps_mode", "vfr", str(frames / "f%05d.png")],
+            timeout=dur * 3 + 300)
+        out: list[str] = []
+        for png in sorted(frames.glob("f*.png")):
+            text = " ".join(ocr_text(png).split())
+            if text and (not out or text != out[-1]):
+                out.append(text)
+        return " ".join(out).strip()
+    except (subprocess.TimeoutExpired, OSError) as e:
+        log.warning("synopsis: subtitle OCR failed (%s) %s title %d",
+                    e, disc.path.name, title.id)
+        return ""
+    finally:
+        vob.unlink(missing_ok=True)
+        for png in frames.glob("f*.png"):
+            png.unlink(missing_ok=True)
+        try:
+            frames.rmdir()
+        except OSError:
+            pass
 
 
 def full_transcript(disc: Disc, title: Title, workdir: Path) -> str:

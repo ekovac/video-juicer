@@ -71,6 +71,21 @@ def paddle_available() -> bool:
     return _rapid() is not None
 
 
+def ocr_text(img: ImageLike) -> str:
+    """Full PP-OCR recognition (det+rec) of an image → recognized text, boxes
+    joined in reading order. "" if the backend is unavailable or nothing is read.
+    Used for subtitle-bitmap OCR (PGS / VOBSUB), where PP-OCR is markedly more
+    accurate than tesseract — especially on low-res DVD VOBSUB."""
+    eng = _rapid()
+    if eng is None:
+        return ""
+    src = str(img) if isinstance(img, (str, Path)) else img
+    res, _ = eng(src)
+    if not res:
+        return ""
+    return " ".join(line[1] for line in res).strip()
+
+
 # ---------------------------------------------------------------------------
 # backend 2: EAST (cv2.dnn) — optional fallback, license-murky
 # ---------------------------------------------------------------------------

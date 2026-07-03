@@ -410,9 +410,35 @@ Three sources of canonical episode ORDER, cheapest first:
 
 `vj run synopsis` identifies a title by *content*, not position — the escalation
 for a **no-title-card, order-unverified** show (Blu-ray, same-runtime episodes;
-OCR has nothing to read). It whisper-transcribes the episode audio and a 2-stage
-LLM judge matches the dialogue against each candidate's plot synopsis.
+OCR has nothing to read). It gets the episode's dialogue as text and a 2-stage
+LLM judge matches it against each candidate's plot synopsis.
 
+- **Dialogue comes from SUBTITLES first, whisper last (`--transcript-source`,
+  default auto). The fallback chain, each tier self-selecting by disc format:**
+  1. **Closed captions (`subtitle_transcript`, DVD)** — the MPEG-2 video carries
+     EIA-608 CC as TEXT (no OCR): stream-copy the title (`mencoder -ovc copy
+     -nosound`, preserves the video user-data), `ffmpeg movie=…[out+subcc]` emits
+     an SRT, `srt_to_text` flattens it. Exact words, whole episode, ~4 s. No CC →
+     "" → next tier. (Extras carry no CC — a free episode/extra tell.)
+  2. **Bitmap-subtitle OCR (`subtitle_ocr_transcript`, DVD VOBSUB + BD PGS)** — for
+     CC-less DVDs (VB S3) and ALL Blu-ray (PGS, no CC ever). ffmpeg renders ONLY
+     the subtitle stream onto a black canvas (video never decoded, so fast),
+     `mpdecimate` keeps one frame per distinct caption, and **PP-OCR (RapidOCR,
+     the text-region detector's engine — `text_region.ocr_text`) reads each**.
+     Blu-ray reads via `bluray:` directly; DVD has no ffmpeg protocol so mplayer
+     `-dumpstream` first dumps the title's program stream (carries the subpicture).
+     **Use RapidOCR, NOT tesseract:** on low-res 480p VOBSUB tesseract garbles it
+     ("GIRLFRIEND"→"GIREERIEND", words mashed) while RapidOCR is near-exact; 1080p
+     PGS is clean on both. Cost is the OCR loop: ~335 ms/frame CPU × ~385
+     frames/episode ≈ **~2 min/episode** (vs whisper ~4-5 min, and far cleaner) —
+     onnxruntime-gpu would cut it ~10x.
+  3. **Whisper audio (`full_transcript`/`sample_transcript`)** — last resort when a
+     title has neither CC nor a subtitle track (bonus featurettes) — those usually
+     abstain in the judge anyway.
+  Cached in the `transcript` table keyed by `(source, windows, length)` — a source
+  is 'cc'/'subtitle-ocr'/'audio'. Validation (Venture Bros, Haiku judge, Wikipedia
+  synopses): **CC path S1D1 8/8, VOBSUB-OCR path S3 13/13** vs the known-correct
+  metadata order. `--transcript-source {auto,subtitle,audio}` forces a tier.
 - **Transcribe the WHOLE episode by default (2026-07); windowing is opt-in.**
   Identifying dialogue is strewn throughout an episode, so sampling a few windows
   can phase-skip the very lines that name it — proven on Magicians S1D1 title 165

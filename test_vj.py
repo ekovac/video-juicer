@@ -226,7 +226,7 @@ class SynopsisGuardTests(Base):
             args = auto_args(disc=did, title=None, all=False, judge_model=None,
                              synopsis_windows=None, synopsis_length=None,
                              retranscribe=False, synopsis_source="tmdb",
-                             include_specials=False)
+                             transcript_source="audio", include_specials=False)
             res = compute.run_synopsis(self.conn, args)
         finally:
             compute.full_transcript, compute.rank_candidates = orig_ft, orig_rc
@@ -257,7 +257,8 @@ class SynopsisGuardTests(Base):
             compute.run_synopsis(self.conn, auto_args(
                 disc=did, title=None, all=False, judge_model=None,
                 synopsis_windows=None, synopsis_length=None, retranscribe=False,
-                synopsis_source="tmdb", include_specials=False))
+                synopsis_source="tmdb", transcript_source="audio",
+                include_specials=False))
         finally:
             compute.full_transcript, compute.rank_candidates = orig_ft, orig_rc
         self.assertEqual(sorted(transcribed), [1, 2])      # both transcribed
