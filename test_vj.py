@@ -667,6 +667,21 @@ def _build_snapshot(dirpath):
     return dp / "data.xml.bz2", dp / "index.txt.bz2"
 
 
+class BoardOrderTests(Base):
+    def test_board_is_season_then_disc_order(self):
+        state.upsert_episodes(self.conn, [ep(1, 1, "A", 1320.0)])
+        # add discs out of season/disc order; scan (id) order would be S2D1,
+        # S1D2, S1D1 — board must re-sort to S1D1, S1D2, S2D1
+        self.add_disc([title(1, 1320, [660])], season_hint=2, disc_hint=1,
+                      path="/d/s2d1")
+        self.add_disc([title(1, 1320, [660])], season_hint=1, disc_hint=2,
+                      path="/d/s1d2")
+        self.add_disc([title(1, 1320, [660])], season_hint=1, disc_hint=1,
+                      path="/d/s1d1")
+        order = [(d["season"], d["disc"]) for d in review.board(self.conn)["discs"]]
+        self.assertEqual(order, [(1, "s1d1"), (1, "s1d2"), (2, "s2d1")])
+
+
 class WikiReaderTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

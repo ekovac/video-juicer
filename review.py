@@ -343,8 +343,14 @@ def board(conn, season: int | None = None, disc_id: int | None = None) -> dict:
     picture instead of stitching status+gaps+show together."""
     proj = state.get_project(conn)
     warns = {w["disc_id"]: w["reason"] for w in order_warnings(conn)}
+    # Present discs in season-then-disc order (scan/id order is meaningless to a
+    # reader); discs with no S?D? hint sort last, ties broken by scan id.
+    def _disc_key(d):
+        sh, dh = d["season_hint"], d["disc_hint"]
+        return (sh is None, sh or 0, dh is None, dh or 0, d["id"])
+
     discs = []
-    for d in state.list_discs(conn):
+    for d in sorted(state.list_discs(conn), key=_disc_key):
         if disc_id is not None and d["id"] != disc_id:
             continue
         if season is not None and d["season_hint"] != season:
