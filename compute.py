@@ -22,6 +22,7 @@ import state
 from discs import Assignment, Disc, Episode, group_discs, log
 from identify import (align, classify_disc, recover_by_elimination,
                       stream_signature, verify_title)
+import synopsis
 from synopsis import identify_by_synopsis
 
 # Map align's confidence label to a numeric evidence confidence.
@@ -379,7 +380,14 @@ def run_synopsis(conn, args) -> dict:
             pool = _pool_for(disc, seasons, specials, all_eps,
                              getattr(args, "include_specials", False))
             ep, conf, detail = identify_by_synopsis(
-                disc, title, pool, workdir, args.vlm_model, args.ollama_host)
+                disc, title, pool, workdir,
+                getattr(args, "judge_model", None) or synopsis.JUDGE_MODEL,
+                args.ollama_host,
+                fractions=synopsis.spread_fractions(
+                    getattr(args, "synopsis_windows", None)
+                    or len(synopsis.SAMPLE_FRACTIONS)),
+                length=getattr(args, "synopsis_length", None)
+                or synopsis.SAMPLE_LENGTH)
             ep_id = state.episode_id(conn, ep.season, ep.number) if ep else None
             verdict = (f"S{ep.season:02d}E{ep.number:02d} ({conf:.2f}): {detail}"
                        if ep else f"abstained: {detail}")

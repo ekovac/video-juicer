@@ -39,10 +39,20 @@ from discs import Disc, Episode, Title, log, run
 WHISPER_MODEL = "base.en"
 _whisper = None
 
-# Sample three ~40 s windows away from the cold open and end credits, where
+# Sample a few ~40 s windows away from the cold open and end credits, where
 # plot-distinctive dialogue lives (a title's first minute is often a recap /
-# "previously on", its last is credits music).
-SAMPLE_FRACTIONS = (0.2, 0.5, 0.8)
+# "previously on", its last is credits music). More/longer windows see more of
+# the synopsis's plot beats at more whisper cost — tunable per run via
+# `vj run synopsis --synopsis-windows N --synopsis-length SEC`.
+def spread_fractions(n: int) -> tuple:
+    """`n` positions evenly spread across a title's interior (avoiding the very
+    start/end): n=3 -> (0.25, 0.5, 0.75)."""
+    n = max(1, n)
+    return tuple((i + 1) / (n + 1) for i in range(n))
+
+
+SAMPLE_WINDOWS = 3
+SAMPLE_FRACTIONS = spread_fractions(SAMPLE_WINDOWS)
 SAMPLE_LENGTH = 40.0
 
 JUDGE_MODEL = "gemma4:latest"
@@ -261,10 +271,15 @@ def judge_by_synopsis(transcript: str, candidates: list[Episode],
 
 def identify_by_synopsis(disc: Disc, title: Title, candidates: list[Episode],
                          workdir: Path, model: str = JUDGE_MODEL,
-                         host: str = "http://localhost:11434"
+                         host: str = "http://localhost:11434",
+                         fractions=SAMPLE_FRACTIONS, length=SAMPLE_LENGTH
                          ) -> tuple[Optional[Episode], float, str]:
-    """End-to-end: sample dialogue from a title and judge it against the pool."""
-    transcript = sample_transcript(disc, title, workdir)
+    """End-to-end: sample dialogue from a title and judge it against the pool.
+
+    `fractions`/`length` set how many dialogue windows to sample and how long
+    each is — more/longer sees more of the episode at more whisper cost."""
+    transcript = sample_transcript(disc, title, workdir,
+                                   fractions=fractions, length=length)
     if not transcript:
         return None, 0.0, "no dialogue transcribed"
     return judge_by_synopsis(transcript, candidates, model, host)

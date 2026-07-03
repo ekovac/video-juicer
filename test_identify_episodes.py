@@ -1115,5 +1115,17 @@ class VerifyAssignmentTest(unittest.TestCase):
         self.assertEqual([e.number for e in a.episodes], [5])
 
 
+class SpreadFractionsTest(unittest.TestCase):
+    def test_spread(self):
+        import synopsis
+        self.assertEqual(synopsis.spread_fractions(1), (0.5,))
+        self.assertEqual(synopsis.spread_fractions(3), (0.25, 0.5, 0.75))
+        f = synopsis.spread_fractions(5)
+        self.assertEqual(len(f), 5)
+        self.assertTrue(all(0 < x < 1 for x in f))      # interior only
+        self.assertEqual(f, tuple(sorted(f)))           # ascending
+        self.assertEqual(synopsis.spread_fractions(0), (0.5,))  # clamps to >=1
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -786,6 +786,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--ollama-host",
                        default=os.environ.get("OLLAMA_HOST",
                                               "http://localhost:11434"))
+    p_run.add_argument("--synopsis-windows", type=int, default=None,
+                       help="synopsis: number of dialogue windows to sample per "
+                            "title (default 3); more sees more plot at more "
+                            "whisper cost")
+    p_run.add_argument("--synopsis-length", type=float, default=None,
+                       help="synopsis: seconds of audio per window (default 40)")
+    p_run.add_argument("--judge-model", default=None,
+                       help="synopsis: Ollama TEXT model for the synopsis judge "
+                            "(default a text model, NOT the --vlm-model)")
     p_run.set_defaults(func=cmd_run)
 
     p_status = sub.add_parser("status", help="coverage summary")
