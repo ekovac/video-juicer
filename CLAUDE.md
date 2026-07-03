@@ -523,6 +523,36 @@ a 2-stage LLM judge matches the dialogue against each candidate's plot synopsis.
   code/tests/docs). `.gitignore` also blocks the usual artifact patterns
   (incl. `*.db`) so a stray run in the repo dir won't pollute it.
 
+## Future features (backlog — not yet built)
+
+- **Pluggable LLM backend (OpenAI-compatible) instead of only Ollama.** There are
+  exactly two Ollama call sites, both POSTing `{host}/api/chat`:
+  `synopsis._ollama_text` (text judge) and `identify.ollama_chat` (VLM/OCR, with a
+  base64 image + `done_reason` truncation handling). The clean seam is NOT
+  "an HF backend" but an **OpenAI-compatible chat backend** (`/v1/chat/completions`,
+  `Authorization: Bearer …`, read `choices[0].message.content`) — that one adapter
+  covers HuggingFace **Inference Providers** (`https://router.huggingface.co/v1`),
+  OpenAI, Groq, Together, a local vLLM, and Ollama's own `/v1`. Select by
+  flag/env (`--llm-backend {ollama,openai}` + `VJ_LLM_BASE`/`VJ_LLM_KEY`), default
+  Ollama.
+  - **Text judge first — easy (~an afternoon), low risk, high value.** The judge
+    is model-sensitive (qwen2.5:14b got Magicians E01 where weaker models didn't),
+    so a 70B/frontier judge via a provider could push accuracy up; a bigger model
+    helps here more than anywhere. Only extra work vs. plumbing: catch HTTP
+    429/503 (rate limits) in the retry/backoff, which today only handles Ollama's
+    OOM-restart connection errors.
+  - **VLM/OCR path — moderate/hard (~+1 day), medium risk.** The API glue is easy
+    (OpenAI vision uses an `image_url` `data:` URI part), but the real cost is
+    **re-validating a hosted vision model** against the title-card corpus —
+    qwen3-vl:2B was hand-picked because moondream *described* images and qwen2.5vl
+    *translated* titles (see VLM/OCR notes). Also redo the truncation guard
+    (`finish_reason=="length"`, no separate `thinking` field), and mind that this
+    is the call-heavy path → cloud latency/per-token cost/rate limits (mitigated
+    by Tesseract-first + the text-region gate) and it ships disc frames to a third
+    party.
+  - Whisper (synopsis transcription) is local `faster-whisper`, not Ollama — leave
+    it local (cheap/fast); no reason to route it through a remote backend.
+
 ## Claude self-inflicted workflow traps (don't repeat)
 
 - `pgrep -f vj` (or `identify`) matches its **own** command line → false "already
