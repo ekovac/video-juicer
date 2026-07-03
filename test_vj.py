@@ -614,5 +614,123 @@ class PlayTests(Base):
         self.assertEqual(out["error"], "no-assignment")
 
 
+import bz2
+import wiki
+
+_EPLIST = """Lead paragraph.
+== Season 1 ==
+{{Episode table}}
+{{Episode list
+|EpisodeNumber=1
+|EpisodeNumber2=1
+|Title=Pilot
+|ShortSummary=Quentin takes a magic entrance exam and [[passes]] it.<ref>x</ref>
+}}
+{{Episode list
+|EpisodeNumber=2
+|EpisodeNumber2=2
+|Title=Second
+|ShortSummary=The students face the '''aftermath'''.
+}}
+== Season 2 ==
+{{Episode list
+|EpisodeNumber=3
+|EpisodeNumber2=1
+|Title=Return
+|ShortSummary=They return to the world.
+}}
+"""
+
+
+def _build_snapshot(dirpath):
+    """A synthetic 2-stream multistream dump + index, mirroring Wikimedia's
+    layout: independent bz2 streams concatenated, index = offset:pageid:title."""
+    def page(title, text):
+        return (f"<page><title>{title}</title><ns>0</ns><id>0</id><revision>"
+                f'<text xml:space="preserve">{text}</text></revision></page>')
+    streams = [
+        [("Alpha", "alpha body"),
+         ("List of Foo (TV series) episodes", _EPLIST)],
+        [("Beta", "beta body"), ("Foo Redirect", "#REDIRECT [[Alpha]]")],
+    ]
+    data, index, pid = b"", [], 1
+    for pages in streams:
+        offset = len(data)
+        xml = "".join(page(t, x) for t, x in pages)
+        data += bz2.compress(xml.encode("utf-8"))
+        for t, _ in pages:
+            index.append(f"{offset}:{pid}:{t}")
+            pid += 1
+    dp = Path(dirpath)
+    (dp / "data.xml.bz2").write_bytes(data)
+    (dp / "index.txt.bz2").write_bytes(bz2.compress(("\n".join(index) + "\n").encode()))
+    return dp / "data.xml.bz2", dp / "index.txt.bz2"
+
+
+class WikiReaderTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.data, self.index = _build_snapshot(self.tmp.name)
+        self.snap = wiki.MultistreamSnapshot(self.data, self.index)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_lookup_first_and_second_stream(self):
+        self.assertEqual(self.snap.article("Alpha"), "alpha body")
+        self.assertEqual(self.snap.article("Beta"), "beta body")   # 2nd stream
+
+    def test_missing_title(self):
+        self.assertIsNone(self.snap.article("Nonexistent"))
+
+    def test_redirect_followed(self):
+        self.assertEqual(self.snap.article("Foo Redirect"), "alpha body")
+
+    def test_missing_files_raise(self):
+        with self.assertRaises(wiki.SnapshotError):
+            wiki.MultistreamSnapshot("/no/data.bz2", self.index)
+
+    def test_parse_episode_summaries(self):
+        s = wiki.episode_summaries(self.snap, "List of Foo (TV series) episodes")
+        self.assertEqual(s[(1, 1)][0], "Pilot")
+        self.assertIn("entrance exam", s[(1, 1)][1])
+        self.assertNotIn("<ref>", s[(1, 1)][1])      # markup stripped
+        self.assertNotIn("'''", s[(1, 2)][1])
+        self.assertEqual(s[(2, 1)][0], "Return")     # season header tracked
+        self.assertEqual(len(s), 3)
+
+
+class EnrichTests(Base):
+    def _run_enrich(self, **kw):
+        data, index = _build_snapshot(self.tmp.name)
+        args = types.SimpleNamespace(db=self.db, source="wikipedia",
+                                     snapshot=data, index=index, json=True, **kw)
+        out_buf, err_buf = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(err_buf):
+            rc = vj.cmd_enrich(args)
+        text = out_buf.getvalue().strip() or err_buf.getvalue().strip()
+        return rc, (_json.loads(text) if text else {})
+
+    def test_enrich_populates_wiki_overview_and_remembers_page(self):
+        state.upsert_episodes(self.conn, [
+            ep(1, 1, "Pilot", 2640.0), ep(1, 2, "Second", 2640.0),
+            ep(2, 1, "Return", 2640.0)])
+        rc, out = self._run_enrich(page="List of Foo (TV series) episodes")
+        self.assertEqual(rc, 0)
+        self.assertEqual(out["updated"], 3)
+        eps = {(e.season, e.number): e for e in state.load_episodes(self.conn)}
+        self.assertIn("entrance exam", eps[(1, 1)].wiki_overview)
+        self.assertEqual(eps[(1, 1)].synopsis, eps[(1, 1)].wiki_overview)  # prefers wiki
+        # page is remembered so a re-run needs no --page
+        self.assertEqual(state.get_project(self.conn).get("wikipedia_page"),
+                         "List of Foo (TV series) episodes")
+
+    def test_enrich_without_page_errors(self):
+        state.upsert_episodes(self.conn, [ep(1, 1, "Pilot", 2640.0)])
+        rc, out = self._run_enrich(page=None)
+        self.assertEqual(rc, 1)
+        self.assertEqual(out["error"], "no-page")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -36,6 +36,7 @@ import compute
 import export as export_mod
 import review
 import state
+import wiki
 from discs import (
     Tmdb, grouped_seasons, log, scan_disc,
 )
@@ -117,6 +118,46 @@ def cmd_init(args) -> int:
                 f"  {show} ({year}) [tmdb {args.tmdb_id}]\n"
                 f"  {len(seasons)} seasons, {len(episodes)} episodes"
                 f"{f' (+{n_specials} specials)' if n_specials else ''}"))
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# enrich: richer episode synopses from a local Wikipedia dump
+# ---------------------------------------------------------------------------
+
+
+def cmd_enrich(args) -> int:
+    if not Path(args.db).exists():
+        return fail(args, "no-db", f"state file not found: {args.db} (run `init`)")
+    conn = state.connect(args.db)
+    page = args.page or state.get_project(conn).get("wikipedia_page")
+    if not page:
+        show = state.get_project(conn).get("show_name", "")
+        guess = f"List of {show} episodes" if show else ""
+        conn.close()
+        return fail(args, "no-page",
+                    "no Wikipedia page given; pass --page \"List of <Show> "
+                    f"episodes\"{f' (try: {guess!r})' if guess else ''}. It is "
+                    "remembered for next time.")
+    try:
+        snap = wiki.MultistreamSnapshot(args.snapshot, args.index)
+        summaries = wiki.episode_summaries(snap, page)
+    except wiki.SnapshotError as e:
+        conn.close()
+        return fail(args, "snapshot-error", str(e))
+
+    by_key = {k: text for k, (_name, text) in summaries.items()}
+    n = state.set_wiki_overviews(conn, by_key)
+    state.set_project(conn, wikipedia_page=page)   # remember for re-runs
+    total = len(state.load_episodes(conn))
+    conn.close()
+
+    emit(args,
+         {"ok": True, "page": page, "parsed": len(summaries),
+          "updated": n, "episodes": total},
+         human=(f"enriched {n}/{total} episodes from Wikipedia\n"
+                f"  page: {page}\n"
+                f"  parsed {len(summaries)} summaries from the dump"))
     return 0
 
 
@@ -754,6 +795,20 @@ def build_parser() -> argparse.ArgumentParser:
                         help="disc images (.iso) or backup directories")
     p_scan.set_defaults(func=cmd_scan)
 
+    p_enrich = sub.add_parser(
+        "enrich", help="add richer episode synopses from a local Wikipedia dump")
+    p_enrich.add_argument("source", choices=["wikipedia"],
+                          help="synopsis source (only 'wikipedia' for now)")
+    p_enrich.add_argument("db", type=Path, help="existing state file")
+    p_enrich.add_argument("--snapshot", type=Path, required=True,
+                          help="enwiki-<date>-pages-articles-multistream.xml.bz2")
+    p_enrich.add_argument("--index", type=Path, required=True,
+                          help="the matching …-multistream-index.txt.bz2")
+    p_enrich.add_argument("--page", default=None,
+                          help="article title (e.g. 'List of <Show> "
+                               "(American TV series) episodes'); remembered")
+    p_enrich.set_defaults(func=cmd_enrich)
+
     p_run = sub.add_parser("run", help="run a heuristic as an evidence producer")
     p_run.add_argument("heuristic", nargs="?", default=None,
                        help="align | ocr | synopsis (or --list)")
@@ -795,6 +850,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--judge-model", default=None,
                        help="synopsis: Ollama TEXT model for the synopsis judge "
                             "(default a text model, NOT the --vlm-model)")
+    p_run.add_argument("--synopsis-source", choices=["auto", "wikipedia", "tmdb"],
+                       default="auto",
+                       help="synopsis: which plot summary to judge against "
+                            "(auto = Wikipedia if enriched, else TMDB)")
     p_run.set_defaults(func=cmd_run)
 
     p_status = sub.add_parser("status", help="coverage summary")

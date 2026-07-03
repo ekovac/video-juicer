@@ -77,7 +77,8 @@ CREATE TABLE IF NOT EXISTS episode (
     number        INTEGER NOT NULL,
     name          TEXT,
     runtime       REAL,
-    overview      TEXT NOT NULL DEFAULT '',
+    overview      TEXT NOT NULL DEFAULT '',      -- TMDB synopsis
+    wiki_overview TEXT NOT NULL DEFAULT '',      -- richer Wikipedia plot summary
     aired_season  INTEGER,
     aired_number  INTEGER,
     UNIQUE(season, number)
@@ -144,8 +145,19 @@ def connect(path: str | Path) -> sqlite3.Connection:
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA journal_mode = WAL")  # concurrent readers, safe writes
     conn.executescript(SCHEMA)
+    _migrate(conn)
     conn.commit()
     return conn
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Additive column migrations for DBs created before a column existed —
+    CREATE IF NOT EXISTS never alters an existing table, so add missing columns
+    here (idempotent; safe on fresh and old DBs alike)."""
+    have = {r["name"] for r in conn.execute("PRAGMA table_info(episode)")}
+    if "wiki_overview" not in have:
+        conn.execute("ALTER TABLE episode ADD COLUMN "
+                     "wiki_overview TEXT NOT NULL DEFAULT ''")
 
 
 def _now(conn: sqlite3.Connection) -> str:
@@ -196,8 +208,23 @@ def _episode_from_row(r: sqlite3.Row) -> Episode:
     return Episode(
         season=r["season"], number=r["number"], name=r["name"],
         runtime=r["runtime"], overview=r["overview"] or "",
+        wiki_overview=(r["wiki_overview"] or "") if "wiki_overview" in r.keys() else "",
         aired_season=r["aired_season"], aired_number=r["aired_number"],
     )
+
+
+def set_wiki_overviews(conn: sqlite3.Connection,
+                       by_key: dict[tuple[int, int], str]) -> int:
+    """Write Wikipedia plot summaries onto episodes, keyed by (season, number).
+    Only touches episodes that already exist; returns the count updated."""
+    n = 0
+    for (season, number), text in by_key.items():
+        cur = conn.execute(
+            "UPDATE episode SET wiki_overview=? WHERE season=? AND number=?",
+            (text, season, number))
+        n += cur.rowcount
+    conn.commit()
+    return n
 
 
 def load_episodes(conn: sqlite3.Connection) -> list[Episode]:

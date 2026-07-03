@@ -59,9 +59,16 @@ class Episode:
     name: str
     runtime: Optional[float]     # seconds, None if TMDB has no runtime
     overview: str = ""           # TMDB synopsis (for the dialogue/synopsis judge)
+    wiki_overview: str = ""      # richer Wikipedia plot summary (vj enrich wikipedia)
     # set when an alternate episode ordering (TMDB episode group) is in use
     aired_season: Optional[int] = None
     aired_number: Optional[int] = None
+
+    @property
+    def synopsis(self) -> str:
+        """Best available plot summary: the richer Wikipedia one if enriched,
+        else the TMDB overview. The synopsis judge keys on this."""
+        return self.wiki_overview or self.overview
 
 
 @dataclass

@@ -1119,11 +1119,11 @@ class SpreadFractionsTest(unittest.TestCase):
     def test_spread(self):
         import synopsis
         self.assertEqual(synopsis.spread_fractions(1), (0.5,))
-        self.assertEqual(synopsis.spread_fractions(3), (0.25, 0.5, 0.75))
-        f = synopsis.spread_fractions(5)
-        self.assertEqual(len(f), 5)
-        self.assertTrue(all(0 < x < 1 for x in f))      # interior only
-        self.assertEqual(f, tuple(sorted(f)))           # ascending
+        self.assertEqual(synopsis.spread_fractions(3), (0.2, 0.5, 0.8))
+        f = synopsis.spread_fractions(6)
+        self.assertEqual(len(f), 6)
+        self.assertTrue(all(0.2 <= x <= 0.8 for x in f))   # stays in interior band
+        self.assertEqual(f, tuple(sorted(f)))              # ascending
         self.assertEqual(synopsis.spread_fractions(0), (0.5,))  # clamps to >=1
 
 

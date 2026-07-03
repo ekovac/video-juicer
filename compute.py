@@ -369,6 +369,18 @@ def run_synopsis(conn, args) -> dict:
     seasons, specials = _season_pools(conn)
     all_eps = [e for n in sorted(seasons) for e in seasons[n]] + specials
 
+    # which synopsis text the judge sees: 'auto' prefers the richer Wikipedia
+    # summary (Episode.synopsis already does), 'wikipedia'/'tmdb' force one.
+    src = getattr(args, "synopsis_source", "auto") or "auto"
+
+    def _apply_source(pool):
+        for e in pool:
+            if src == "wikipedia":
+                e.overview = ""            # synopsis -> wiki_overview or nothing
+            elif src == "tmdb":
+                e.wiki_overview = ""       # synopsis -> overview
+        return pool
+
     results = []
     with tempfile.TemporaryDirectory(prefix="vj-syn-", dir=args.scratch_dir) as tmp:
         workdir = Path(tmp)
@@ -377,8 +389,8 @@ def run_synopsis(conn, args) -> dict:
             tn = conn.execute("SELECT title_number FROM title WHERE id=?",
                               (tid,)).fetchone()["title_number"]
             title = next(t for t in disc.titles if t.id == tn)
-            pool = _pool_for(disc, seasons, specials, all_eps,
-                             getattr(args, "include_specials", False))
+            pool = _apply_source(_pool_for(disc, seasons, specials, all_eps,
+                                 getattr(args, "include_specials", False)))
             ep, conf, detail = identify_by_synopsis(
                 disc, title, pool, workdir,
                 getattr(args, "judge_model", None) or synopsis.JUDGE_MODEL,

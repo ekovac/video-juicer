@@ -44,18 +44,25 @@ _whisper = None
 # "previously on", its last is credits music). More/longer windows see more of
 # the synopsis's plot beats at more whisper cost — tunable per run via
 # `vj run synopsis --synopsis-windows N --synopsis-length SEC`.
-def spread_fractions(n: int) -> tuple:
-    """`n` positions evenly spread across a title's interior (avoiding the very
-    start/end): n=3 -> (0.25, 0.5, 0.75)."""
+def spread_fractions(n: int, lo: float = 0.2, hi: float = 0.8) -> tuple:
+    """`n` sampling positions evenly spread across a title's interior BAND
+    [lo, hi] (default 20%–80%), so no window falls in the cold-open "previously
+    on" recap or the end credits regardless of how many are requested:
+    n=1 -> (0.5,); n=3 -> (0.2, 0.5, 0.8); n=6 -> (0.2, 0.32, …, 0.8)."""
     n = max(1, n)
-    return tuple((i + 1) / (n + 1) for i in range(n))
+    if n == 1:
+        return ((lo + hi) / 2,)
+    return tuple(lo + (hi - lo) * i / (n - 1) for i in range(n))
 
 
 SAMPLE_WINDOWS = 3
 SAMPLE_FRACTIONS = spread_fractions(SAMPLE_WINDOWS)
 SAMPLE_LENGTH = 40.0
 
-JUDGE_MODEL = "gemma4:latest"
+# A NON-thinking instruct model: a thinking judge (e.g. gemma4) spends its token
+# budget reasoning and can return empty content on long synopsis prompts, which
+# reads as an abstention. qwen2.5:14b answers directly with the JSON verdict.
+JUDGE_MODEL = "qwen2.5:14b-instruct"
 ACCEPT = 0.7          # min stage-1 confidence to bother running the contrast
 
 
@@ -222,14 +229,14 @@ def judge_by_synopsis(transcript: str, candidates: list[Episode],
     competitor (so recurring cast / usual setting / generic banter can't carry a
     match — they fit both and cancel). Only candidates with a synopsis are
     offered."""
-    pool = [e for e in candidates if e.overview]
+    pool = [e for e in candidates if e.synopsis]
     if not transcript:
         return None, 0.0, "no transcript"
     if len(pool) < 2:
         return None, 0.0, "need >=2 synopses to discriminate"
 
     listing = "\n".join(
-        f"{i+1}. {e.name}: {e.overview}" for i, e in enumerate(pool))
+        f"{i+1}. {e.name}: {e.synopsis}" for i, e in enumerate(pool))
     reply = _ollama_text(
         model, _STAGE1.format(candidates=listing, transcript=transcript), host)
     obj = _extract_json(reply)
@@ -260,8 +267,8 @@ def judge_by_synopsis(transcript: str, candidates: list[Episode],
     # setting, generic banter) can't discriminate, so it can't pass here — no
     # exclusion list needed, it cancels by construction.
     reply2 = _ollama_text(model, _STAGE2.format(
-        a_name=chosen.name, a_overview=chosen.overview,
-        b_name=runner.name, b_overview=runner.overview,
+        a_name=chosen.name, a_overview=chosen.synopsis,
+        b_name=runner.name, b_overview=runner.synopsis,
         transcript=transcript), host)
     obj2 = _extract_json(reply2) or {}
     if not obj2.get("distinguishes") or not (obj2.get("detail") or "").strip():

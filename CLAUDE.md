@@ -39,7 +39,10 @@ Layout:
   TMDB client. `log` and `run()` live here.
 - `identify.py` — the heuristics: metadata alignment + orderability, title-card
   OCR (verify_title/ocr_identify/probe/elimination), rip-command/filename output.
-- `synopsis.py` — the dialogue→TMDB-synopsis judge (a second OCR-free identifier).
+- `synopsis.py` — the dialogue→synopsis judge (a second OCR-free identifier):
+  whisper-transcribe sampled audio windows, judge against episode synopses.
+- `wiki.py` — read episode plot summaries from a local Wikipedia **multistream**
+  dump (offline synopsis source; see the synopsis note below).
 - `state.py` — SQLite data layer (schema, row⇄dataclass mappers, evidence upsert,
   frame BLOBs, assignment ops).
 - `compute.py` — `vj run <heuristic>`: wraps the heuristics as evidence producers.
@@ -50,8 +53,10 @@ Layout:
 
 Run (per-verb; see README for the full flow): `vj init db --tmdb-id <id>` →
 `vj scan db <discs>` → `vj run align db` → `vj run streams db` (optional; flags
-episode-length extras by audio/subtitle layout) → `vj run ocr db --disc N` →
-`vj resolve db` → review/adjudicate → `vj export db --manifest … --rip-script …`.
+episode-length extras by audio/subtitle layout) → `vj run ocr db --disc N` (or,
+for a no-title-card show, `vj enrich wikipedia db --snapshot … --index … --page
+…` then `vj run synopsis db`) → `vj resolve db` → review/adjudicate →
+`vj export db --manifest … --rip-script …`.
 Tests: `python3 -m unittest test_identify_episodes test_vj` (no discs/network).
 Needs `lsdvd`,`7z`; OCR also needs `ffmpeg`/`mencoder` + Ollama; `TMDB_API_KEY`
 in env for `init`.
@@ -399,6 +404,43 @@ Three sources of canonical episode ORDER, cheapest first:
   wrongly believed DVD was type 4.
 - A 2-part pilot/finale may be one TMDB entry (Enterprise "Broken Bow" = S01E01,
   86 min, with no E02 — numbering jumps E01→E03).
+
+## Synopsis judge + Wikipedia enrichment (the OCR-free identifier)
+
+`vj run synopsis` identifies a title by *content*, not position — the escalation
+for a **no-title-card, order-unverified** show (Blu-ray, same-runtime episodes;
+OCR has nothing to read). It whisper-transcribes a few sampled audio windows
+(`spread_fractions` places them in the 20–80% interior band, away from the
+"previously on" recap and end credits; `--synopsis-windows/-length` tune it) and
+a 2-stage LLM judge matches the dialogue against each candidate's plot synopsis.
+
+- **The judge is only as good as the synopsis, and TMDB's are often too generic.**
+  On The Magicians, TMDB's E01 overview is a series-premise blurb
+  ("twentysomethings studying magic in New York discover a fantasy world") that
+  names none of the episode's events; the exam dialogue then matched *E06's*
+  "The Trials" synopsis and the judge was confidently wrong. Result on S1D1
+  E01–E04: **0/4 with TMDB**.
+- **Wikipedia episode summaries fix this.** They're plot-specific ("Quentin and
+  Julia are invited to a *test*… Julia *fails*… they *wipe her memory*"). Same
+  titles: **3/4 with Wikipedia** (the one miss, E02→E01, is genuine adjacency —
+  E02's dialogue is *about* E01's aftermath). `vj enrich wikipedia <db>
+  --snapshot <…-multistream.xml.bz2> --index <…-multistream-index.txt.bz2>
+  --page "List of <Show> (…) episodes"` parses the `{{Episode list}}` templates
+  into `episode.wiki_overview` (kept alongside TMDB `overview`; `Episode.synopsis`
+  prefers wiki). `--page` is remembered on the project. `run synopsis
+  --synopsis-source {auto,wikipedia,tmdb}` picks the source (auto = wiki if
+  enriched). Reader (`wiki.py`): the multistream dump is concatenated ~100-page
+  bz2 streams; the index gives `offset:pageid:title`, so a lookup = find offset →
+  seek → decompress ONE stream → pull the `<page>`. Index and data MUST be from
+  the same dump run (offsets are file-specific) — a mismatch raises, not silent
+  garbage. Fully offline, pure `bz2` (no deps).
+- **Use a NON-thinking judge model** (default `qwen2.5:14b-instruct`, overridable
+  with `--judge-model`). A thinking model (gemma4) spends its `num_predict`
+  budget reasoning and returns empty `content` on the long Wikipedia prompt —
+  which reads as an abstention. (Same thinking-truncation wart as the OCR VLM.)
+  `run_synopsis` had defaulted the judge to `--vlm-model` (a 2B *vision* model) —
+  fixed. Judge accuracy is also model-sensitive: qwen2.5:14b got E01 where a
+  weaker model didn't.
 
 ## Output / rip workflow
 
