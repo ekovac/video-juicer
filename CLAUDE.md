@@ -449,11 +449,24 @@ a 2-stage LLM judge matches the dialogue against each candidate's plot synopsis.
   6), because episodes whose synopsis is heavy on shared season-arc vocabulary
   (Fillory, the Beast, the main quest) match lots of dialogue. So: trust an AGREE
   as a confidence boost (S1 order was effectively confirmed), but do NOT treat
-  the raw DIFFER list as a worklist. **The fix (not yet built): a global
-  one-episode-per-title constraint** — solve each disc/season as a bijection
-  (assignment problem) over the judge's per-title scores, the analog of `align`'s
-  monotonic DP and the OCR collision pass. Without it, independent judging always
-  admits magnets. (Added to Future features.)
+  the raw DIFFER list as a worklist.
+- **Bijection assignment (built) — necessary but NOT sufficient.** `run_synopsis`
+  now runs two phases: (1) one judge call per title returns a RANKED shortlist
+  (Borda-scored — the order is reliable, the model's confidence number isn't);
+  (2) a per-season global assignment (scipy Hungarian, `assign_by_synopsis`) so
+  each episode is claimed at most once, a title whose shortlist is all taken
+  abstains. Re-run on Magicians: magnets → **zero** (was 14 episodes / S03E09
+  ×6), and the output is finally a valid one-to-one mapping. BUT accuracy did NOT
+  improve — AGREE 38→31, abstain 30→42. The magnet was a *symptom* of weak
+  rankings, not the disease: forcing a coherent bijection over noisy rankings
+  redistributes the wrongness into a different permutation and can even move a
+  correct assignment (S1D1 pl803 was rightly E04 independently, bumped to E08 by
+  the global optimum). **The bottleneck is per-title ranking QUALITY**, not the
+  assignment — on a heavy-shared-arc show the rankings are too short/noisy for
+  even a perfect assignment to recover the order. Keep the bijection (guarantees
+  a duplicate-free rip plan, and it helps on shows with distinctive episodes);
+  the next lever is a stronger judge (see the OpenAI/HF backend in Future
+  features), not more assignment cleverness.
 
 ## Output / rip workflow
 
