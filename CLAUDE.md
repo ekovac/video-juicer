@@ -431,14 +431,26 @@ LLM judge matches it against each candidate's plot synopsis.
      ("GIRLFRIEND"→"GIREERIEND", words mashed) while RapidOCR is near-exact; 1080p
      PGS is clean on both. Cost is the OCR loop: ~335 ms/frame CPU × ~385
      frames/episode ≈ **~2 min/episode** (vs whisper ~4-5 min, and far cleaner) —
-     onnxruntime-gpu would cut it ~10x.
+     OCR is parallelized over a persistent spawn pool (`text_region.ocr_texts`,
+     cpu_count-2 single-thread workers, angle classifier off, ≤960px downscale);
+     Avatar B1D1 measured ~1:50/episode end-to-end.
+     **The render's `color` source MUST be duration-bounded (`d={dur}`).** The BD
+     dump is subtitle-ONLY (no video), and ffmpeg's sub2video never signals EOF
+     for a bare subtitle stream — an infinite color + `overlay=shortest=1` then
+     renders forever while `mpdecimate` drops the identical frames, so output PTS
+     never reaches `-t` and ffmpeg spins at ~360% CPU until the outer timeout
+     (~76 min/title, hit on Avatar). A finite `d=` ends the graph at the title
+     length (6 s for a 24-min episode). The DVD path never hit this only because
+     its `.vob` dump has video (a sub2video heartbeat).
   3. **Whisper audio (`full_transcript`/`sample_transcript`)** — last resort when a
      title has neither CC nor a subtitle track (bonus featurettes) — those usually
      abstain in the judge anyway.
   Cached in the `transcript` table keyed by `(source, windows, length)` — a source
-  is 'cc'/'subtitle-ocr'/'audio'. Validation (Venture Bros, Haiku judge, Wikipedia
-  synopses): **CC path S1D1 8/8, VOBSUB-OCR path S3 13/13** vs the known-correct
-  metadata order. `--transcript-source {auto,subtitle,audio}` forces a tier.
+  is 'cc'/'subtitle-ocr'/'audio'. Validation (Haiku judge): **VB CC path S1D1
+  8/8, VB VOBSUB-OCR S3 13/13** (Wikipedia synopses), **Avatar PGS-OCR B1D1 8/8
+  at 1.0 with zero conflicts** (TMDB synopses; the play-all and the 226-min
+  monolithic playlist correctly skipped by the multi-episode guard) — all vs the
+  known-correct metadata order. `--transcript-source {auto,subtitle,audio}` forces a tier.
 - **Transcribe the WHOLE episode by default (2026-07); windowing is opt-in.**
   Identifying dialogue is strewn throughout an episode, so sampling a few windows
   can phase-skip the very lines that name it — proven on Magicians S1D1 title 165

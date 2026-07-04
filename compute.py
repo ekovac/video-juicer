@@ -520,36 +520,52 @@ def run_synopsis(conn, args) -> dict:
                                         else "no dialogue transcribed")
             recs.append((tid, season_key, pool, ranked, evidence, used))
 
-    # --- phase 2: per-season bijection assignment over the rankings ---
+    # --- phase 2: bijection assignment over the rankings ---
+    # Real episodes get a per-SEASON bijection (each disc pair aligns within its
+    # season). Specials (season 0) sit in EVERY season's pool, so a per-season pass
+    # would let one special be claimed by several seasons (VB: Gargantua-2 grabbed
+    # by S4 AND S6). Instead they get ONE GLOBAL bijection over all titles no season
+    # episode claimed — so a special is assigned at most once across the series.
     groups: dict = defaultdict(list)
     for r in recs:
         groups[r[1]].append(r)
 
-    results = []
+    season_assigned: dict = {}       # tid -> (episode, score, rank)
+    special_claims: list = []        # (tid, [(special, score), …]) for leftovers
     for season_key, group in groups.items():
-        pool = group[0][2]     # season-scoped episode set (same across the group)
-        assigned = assign_by_synopsis([(tid, ranked) for tid, _, _, ranked, _, _
-                                       in group], pool)
-        for tid, _sk, _pool, ranked, evidence, src_used in group:
-            shortlist = [f"S{e.season:02d}E{e.number:02d}" for e, _ in ranked]
-            if tid in assigned:
-                ep, score, rank = assigned[tid]
-                ep_id = state.episode_id(conn, ep.season, ep.number)
-                conf = round(score / synopsis.RANK_TOP_K, 3)
-                verdict = (f"S{ep.season:02d}E{ep.number:02d} "
-                           f"(rank {rank}/{len(ranked)}): {evidence}")
-                payload = {"rank": rank, "assigned": True, "shortlist": shortlist,
-                           "evidence": evidence, "source": src_used}
-            else:
-                ep_id, conf = None, 0.0
-                verdict = (f"abstained — shortlist {shortlist} taken by better "
-                           "fits" if ranked else f"abstained: {evidence}")
-                payload = {"assigned": False, "shortlist": shortlist,
-                           "source": src_used}
-            state.put_evidence(conn, tid, "synopsis", episode_id=ep_id,
-                               verdict=verdict, confidence=conf, payload=payload)
-            results.append({"title_id": tid, "verdict": verdict,
-                            "confidence": conf, "source": src_used})
+        season_pool = [e for e in group[0][2] if e.season != 0]
+        rows = [(tid, [(e, s) for e, s in ranked if e.season != 0])
+                for tid, _, _, ranked, _, _ in group]
+        season_assigned.update(assign_by_synopsis(rows, season_pool))
+        for tid, _, _, ranked, _, _ in group:
+            if tid not in season_assigned:
+                spec = [(e, s) for e, s in ranked if e.season == 0]
+                if spec:
+                    special_claims.append((tid, spec))
+    specials_assigned = (assign_by_synopsis(special_claims, specials)
+                         if special_claims else {})
+    assigned = {**season_assigned, **specials_assigned}
+
+    results = []
+    for tid, _sk, _pool, ranked, evidence, src_used in recs:
+        shortlist = [f"S{e.season:02d}E{e.number:02d}" for e, _ in ranked]
+        if tid in assigned:
+            ep, score, rank = assigned[tid]
+            ep_id = state.episode_id(conn, ep.season, ep.number)
+            conf = round(score / synopsis.RANK_TOP_K, 3)
+            verdict = (f"S{ep.season:02d}E{ep.number:02d} "
+                       f"(rank {rank}/{len(ranked)}): {evidence}")
+            payload = {"rank": rank, "assigned": True, "shortlist": shortlist,
+                       "evidence": evidence, "source": src_used}
+        else:
+            ep_id, conf = None, 0.0
+            verdict = (f"abstained — shortlist {shortlist} taken by better "
+                       "fits" if ranked else f"abstained: {evidence}")
+            payload = {"assigned": False, "shortlist": shortlist, "source": src_used}
+        state.put_evidence(conn, tid, "synopsis", episode_id=ep_id,
+                           verdict=verdict, confidence=conf, payload=payload)
+        results.append({"title_id": tid, "verdict": verdict,
+                        "confidence": conf, "source": src_used})
     return {"ok": True, "synopsis": results}
 
 

@@ -314,6 +314,43 @@ class BackgroundHintTests(Base):
         self.assertIn([1, 3], pkg["s1d1"]["missing"])
 
 
+class SpecialsDedupTests(Base):
+    def test_special_assigned_at_most_once_across_seasons(self):
+        # one special (S00E01) ranked #1 by a leftover title in S1 AND one in S2.
+        # A per-season bijection would let BOTH claim it (each season's pool holds
+        # all specials); the global specials pass must give it to only one.
+        state.upsert_episodes(self.conn, [
+            ep(1, 1, "A", 1320.0), ep(2, 1, "B", 1320.0),
+            ep(0, 1, "Special", 1320.0)])
+        t1 = title(1, 1320, [1320]); t1.kind = "episode-candidate"
+        t2 = title(1, 1320, [1320]); t2.kind = "episode-candidate"
+        did1 = self.add_disc([t1], season_hint=1, path="/d/S1D1.iso")
+        did2 = self.add_disc([t2], season_hint=2, path="/d/S2D1.iso")
+
+        orig_ft, orig_rc = compute.full_transcript, compute.rank_candidates
+        compute.full_transcript = lambda d, t, w: "dialogue"
+        compute.rank_candidates = lambda tr, pool, model, host: (
+            [(next(e for e in pool if e.season == 0), 6)], "ev")   # both pick the special
+        try:
+            compute.run_synopsis(self.conn, auto_args(
+                all=True, title=None, disc=None, judge_model=None,
+                synopsis_windows=None, synopsis_length=None, retranscribe=False,
+                synopsis_source="tmdb", transcript_source="audio",
+                include_specials=True))
+        finally:
+            compute.full_transcript, compute.rank_candidates = orig_ft, orig_rc
+
+        sp = state.episode_id(self.conn, 0, 1)
+        got = []
+        for did in (did1, did2):
+            tid = state.title_id(self.conn, did, 1)
+            e = [x for x in state.evidence_for_title(self.conn, tid)
+                 if x["category"] == "synopsis"][0]
+            got.append(e["episode_id"])
+        self.assertEqual(got.count(sp), 1)      # special claimed exactly once
+        self.assertEqual(got.count(None), 1)    # the loser abstains, not double-claim
+
+
 class PoolTests(Base):
     def test_include_specials_widens_season_pool(self):
         from discs import Disc

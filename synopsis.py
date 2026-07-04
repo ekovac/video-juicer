@@ -172,18 +172,18 @@ def subtitle_transcript(disc: Disc, title: Title, workdir: Path) -> str:
 
 
 def _probe_video_size(source: list) -> Optional[tuple]:
-    """(width, height) of the first video stream, via ffprobe (header read only)."""
+    """(width, height) of the first video stream, via ffprobe (header read only).
+    The Blu-ray demuxer prints the resolution once PER CLIP (a multi-clip playlist
+    yields `1920x1080\\n1920x1080\\n…`), so match the FIRST WxH rather than parsing
+    the whole stdout — otherwise the size read is garbage and OCR silently dies."""
     try:
         r = run(["ffprobe", "-hide_banner", "-v", "error", "-select_streams",
                  "v:0", "-show_entries", "stream=width,height",
                  "-of", "csv=p=0:s=x", *source], timeout=120)
     except (subprocess.TimeoutExpired, OSError):
         return None
-    parts = r.stdout.strip().split("x")
-    try:
-        return int(parts[0]), int(parts[1])
-    except (ValueError, IndexError):
-        return None
+    m = re.search(r"(\d+)x(\d+)", r.stdout)
+    return (int(m.group(1)), int(m.group(2))) if m else None
 
 
 def subtitle_ocr_transcript(disc: Disc, title: Title, workdir: Path) -> str:
@@ -198,39 +198,60 @@ def subtitle_ocr_transcript(disc: Disc, title: Title, workdir: Path) -> str:
     so mplayer first dumps the title's raw program stream (which carries the
     subpicture) to a local file. Returns "" if there's no subtitle track / OCR
     backend, so the caller falls through to whisper."""
-    from text_region import ocr_text, paddle_available
+    from text_region import ocr_texts, paddle_available
     if disc.format not in ("bluray", "dvd") or not paddle_available():
         return ""
     frames = workdir / f"subf_{title.id}"
     frames.mkdir(exist_ok=True)
-    vob = workdir / f"sub_{title.id}.vob"
+    dump = workdir / f"sub_{title.id}.{'mkv' if disc.format == 'bluray' else 'vob'}"
     dur = int(title.duration) + 2 if title.duration else 3600
+    size = None
     try:
+        dump.unlink(missing_ok=True)
+        # BOTH formats render from a LOCAL file, not the disc directly — rendering
+        # straight off the `bluray:` protocol stitches the multi-clip playlist live
+        # at ~1x realtime (~20 min/episode!).
         if disc.format == "bluray":
-            src_in = ["-playlist", str(title.id), "-i", f"bluray:{disc.path}"]
+            # canvas size (PGS positions are absolute) via a cheap ffprobe header
+            # read — the subtitle-only copy below carries no video stream.
             size = _probe_video_size(["-playlist", str(title.id),
                                       f"bluray:{disc.path}"])
-        else:   # DVD: dump the raw program stream (keeps the subpicture stream)
-            vob.unlink(missing_ok=True)
+            # copy ONLY the PGS subtitle stream (~1 s, a few MB). A full `-map 0`
+            # remux both hits an unmuxable data stream and stitches the whole title.
+            run(["ffmpeg", "-hide_banner", "-y", "-playlist", str(title.id),
+                 "-i", f"bluray:{disc.path}", "-map", "0:s:0", "-c", "copy",
+                 str(dump)], timeout=dur * 2 + 300)
+        else:   # DVD has no ffmpeg protocol — mplayer dumps the program stream
             run(["mplayer", f"dvd://{title.id}", "-dvd-device", str(disc.path),
-                 "-dumpstream", "-dumpfile", str(vob), "-really-quiet"],
+                 "-dumpstream", "-dumpfile", str(dump), "-really-quiet"],
                 timeout=dur * 2 + 300)
-            if not (vob.exists() and vob.stat().st_size > 0):
-                return ""
-            src_in = ["-i", str(vob)]
-            size = _probe_video_size([str(vob)])
+        if not (dump.exists() and dump.stat().st_size > 0):
+            return ""
+        if size is None:                       # DVD: probe the dumped VOB
+            size = _probe_video_size([str(dump)])
         if not size:
             return ""
         w, h = size
-        # render subs on black, keep only changed frames (one per distinct caption)
-        run(["ffmpeg", "-hide_banner", "-y", *src_in, "-t", str(dur),
+        # render subs on black, keep only changed frames (one per distinct caption),
+        # and DOWNSCALE to ≤960px wide — PGS text is large, OCRs fine at half res,
+        # and det cost scales with pixels (1080p→960 is ~4x fewer). DVD (720) is
+        # left as-is by the min().
+        # The color source MUST be duration-bounded (`d=`): on a video-less dump
+        # (the BD subtitle-only copy) sub2video never signals EOF, so an infinite
+        # color + overlay=shortest=1 renders forever, mpdecimate drops the
+        # identical frames, output PTS never reaches -t, and ffmpeg spins until
+        # the outer timeout (~76 min/title, observed on Avatar). A finite bg ends
+        # the graph at `dur` regardless. (The DVD .vob path has video and never
+        # hit this, but the bound is correct there too.)
+        run(["ffmpeg", "-hide_banner", "-y", "-i", str(dump), "-t", str(dur),
              "-filter_complex",
-             f"color=black:s={w}x{h}:r=2[bg];[bg][0:s:0]overlay=shortest=1,mpdecimate",
+             f"color=black:s={w}x{h}:r=2:d={dur}[bg];[bg][0:s:0]overlay=shortest=1,"
+             "mpdecimate,scale='min(960,iw)':-2",
              "-fps_mode", "vfr", str(frames / "f%05d.png")],
             timeout=dur * 3 + 300)
         out: list[str] = []
-        for png in sorted(frames.glob("f*.png")):
-            text = " ".join(ocr_text(png).split())
+        for text in ocr_texts(sorted(frames.glob("f*.png"))):   # parallel OCR
+            text = " ".join(text.split())
             if text and (not out or text != out[-1]):
                 out.append(text)
         return " ".join(out).strip()
@@ -239,7 +260,7 @@ def subtitle_ocr_transcript(disc: Disc, title: Title, workdir: Path) -> str:
                     e, disc.path.name, title.id)
         return ""
     finally:
-        vob.unlink(missing_ok=True)
+        dump.unlink(missing_ok=True)
         for png in frames.glob("f*.png"):
             png.unlink(missing_ok=True)
         try:

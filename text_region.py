@@ -75,15 +75,70 @@ def ocr_text(img: ImageLike) -> str:
     """Full PP-OCR recognition (det+rec) of an image → recognized text, boxes
     joined in reading order. "" if the backend is unavailable or nothing is read.
     Used for subtitle-bitmap OCR (PGS / VOBSUB), where PP-OCR is markedly more
-    accurate than tesseract — especially on low-res DVD VOBSUB."""
+    accurate than tesseract — especially on low-res DVD VOBSUB. `use_cls=False`
+    skips angle classification — subtitles are horizontal, so it's wasted work."""
     eng = _rapid()
     if eng is None:
         return ""
     src = str(img) if isinstance(img, (str, Path)) else img
-    res, _ = eng(src)
+    res, _ = eng(src, use_cls=False)
     if not res:
         return ""
     return " ".join(line[1] for line in res).strip()
+
+
+# --- parallel OCR over many frames (subtitle-card OCR is embarrassingly parallel;
+# each PP-OCR call is one core, so a process pool = ~one frame per core at once) ---
+_POOL_ENG = None
+
+
+def _pool_init():
+    """Per-worker: a SINGLE-THREAD RapidOCR (so N workers ≈ N cores, no
+    oversubscription). OMP is pinned to 1 before the engine's onnx sessions load."""
+    import os
+    os.environ["OMP_NUM_THREADS"] = "1"
+    global _POOL_ENG
+    from rapidocr_onnxruntime import RapidOCR
+    try:
+        _POOL_ENG = RapidOCR(intra_op_num_threads=1)
+    except Exception:  # noqa: BLE001
+        _POOL_ENG = RapidOCR()
+
+
+def _pool_ocr(path: str) -> str:
+    res, _ = _POOL_ENG(path, use_cls=False)
+    return " ".join(line[1] for line in res).strip() if res else ""
+
+
+_POOL = None            # persistent worker pool, reused across titles in a run
+
+
+def _get_pool(workers: int):
+    """A PERSISTENT spawn pool — workers load the OCR models ONCE and stay warm
+    for the whole run. Re-spawning per title (each worker re-importing onnx +
+    re-loading models) dominated the cost otherwise. Torn down at process exit."""
+    global _POOL
+    if _POOL is None:
+        import multiprocessing as mp
+        import atexit
+        _POOL = mp.get_context("spawn").Pool(workers, initializer=_pool_init)
+        atexit.register(lambda: _POOL and _POOL.terminate())
+    return _POOL
+
+
+def ocr_texts(paths, workers: Optional[int] = None) -> list:
+    """OCR a list of image paths, in order (so consecutive-dedup still works),
+    across a persistent process pool. Falls back to serial for a short list / no
+    backend / single worker. Order-preserving (`pool.map`)."""
+    paths = [str(p) for p in paths]
+    if _rapid() is None:
+        return ["" for _ in paths]
+    import os
+    if workers is None:
+        workers = max(1, (os.cpu_count() or 2) - 2)
+    if workers <= 1 or len(paths) < 8:
+        return [ocr_text(p) for p in paths]
+    return _get_pool(workers).map(_pool_ocr, paths, chunksize=4)
 
 
 # ---------------------------------------------------------------------------
