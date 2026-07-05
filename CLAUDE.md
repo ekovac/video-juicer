@@ -447,10 +447,36 @@ LLM judge matches it against each candidate's plot synopsis.
      abstain in the judge anyway.
   Cached in the `transcript` table keyed by `(source, windows, length)` — a source
   is 'cc'/'subtitle-ocr'/'audio'. Validation (Haiku judge): **VB CC path S1D1
-  8/8, VB VOBSUB-OCR S3 13/13** (Wikipedia synopses), **Avatar PGS-OCR B1D1 8/8
-  at 1.0 with zero conflicts** (TMDB synopses; the play-all and the 226-min
-  monolithic playlist correctly skipped by the multi-episode guard) — all vs the
-  known-correct metadata order. `--transcript-source {auto,subtitle,audio}` forces a tier.
+  8/8, VB VOBSUB-OCR S3 13/13** (Wikipedia synopses), and the **full Avatar
+  Blu-ray (all 9 discs, PGS-OCR, TMDB synopses)** — all vs the known-correct
+  order. `--transcript-source {auto,subtitle,audio}` forces a tier.
+  - **The full-Avatar run is the demonstration that synopsis CORRECTS a scrambled
+    metadata alignment, not just corroborates it** — the Blu-ray-scramble failure
+    mode this path exists for. S1 (unscrambled here) was 20/20 agreeing with
+    runtime-align at 1.0. But on B2D2 the aligner mapped E10/E11/E15 onto titles
+    whose *content* is E14/E10/E11 and dropped the real E15 as a leftover; synopsis
+    got all four right and recovered the leftover. Same on B3D2 (E13/E17 titles are
+    really E09/E13) and it recovered E17 "Ember Island Players" that the aligner had
+    dropped on B3D3. **Every single title where synopsis DIFFERED from metadata,
+    synopsis was right and metadata was the scramble victim; zero wrong synopsis
+    calls, and the per-season bijection held with zero double-claims.** This is the
+    contrast the magnet note predicts: on a show with DISTINCTIVE episodes (Avatar)
+    synopsis+bijection is a reliable *order-verifier*; on a heavy-shared-arc
+    ensemble (Magicians) it stays a corroborator. Frontier judge (Haiku) + full
+    transcripts + bijection is what tips it over on the distinctive show.
+  - **Synopsis also implicitly rejects stripped duplicate titles the aligner falls
+    for.** The scramble-victim slots on B2D2/B3D2 were 1A/0S copies with NO PGS
+    stream at all (byte-stripped alternates); the aligner's position DP grabbed one
+    as "E14" but synopsis abstained ("no subtitles found") — the *real* episode is
+    the full-PGS twin, which synopsis identified. No-subtitle abstain doubles as a
+    junk-title filter.
+  - **`--transcript-source subtitle` correctly abstains on genuinely sub-less
+    titles — escalate to `auto`/`audio` for those.** Avatar's Sozin's Comet finale
+    (B3D3, E18–E21) is authored with only H.264 + one AC3 track, no PGS at all (the
+    480i format-outlier authoring), so the forced subtitle tier had nothing to OCR
+    and abstained fail-soft (metadata kept its medium-confidence assignment). Those
+    titles DO carry audio, so `auto` (or `--transcript-source audio`) whispers them
+    — the subtitle-only run just skipped that tier by request.
 - **Transcribe the WHOLE episode by default (2026-07); windowing is opt-in.**
   Identifying dialogue is strewn throughout an episode, so sampling a few windows
   can phase-skip the very lines that name it — proven on Magicians S1D1 title 165
