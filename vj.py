@@ -715,7 +715,7 @@ def cmd_play(args) -> int:
                         f"no title is assigned to {args.target} yet "
                         f"(try --title N to preview a candidate)")
         row = conn.execute(
-            "SELECT t.id, t.title_number, d.path, d.format FROM title t "
+            "SELECT t.id, t.title_number, t.clips_json, d.path, d.format FROM title t "
             "JOIN disc d ON d.id=t.disc_id WHERE t.id=?", (tid,)).fetchone()
     else:
         conn.close()
