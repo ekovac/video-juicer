@@ -161,8 +161,8 @@ UNIX tool with structured output and no hidden state.** Concretely:
   `verify_title`). The match pool is scoped to the disc's season by default
   (efficient, right for episodes); `--include-specials` widens it with the S00
   pool so a leftover title can be identified as a special. The VLM pass is gated
-  by an OCR-free text-region detector (`text_region.py`, default PaddleOCR
-  PP-OCRv3 via RapidOCR, Apache-2.0; EAST fallback) that prunes text-less scene
+  by an OCR-free text-region detector (`text_region.py`, PaddleOCR
+  PP-OCRv3 via RapidOCR, Apache-2.0) that prunes text-less scene
   frames — recall-first, fails open, guarded; `--no-text-filter` disables it for
   shows whose title is painted into the scene art (Adventure Time), where a text
   detector may not see the card.

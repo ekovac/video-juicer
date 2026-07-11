@@ -955,10 +955,10 @@ def build_parser() -> argparse.ArgumentParser:
                             "identifying a leftover title as a special)")
     p_run.add_argument("--no-text-filter", dest="text_filter",
                        action="store_false",
-                       help="disable the EAST text-region gate on the VLM pass. "
+                       help="disable the text-region gate on the VLM pass. "
                             "Turn OFF for shows whose title is painted into the "
-                            "scene art (Adventure Time), where EAST may not see "
-                            "it as text and could prune the real card")
+                            "scene art (Adventure Time), where the detector may not "
+                            "see it as text and could prune the real card")
     p_run.add_argument("--scratch-dir", type=Path, default=None,
                        help="dir for temp rips/frames (real disk, not tmpfs)")
     p_run.add_argument("--ollama-host",
@@ -1068,7 +1068,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_auto.add_argument("--ocr-accept", type=float, default=0.8)
     p_auto.add_argument("--no-text-filter", dest="text_filter",
                         action="store_false",
-                        help="disable the EAST text-region gate on OCR "
+                        help="disable the text-region gate on OCR "
                              "(for scene-art title cards, e.g. Adventure Time)")
     p_auto.add_argument("--include-specials", action="store_true",
                         help="add S00 specials to the OCR match pool")

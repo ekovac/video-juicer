@@ -117,14 +117,12 @@ carry the aired numbering as an `aired` cross-reference. The TMDB type enum:
 - `HandBrakeCLI` — only for the Blu-ray title-number scan at export time.
 - **Text-region detector** (recommended) — `vj run ocr` gates the slow VLM pass
   with an OCR-free detector so it only reads frames that plausibly bear a title.
-  Default backend is **PaddleOCR PP-OCRv3 detection via RapidOCR**
+  The detector is **PaddleOCR PP-OCRv3 detection via RapidOCR**
   (`pip install rapidocr-onnxruntime`, Apache-2.0, model bundled) — ~92% of scene
-  frames pruned at 100% recall on real cards. Fallback is **EAST** (`cv2.dnn`;
-  point `VJ_EAST_MODEL` at a `.pb` — note its license is murky, so it's optional
-  and not shipped). Neither installed → the gate fails open (no speedup, no
-  risk). Force a backend with `VJ_TEXT_DETECTOR=paddle|east`. It's
-  *recall-first*, but a show whose title is painted into the scene art (Adventure
-  Time) can defeat any text detector — use `vj run ocr --no-text-filter` there.
+  frames pruned at 100% recall on real cards. Not installed → the gate fails open
+  (no speedup, no risk). It's *recall-first*, but a show whose title is painted
+  into the scene art (Adventure Time) can defeat any text detector — use
+  `vj run ocr --no-text-filter` there.
 
 ## Tests
 

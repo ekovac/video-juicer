@@ -649,7 +649,7 @@ def verify_title(disc: Disc, title: Title, episodes: list[Episode],
     title is ~10 s): rip+extract every frame once, then three tiers cheap-first:
       1. **Tesseract** over all frames — plain block cards read outright, ANYWHERE
          in the title (no window to miss them); returns on the first accept.
-      2. an OCR-free **text-region gate** (`frame_has_text`, PaddleOCR/EAST)
+      2. an OCR-free **text-region gate** (`frame_has_text`, PaddleOCR)
          prunes text-less scene frames from the expensive VLM pass.
       3. the **VLM** reads the gate survivors, capped at `vlm_budget` calls so a
          card-less title can't run away (a missed read is recovered later by
@@ -667,7 +667,7 @@ def verify_title(disc: Disc, title: Title, episodes: list[Episode],
     if text_filter and use_vlm:
         try:
             from text_region import frame_has_text as has_text
-        except Exception:  # noqa: BLE001 — cv2/rapidocr missing
+        except Exception:  # noqa: BLE001 — rapidocr missing
             has_text = None
 
     def result():

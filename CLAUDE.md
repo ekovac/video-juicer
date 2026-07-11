@@ -333,22 +333,17 @@ Three sources of canonical episode ORDER, cheapest first:
     (`text_region.py`): only frames a detector scores as bearing text reach the
     VLM. It's **recall-first**, **fails open** (no detector → no pruning), and
     **guarded** (would-prune-whole-window → keep the window). The seam
-    (`frame_has_text`) is detector-agnostic; two backends, measured on a
-    VB(stylized)+Enterprise(plain) card corpus vs scene negatives (both hold
-    100% recall on real episode cards):
-    - **PaddleOCR PP-OCRv3 det via RapidOCR/onnx (default)** — Apache-2.0, model
-      bundled with the pip package, **~92% scene rejection** (88% on the pathological
-      title-205 window), ~170 ms/frame.
-    - **EAST (cv2.dnn, fallback)** — ~70% rejection, ~50 ms/frame; its ~96 MB
-      model isn't shipped and is license-murky (GPL-3.0 upstream / ICDAR data),
-      so it's fallback-only (`VJ_EAST_MODEL`). Force a backend with
-      `VJ_TEXT_DETECTOR=paddle|east`.
+    (`frame_has_text`) uses **PaddleOCR PP-OCRv3 det via RapidOCR/onnx** —
+    Apache-2.0, model bundled with the pip package, **~92% scene rejection** (88%
+    on the pathological title-205 window), ~170 ms/frame, at 100% recall on real
+    episode cards (measured on a VB-stylized + Enterprise-plain corpus vs scene
+    negatives). `VJ_TEXT_DETECTOR=paddle` is honored for compatibility.
 
     Classical detectors were tried and rejected first (morphological gate ~60%
     recall on stylized/textured cards; MSER ~30% scene rejection).
-  - **Wart 1 caveat — scene-art title cards.** EAST detects *text*; a show whose
-    title is painted INTO the scene art (Adventure Time — hand-lettered, more
-    stylized than VB) may not read as text, so the gate could prune the real
+  - **Wart 1 caveat — scene-art title cards.** The detector finds *text*; a show
+    whose title is painted INTO the scene art (Adventure Time — hand-lettered,
+    more stylized than VB) may not read as text, so the gate could prune the real
     card. Default is on; disable per-run with `vj run ocr --no-text-filter`
     (also on `vj auto`). The escalation probe (`probe_card_presence`) always
     runs unfiltered so a false "no text" never wrongly skips OCR.

@@ -557,9 +557,8 @@ class AutoTests(Base):
 class TextGateTests(unittest.TestCase):
     def test_fails_open_when_backend_unavailable(self):
         import text_region as tr
-        # a forced-but-unavailable backend must never prune (recall-first)
-        self.assertTrue(tr.frame_has_text("/any.jpg", backend="east",
-                                          model="/no/model.pb"))
+        # an unrecognized/unavailable backend must never prune (recall-first)
+        self.assertTrue(tr.frame_has_text("/any.jpg", backend="nope"))
 
     def test_verify_title_accepts_text_filter(self):
         import inspect
@@ -572,7 +571,7 @@ class TextGateTests(unittest.TestCase):
         base = "/run/media/ekovac/MediaScratc/video-juicer-artifacts/tr-eval"
         cards = glob.glob(f"{base}/pos_db/*.jpg")
         scenes = glob.glob(f"{base}/neg_ent/*.jpg")
-        available = tr.paddle_available() or tr.east_available()
+        available = tr.paddle_available()
         if not (available and cards and scenes):
             self.skipTest("no text detector or fixture frames available")
         self.assertTrue(tr.frame_has_text(cards[0]))                 # card kept
