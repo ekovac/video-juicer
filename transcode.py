@@ -26,6 +26,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import xml.etree.ElementTree as ET
@@ -193,7 +194,8 @@ def _plan(conn, args) -> tuple[list[dict], dict]:
 
     preset = args.handbrake_preset
     preset_alt = getattr(args, "handbrake_preset_alt", None) or preset
-    opts = getattr(args, "handbrake_opts", None) or []
+    raw_opts = getattr(args, "handbrake_opts", None)
+    opts = shlex.split(raw_opts) if isinstance(raw_opts, str) else (raw_opts or [])
     prefix = Path(args.output_prefix or ".")
 
     majority = _record_video_majority(records)

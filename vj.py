@@ -1134,8 +1134,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_tc.add_argument("--handbrake-preset", default="Fast 1080p30")
     p_tc.add_argument("--handbrake-preset-alt", default=None,
                       help="preset for video-format outliers (default: same as --handbrake-preset)")
-    p_tc.add_argument("--handbrake-opts", nargs="*", default=None,
-                      help="extra HandBrakeCLI flags applied to every encode")
+    p_tc.add_argument("--handbrake-opts", default=None,
+                      help="extra HandBrakeCLI flags as ONE string (shlex-split), "
+                           "e.g. --handbrake-opts '--encoder-preset ultrafast'")
     p_tc.add_argument("--scratch-dir", type=Path, default=None,
                       help="dir for temp .part files + tag XML (real disk)")
     p_tc.add_argument("--dry-run", action="store_true",
