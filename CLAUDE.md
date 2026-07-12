@@ -639,6 +639,23 @@ LLM judge matches it against each candidate's plot synopsis.
 - `--from-manifest FILE` → emit rip commands from a saved manifest, no scanning.
 - `--merge` → merge a run into the existing `--out`, replacing only the discs
   processed this run.
+- **`vj transcode` (transcode.py) runs the HandBrake jobs itself** instead of
+  emitting a script — same `build_records` source of truth, but it encodes each
+  episode and writes **Matroska tags** into the output (mkvtoolnix: `mkvpropedit`
+  to write, `mkvextract` to read; `.mkv` only). It's **idempotent by design**: a
+  `VJ_RECIPE` tag hashes ONLY the encode-determining inputs (source disc
+  basename, HandBrake title index, preset, opts), kept separate from a `VJ_META`
+  hash (names/numbers/ids). A re-run indexes existing outputs by their
+  `VJ_EPISODES` tag (so a rename is found as a rename, not a re-encode+orphan)
+  and `decide_action` picks per episode: recipe changed → **reencode**; same
+  recipe, moved → **rename**+retag; metadata-only change → **retag**; unchanged →
+  **skip**. That's the "regenerate only what the DB changed" property — edit an
+  assignment/preset and re-run; only the affected episodes re-encode. `--dry-run`
+  shows the plan, `--force` re-encodes regardless. The encode is `subprocess.run`
+  with output to DEVNULL (NOT `discs.run`, which captures — a multi-hour encode
+  would buffer HandBrake's continuous progress unbounded) and no timeout; it
+  writes to `<target>.mkv.part` then tags then atomically `os.replace`s into
+  place, so an interrupted encode never leaves a half file that reads as done.
 - Every episode record has `identified_by`: `runtime-align` / `title-card` /
   `elimination`, plus `confidence` and `verified_by_titlecard`.
 - **Video-format outlier warning.** Each record carries `video_format`

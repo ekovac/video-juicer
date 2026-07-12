@@ -893,5 +893,82 @@ class EnrichTests(Base):
         self.assertEqual(out["error"], "no-page")
 
 
+class TranscodeTests(unittest.TestCase):
+    """Pure logic of the transcode verb (no HandBrake/mkvtoolnix needed)."""
+
+    def _rec(self, image="/img/Book_1_Disc_1", title=62, season=1,
+             episodes=(1,), name="The Boy in the Iceberg"):
+        return {"image": image, "title": title, "kind": "episode",
+                "season": season, "episodes": list(episodes),
+                "episode_name": name, "suggested_filename": "x.mkv",
+                "video_format": "1080p"}
+
+    def test_recipe_hash_is_encode_only(self):
+        import transcode as tc
+        r = self._rec()
+        base = tc._sha(tc.encode_recipe(r, "Fast 1080p30", []))
+        # renaming the episode does NOT change the encode recipe
+        r2 = self._rec(name="Totally Different Name")
+        self.assertEqual(base, tc._sha(tc.encode_recipe(r2, "Fast 1080p30", [])))
+        # changing preset / title / source / opts DOES
+        self.assertNotEqual(base, tc._sha(tc.encode_recipe(r, "HQ 1080p30", [])))
+        self.assertNotEqual(base, tc._sha(tc.encode_recipe(self._rec(title=7),
+                                                           "Fast 1080p30", [])))
+        self.assertNotEqual(base, tc._sha(tc.encode_recipe(r, "Fast 1080p30",
+                                                           ["--deinterlace"])))
+
+    def test_meta_hash_tracks_names_not_encode(self):
+        import transcode as tc
+        m1 = tc._sha(tc.meta_fields(self._rec(), "Avatar", 2005, 246))
+        m2 = tc._sha(tc.meta_fields(self._rec(name="Renamed"), "Avatar", 2005, 246))
+        self.assertNotEqual(m1, m2)
+
+    def test_episode_tag_single_and_range(self):
+        import transcode as tc
+        self.assertEqual(tc._episode_tag_for(self._rec(episodes=(1,))), "S01E01")
+        self.assertEqual(
+            tc._episode_tag_for(self._rec(season=3, episodes=(18, 19, 20, 21))),
+            "S03E18-E21")
+
+    def test_decide_action(self):
+        import transcode as tc
+        self.assertEqual(tc.decide_action("r", "m", "/t.mkv", None), "encode")
+        # recipe changed -> reencode
+        self.assertEqual(tc.decide_action(
+            "r2", "m", "/t.mkv",
+            {"path": "/t.mkv", "recipe": "r", "meta": "m"}), "reencode")
+        # same recipe, moved path -> rename
+        self.assertEqual(tc.decide_action(
+            "r", "m", "/new.mkv",
+            {"path": "/old.mkv", "recipe": "r", "meta": "m"}), "rename")
+        # same recipe+path, metadata changed -> retag
+        self.assertEqual(tc.decide_action(
+            "r", "m2", "/t.mkv",
+            {"path": "/t.mkv", "recipe": "r", "meta": "m"}), "retag")
+        # nothing changed -> skip
+        self.assertEqual(tc.decide_action(
+            "r", "m", "/t.mkv",
+            {"path": "/t.mkv", "recipe": "r", "meta": "m"}), "skip")
+        # --force re-encodes even an identical output
+        self.assertEqual(tc.decide_action(
+            "r", "m", "/t.mkv",
+            {"path": "/t.mkv", "recipe": "r", "meta": "m"}, force=True), "reencode")
+
+    def test_tags_xml_roundtrip(self):
+        import transcode as tc
+        simples = {"TITLE": "The Library", "SEASON": "2", "VJ_RECIPE": "abc123",
+                   "VJ_EPISODES": "S02E10", "EMPTY": ""}
+        parsed = tc.parse_tags(tc.tags_xml(simples))
+        self.assertEqual(parsed["TITLE"], "The Library")
+        self.assertEqual(parsed["VJ_RECIPE"], "abc123")
+        self.assertEqual(parsed["VJ_EPISODES"], "S02E10")
+        self.assertNotIn("EMPTY", parsed)   # empty values are dropped
+
+    def test_parse_tags_empty(self):
+        import transcode as tc
+        self.assertEqual(tc.parse_tags(""), {})
+        self.assertEqual(tc.parse_tags("not xml <<<"), {})
+
+
 if __name__ == "__main__":
     unittest.main()

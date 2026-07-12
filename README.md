@@ -46,6 +46,9 @@ vj run align show.db                      # re-run: confirmed=anchor, rejected=e
 
 # 6. emit outputs from the adjudicated state
 vj export show.db --manifest m.json --rip-script rip.sh --output-prefix /mnt/media
+
+# ...or run the HandBrake jobs directly, tagging outputs and skipping up-to-date ones
+vj transcode show.db --output-prefix /mnt/media --include-proposed
 ```
 
 Steps 3-4 can be run in one shot with **`vj auto show.db`**, which scripts
@@ -92,6 +95,19 @@ to include proposals):
   `HANDBRAKE_OPTS`), one `HandBrakeCLI` call per episode, with format-outlier
   episodes split into a `$PRESET_ALT` block.
 
+Or skip the script and let the tool run the jobs itself:
+
+- **`vj transcode`** runs `HandBrakeCLI` for each episode directly, writes
+  Matroska tags into every output (episode name, show, season/episode, TMDB id,
+  plus `VJ_*` provenance), and is **idempotent**: each output carries a
+  `VJ_RECIPE` tag hashing exactly the encode inputs (source disc + title index +
+  preset + opts), so a re-run **re-encodes only what changed** in the project and
+  skips the rest. A metadata-only change (episode renamed) is a cheap rename +
+  re-tag, never a re-encode. `--dry-run` shows the encode/rename/retag/skip plan;
+  `--force` re-encodes regardless; `--handbrake-preset-alt` gives format-outliers
+  a different preset. Needs **mkvtoolnix** (`mkvpropedit`/`mkvextract`) for the
+  tags, and assumes `.mkv` outputs.
+
 The manifest **`title` field is the number to pass to your ripper**
 (`HandBrakeCLI -t N`). For DVD it's the lsdvd/HandBrake title number directly.
 For **Blu-ray** the tool reports HandBrake's title index from a per-disc scan —
@@ -114,7 +130,10 @@ carry the aired numbering as an `aired` cross-reference. The TMDB type enum:
   `.tmdb_cache/`).
 - `ffmpeg`, `mencoder`, and a running **Ollama** with a vision model
   (default `qwen3-vl:2B`) — for `vj run ocr`.
-- `HandBrakeCLI` — only for the Blu-ray title-number scan at export time.
+- `HandBrakeCLI` — the Blu-ray title-number scan at export time, and the encodes
+  when using `vj transcode`.
+- `mkvtoolnix` (`mkvpropedit`, `mkvextract`) — only for `vj transcode` (writes and
+  reads the Matroska output tags). Not needed for `vj export`.
 - **Text-region detector** (recommended) — `vj run ocr` gates the slow VLM pass
   with an OCR-free detector so it only reads frames that plausibly bear a title.
   The detector is **PaddleOCR PP-OCRv3 detection via RapidOCR**

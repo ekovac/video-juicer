@@ -34,6 +34,7 @@ from typing import Optional
 import auto as auto_mod
 import compute
 import export as export_mod
+import transcode as transcode_mod
 import review
 import state
 import wiki
@@ -872,6 +873,25 @@ def cmd_export(args) -> int:
     return 0
 
 
+def cmd_transcode(args) -> int:
+    conn, err = _open(args)
+    if err:
+        return err
+    r = transcode_mod.run_transcode(conn, args)
+    conn.close()
+    if not r.get("ok"):
+        return fail(args, r["error"], r["message"])
+    if r.get("dry_run"):
+        emit(args, r, human="plan: " + ", ".join(f"{k}={v}"
+                                                  for k, v in r["plan"].items()))
+    else:
+        d = r["result"]
+        emit(args, r, human=(f"encoded {d['encoded']}, renamed {d['renamed']}, "
+                             f"retagged {d['retagged']}, skipped {d['skipped']}, "
+                             f"failed {d['failed']}"))
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -1103,6 +1123,26 @@ def build_parser() -> argparse.ArgumentParser:
     p_exp.add_argument("--output-prefix", type=Path,
                        help="rip-script PREFIX (output root)")
     p_exp.set_defaults(func=cmd_export)
+
+    p_tc = sub.add_parser("transcode",
+                          help="run the HandBrake jobs directly, tag + skip up-to-date")
+    p_tc.add_argument("db", type=Path)
+    p_tc.add_argument("--output-prefix", type=Path, required=True,
+                      help="output root (the Plex/Jellyfin tree is built under it)")
+    p_tc.add_argument("--include-proposed", action="store_true",
+                      help="also transcode proposed (not just confirmed) assignments")
+    p_tc.add_argument("--handbrake-preset", default="Fast 1080p30")
+    p_tc.add_argument("--handbrake-preset-alt", default=None,
+                      help="preset for video-format outliers (default: same as --handbrake-preset)")
+    p_tc.add_argument("--handbrake-opts", nargs="*", default=None,
+                      help="extra HandBrakeCLI flags applied to every encode")
+    p_tc.add_argument("--scratch-dir", type=Path, default=None,
+                      help="dir for temp .part files + tag XML (real disk)")
+    p_tc.add_argument("--dry-run", action="store_true",
+                      help="show the encode/rename/retag/skip plan without running")
+    p_tc.add_argument("--force", action="store_true",
+                      help="re-encode even outputs whose recipe is unchanged")
+    p_tc.set_defaults(func=cmd_transcode)
 
     return ap
 
