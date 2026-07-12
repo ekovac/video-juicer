@@ -240,7 +240,30 @@ Three sources of canonical episode ORDER, cheapest first:
 - **Same-runtime episodes** → metadata can't order them → unverifiable → OCR.
 - **Two authoring versions per episode** (body alone vs body+logo/recap) →
   `dedup_subset_playlists`: drop a playlist whose clips are a strict subset of a
-  similar-length one (1.5x guard stops a play-all swallowing episodes).
+  fuller one, **but only when the fuller one is at most a recap/logo longer**
+  (`_RECAP_MAX_S=300`, an ABSOLUTE cap — not the old 1.5x *ratio*). The ratio was
+  a real bug: a play-all only ONE episode longer than a large sub-run passed it
+  and swallowed the sub-run. Avatar B3D3 authors the Sozin's Comet finale three
+  ways — E17 (pl601, 24m), the E18-E21 combined finale (pl602, 91m), and an
+  E17-E21 play-all (pl600, 116m). pl602 ⊂ pl600 and `116 ≤ 91×1.5`, so the ratio
+  guard **dropped the clean finale** (the rip then fell back to the play-all,
+  which includes E17). Absolute cap: 116−91=25m ≫ 300s → kept. A recap/logo is a
+  few minutes regardless of episode length, so absolute is the right shape.
+- **Missing/flaky HandBrake scan silently keeps the STRIPPED twin (the Avatar
+  regression).** `dedup_identical_clips` ranks by `(n_audio+n_sub, lossless,
+  -id)` — but those stream counts come from `handbrake_scan`. If that scan is
+  absent or partial (OOM, timeout), every twin gets `n_audio=0` and the tiebreak
+  falls to **lowest playlist id**, which is the stripped/commentary `pl25x`, not
+  the clean `pl60x` master. A whole Avatar project DB was built this way: ~16 of
+  61 episodes sourced the 1A/0S stripped twin over the 4A/1S DTS-HD MA master
+  (incl. B3D3 "E17" = the director's commentary, single AC3, which carries the
+  episode audio UNDER the directors so a whisper sample of `a:0` reads as
+  "episode" and does NOT flag it). **The reliable commentary/stripped signal is
+  stream-level, not content:** a lone lossy AC3 track where the disc's episodes
+  carry DTS-HD MA. Audit any finished project with a per-selection lossless check
+  (`handbrake_scan(...).lossless`); a re-scan with a WORKING HandBrake pass fixes
+  the dedup (clean master out-ranks the stripped twin) — the DB is a cache, so
+  the fix is `vj scan` again, then re-run align/synopsis/adjudicate.
 - **Two playlists over the *identical* clips** (a lossless/multi-language master
   and a stripped stereo copy — Avatar B1D3 authored every episode as both pl
   60x = DTS-HD MA 4A/1S and pl 25x = AC3-stereo 1A/0S, byte-identical clips and

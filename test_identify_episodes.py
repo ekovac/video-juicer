@@ -399,6 +399,16 @@ class SubsetDedupTest(unittest.TestCase):
         ts = [self._t(1, 1400, ("intro", "a")), self._t(2, 1400, ("intro", "b"))]
         self.assertEqual(len(ie.dedup_subset_playlists(ts)), 2)
 
+    def test_playall_not_swallow_multiepisode_subrun(self):
+        # Avatar B3D3: the E18-E21 finale (91m) is a clip-subset of the
+        # E17-E21 play-all (116m). The old 1.5x ratio guard dropped it
+        # (116 <= 91*1.5); the finale must survive — it's the real title.
+        finale = self._t(602, 5480, ("01093", "01086", "01095"))       # 91m
+        playall = self._t(600, 6953, ("01093", "01062", "01086", "01095"))  # 116m
+        ep17 = self._t(601, 1474, ("01093", "01062"))                  # 24m
+        kept = sorted(t.id for t in ie.dedup_subset_playlists([finale, playall, ep17]))
+        self.assertEqual(kept, [600, 601, 602])
+
 
 class EpisodeGroupTest(unittest.TestCase):
     class StubTmdb:

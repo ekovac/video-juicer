@@ -255,6 +255,15 @@ def dedup_identical_clips(titles: list[Title],
     return sorted(best.values(), key=lambda t: t.id)
 
 
+# A body+recap/logo playlist is only a recap clip longer than the body alone;
+# anything more is a genuinely different grouping (a play-all, or a multi-episode
+# sub-run), which must NOT be swallowed as a "near-duplicate". Absolute, not a
+# ratio: a ratio (old 1.5x) let a play-all only ONE episode longer than a large
+# sub-run eat it — Avatar B3D3 pl600 (E17-E21, 116m) dropped the clean pl602
+# (E18-E21, 91m) because 116 <= 91*1.5. A recap/logo is a few minutes at most.
+_RECAP_MAX_S = 300
+
+
 def dedup_subset_playlists(titles: list[Title]) -> list[Title]:
     """Drop playlists that are a near-duplicate of a fuller one.
 
@@ -262,9 +271,11 @@ def dedup_subset_playlists(titles: list[Title]) -> list[Title]:
     and the body with a logo/recap clip prepended (e.g. Avatar: clips
     (01094,) vs (01100, 01088, 01094)). The first is a strict subset of the
     second and the same episode. Drop the subset, keep the fuller version
-    (which carries the title/recap). The 1.5x length guard stops a long
-    play-all (a superset of many episodes) from swallowing the episodes it
-    contains."""
+    (which carries the title/recap) — but ONLY when the fuller one is at most a
+    recap/logo (`_RECAP_MAX_S`) longer. A play-all (superset of many episodes)
+    or a multi-episode sub-run is much longer and must survive: e.g. Avatar
+    B3D3's E18-E21 finale (91m) is a clip-subset of the E17-E21 play-all (116m)
+    but is the real title to rip, not a duplicate."""
     drop = set()
     for a in titles:
         if not a.clips or id(a) in drop:
@@ -274,8 +285,8 @@ def dedup_subset_playlists(titles: list[Title]) -> list[Title]:
             if a is b or not b.clips:
                 continue
             sb = set(b.clips)
-            if sa < sb and b.duration <= a.duration * 1.5:
-                drop.add(id(a))     # a is the subset (shorter); b is fuller
+            if sa < sb and b.duration - a.duration <= _RECAP_MAX_S:
+                drop.add(id(a))     # a is the subset; b adds only a recap/logo
                 break
     return [t for t in titles if id(t) not in drop]
 
