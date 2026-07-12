@@ -969,6 +969,19 @@ class TranscodeTests(unittest.TestCase):
         self.assertEqual(tc.parse_tags(""), {})
         self.assertEqual(tc.parse_tags("not xml <<<"), {})
 
+    def test_is_matroska_magic(self):
+        import transcode as tc, tempfile, os
+        with tempfile.TemporaryDirectory() as d:
+            mkv = os.path.join(d, "a.mkv")
+            with open(mkv, "wb") as f:
+                f.write(b"\x1a\x45\xdf\xa3rest")          # EBML head
+            self.assertTrue(tc._is_matroska(Path(mkv)))
+            mp4 = os.path.join(d, "b.mkv")
+            with open(mp4, "wb") as f:
+                f.write(b"\x00\x00\x00\x20ftypmp42")       # MP4 ftyp box
+            self.assertFalse(tc._is_matroska(Path(mp4)))
+            self.assertFalse(tc._is_matroska(Path(d) / "missing.mkv"))
+
 
 if __name__ == "__main__":
     unittest.main()

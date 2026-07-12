@@ -127,8 +127,23 @@ def read_tags(path: Path) -> dict:
 def write_tags(path: Path, simples: dict, workdir: Path) -> None:
     xmlf = workdir / (path.stem + ".tags.xml")
     xmlf.write_text(tags_xml(simples))
-    run([MKVPROPEDIT, str(path), "--tags", f"global:{xmlf}"], timeout=120)
+    res = run([MKVPROPEDIT, str(path), "--tags", f"global:{xmlf}"], timeout=120)
     xmlf.unlink(missing_ok=True)
+    if res.returncode != 0:   # don't leave an untagged file looking done
+        raise OSError(f"mkvpropedit failed ({res.returncode}): "
+                      f"{(res.stderr or '').strip()[:200]}")
+
+
+def _is_matroska(path: Path) -> bool:
+    """EBML magic bytes. HandBrake picks its muxer from the output extension, so
+    a wrong temp name (or a preset defaulting to MP4) can yield a non-MKV file;
+    check the container so that fails LOUDLY instead of shipping an untagged MP4
+    with a .mkv name (which then can't be tagged and never matches on re-run)."""
+    try:
+        with open(path, "rb") as fh:
+            return fh.read(4) == b"\x1a\x45\xdf\xa3"
+    except OSError:
+        return False
 
 
 def _tool_missing() -> Optional[str]:
@@ -288,10 +303,14 @@ def _run_step(s: dict, existing: Optional[dict], ctx: dict, workdir: Path,
     if s["action"] == "reencode" and existing and os.path.exists(existing["path"]):
         os.remove(existing["path"])
     target.parent.mkdir(parents=True, exist_ok=True)
-    part = target.with_suffix(".mkv.part")
+    # The temp keeps a .mkv extension AND we force `--format av_mkv`: HandBrake
+    # chooses its muxer from the output extension, so a bare ".part" makes it
+    # fall back to the preset's container (MP4) and write MP4 bytes into a .mkv
+    # name. Both guards ensure Matroska; _is_matroska below verifies it.
+    part = target.with_name(target.stem + ".vjpart.mkv")
     r = s["record"]
-    cmd = [HANDBRAKE, *s["opts"], "-i", str(r["image"]), "-t", str(r["title"]),
-           "--preset", s["preset"], "-o", str(part)]
+    cmd = [HANDBRAKE, "--format", "av_mkv", *s["opts"], "-i", str(r["image"]),
+           "-t", str(r["title"]), "--preset", s["preset"], "-o", str(part)]
     log.info("transcode: encoding %s -> %s", s["ep_key"], target.name)
     # Do NOT capture: a multi-hour HandBrake run streams continuous progress to
     # stderr; buffering it (as discs.run does) would grow unbounded. No timeout.
@@ -300,6 +319,9 @@ def _run_step(s: dict, existing: Optional[dict], ctx: dict, workdir: Path,
         raise OSError(f"HandBrake exited {res.returncode}")
     if not (part.exists() and part.stat().st_size > 0):
         raise OSError("HandBrake produced no output")
+    if not _is_matroska(part):
+        part.unlink(missing_ok=True)
+        raise OSError("HandBrake did not produce a Matroska file (check preset/format)")
     write_tags(part, _simples(s, ctx), workdir)
     os.replace(part, target)
     done["encoded"] += 1
