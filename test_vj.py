@@ -969,6 +969,21 @@ class TranscodeTests(unittest.TestCase):
         self.assertEqual(tc.parse_tags(""), {})
         self.assertEqual(tc.parse_tags("not xml <<<"), {})
 
+    def test_handbrake_opts_passthrough_after_dashdash(self):
+        # the footgun fix: HandBrake flags (which start with --) go after `--`
+        # so argparse's leading-dash trap can't fire. db is still captured.
+        ns = vj.build_parser().parse_args([
+            "transcode", "my.db", "--output-prefix", "/out",
+            "--handbrake-preset", "AV1", "--",
+            "--preset-import-gui", "--encoder-preset", "8"])
+        self.assertEqual(str(ns.db), "my.db")
+        self.assertEqual(ns.handbrake_opts,
+                         ["--preset-import-gui", "--encoder-preset", "8"])
+        # and none is fine
+        ns2 = vj.build_parser().parse_args(
+            ["transcode", "my.db", "--output-prefix", "/out"])
+        self.assertEqual(ns2.handbrake_opts, [])
+
     def test_is_matroska_magic(self):
         import transcode as tc, tempfile, os
         with tempfile.TemporaryDirectory() as d:

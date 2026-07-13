@@ -1134,15 +1134,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_tc.add_argument("--handbrake-preset", default="Fast 1080p30")
     p_tc.add_argument("--handbrake-preset-alt", default=None,
                       help="preset for video-format outliers (default: same as --handbrake-preset)")
-    p_tc.add_argument("--handbrake-opts", default=None,
-                      help="extra HandBrakeCLI flags as ONE string (shlex-split), "
-                           "e.g. --handbrake-opts '--encoder-preset ultrafast'")
     p_tc.add_argument("--scratch-dir", type=Path, default=None,
                       help="dir for temp .part files + tag XML (real disk)")
     p_tc.add_argument("--dry-run", action="store_true",
                       help="show the encode/rename/retag/skip plan without running")
     p_tc.add_argument("--force", action="store_true",
                       help="re-encode even outputs whose recipe is unchanged")
+    # Pass-through HandBrake flags go after `--` (like cargo/npm/pytest). This
+    # avoids argparse's leading-dash trap: an optional taking a value that
+    # itself starts with `--` (every HandBrake flag) can't be given in the
+    # space form. Everything after `--` lands here verbatim, dashes and all,
+    # e.g.  vj transcode db --output-prefix X -- --preset-import-gui --encoder-preset 8
+    p_tc.add_argument("handbrake_opts", nargs="*", metavar="-- HANDBRAKE_FLAG ...",
+                      help="extra flags after `--`, passed straight to HandBrakeCLI")
     p_tc.set_defaults(func=cmd_transcode)
 
     return ap

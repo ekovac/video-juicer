@@ -209,8 +209,10 @@ def _plan(conn, args) -> tuple[list[dict], dict]:
 
     preset = args.handbrake_preset
     preset_alt = getattr(args, "handbrake_preset_alt", None) or preset
+    # From the CLI this is already a list (the post-`--` passthrough); a string
+    # (a programmatic caller) is shlex-split for convenience.
     raw_opts = getattr(args, "handbrake_opts", None)
-    opts = shlex.split(raw_opts) if isinstance(raw_opts, str) else (raw_opts or [])
+    opts = shlex.split(raw_opts) if isinstance(raw_opts, str) else list(raw_opts or [])
     prefix = Path(args.output_prefix or ".")
 
     majority = _record_video_majority(records)
