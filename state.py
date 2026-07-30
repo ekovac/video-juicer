@@ -507,6 +507,16 @@ def set_assignment(
     conn.commit()
 
 
+def delete_assignment(conn: sqlite3.Connection, title_id: int) -> None:
+    conn.execute("DELETE FROM assignment WHERE title_id=?", (title_id,))
+    conn.commit()
+
+
+def delete_all_assignments(conn: sqlite3.Connection) -> None:
+    conn.execute("DELETE FROM assignment")
+    conn.commit()
+
+
 def get_assignment(conn: sqlite3.Connection, title_id: int) -> Optional[sqlite3.Row]:
     return conn.execute(
         "SELECT * FROM assignment WHERE title_id=?", (title_id,)).fetchone()

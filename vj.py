@@ -338,6 +338,7 @@ def cmd_scan(args) -> int:
         log.info("scanning %s", p)
         disc = scan_disc(p)
         disc_id = state.add_disc(conn, disc)
+        compute.run_streams(conn, argparse.Namespace(disc=disc_id))
         scanned.append({
             "disc_id": disc_id, "path": str(disc.path), "format": disc.format,
             "label": disc.label, "season_hint": disc.season_hint,
@@ -544,6 +545,19 @@ def cmd_frame(args) -> int:
     return 0
 
 
+def _resolve_title_arg(conn, args) -> int | None:
+    if getattr(args, "title", None) is not None:
+        return args.title
+    disc = getattr(args, "disc", None)
+    playlist = getattr(args, "playlist", None)
+    if disc is not None and playlist is not None:
+        row = conn.execute("SELECT t.id FROM title t JOIN disc d ON t.disc_id = d.id "
+                           "WHERE d.label=? AND t.title_number=?", (disc, playlist)).fetchone()
+        if row:
+            return row[0]
+    return None
+
+
 def cmd_resolve(args) -> int:
     conn, err = _open(args)
     if err:
@@ -564,9 +578,13 @@ def cmd_assign(args) -> int:
     conn, err = _open(args)
     if err:
         return err
-    if conn.execute("SELECT 1 FROM title WHERE id=?", (args.title,)).fetchone() is None:
+    title_id = _resolve_title_arg(conn, args)
+    if title_id is None:
         conn.close()
-        return fail(args, "no-title", f"no title {args.title}")
+        return fail(args, "no-title", "could not resolve title (provide --title or --disc + --playlist)")
+    if conn.execute("SELECT 1 FROM title WHERE id=?", (title_id,)).fetchone() is None:
+        conn.close()
+        return fail(args, "no-title", f"no title {title_id}")
     try:
         ids = [_parse_ep(conn, s) for s in args.episode]
     except ValueError:
@@ -576,12 +594,12 @@ def cmd_assign(args) -> int:
         conn.close()
         return fail(args, "no-episode", "one or more episodes not found")
     by = "agent" if args.agent else "human"
-    state.set_assignment(conn, args.title, ids, status="confirmed",
+    state.set_assignment(conn, title_id, ids, status="confirmed",
                          decided_by=by, note=args.note)
     conn.close()
-    emit(args, {"ok": True, "title_id": args.title, "episodes": args.episode,
+    emit(args, {"ok": True, "title_id": title_id, "episodes": args.episode,
                 "status": "confirmed", "decided_by": by},
-         human=f"title {args.title} -> {'+'.join(args.episode)} [confirmed by {by}]")
+         human=f"title {title_id} -> {'+'.join(args.episode)} [confirmed by {by}]")
     return 0
 
 
@@ -589,17 +607,21 @@ def cmd_confirm(args) -> int:
     conn, err = _open(args)
     if err:
         return err
-    a = state.get_assignment(conn, args.title)
+    title_id = _resolve_title_arg(conn, args)
+    if title_id is None:
+        conn.close()
+        return fail(args, "no-title", "could not resolve title (provide --title or --disc + --playlist)")
+    a = state.get_assignment(conn, title_id)
     if a is None or not json.loads(a["episode_ids_json"]):
         conn.close()
         return fail(args, "no-proposal",
-                    f"title {args.title} has no proposal to confirm")
+                    f"title {title_id} has no proposal to confirm")
     by = "agent" if args.agent else "human"
-    state.set_assignment(conn, args.title, json.loads(a["episode_ids_json"]),
+    state.set_assignment(conn, title_id, json.loads(a["episode_ids_json"]),
                          status="confirmed", decided_by=by, note=a["note"])
     conn.close()
-    emit(args, {"ok": True, "title_id": args.title, "status": "confirmed",
-                "decided_by": by}, human=f"title {args.title} confirmed by {by}")
+    emit(args, {"ok": True, "title_id": title_id, "status": "confirmed",
+                "decided_by": by}, human=f"title {title_id} confirmed by {by}")
     return 0
 
 
@@ -607,16 +629,45 @@ def cmd_reject(args) -> int:
     conn, err = _open(args)
     if err:
         return err
-    if conn.execute("SELECT 1 FROM title WHERE id=?", (args.title,)).fetchone() is None:
+    title_id = _resolve_title_arg(conn, args)
+    if title_id is None:
         conn.close()
-        return fail(args, "no-title", f"no title {args.title}")
+        return fail(args, "no-title", "could not resolve title (provide --title or --disc + --playlist)")
+    if conn.execute("SELECT 1 FROM title WHERE id=?", (title_id,)).fetchone() is None:
+        conn.close()
+        return fail(args, "no-title", f"no title {title_id}")
     by = "agent" if args.agent else "human"
-    state.set_assignment(conn, args.title, [], status="rejected",
+    state.set_assignment(conn, title_id, [], status="rejected",
                          decided_by=by, note=args.note)
     conn.close()
-    emit(args, {"ok": True, "title_id": args.title, "status": "rejected",
+    emit(args, {"ok": True, "title_id": title_id, "status": "rejected",
                 "decided_by": by},
-         human=f"title {args.title} rejected (not an episode) by {by}")
+         human=f"title {title_id} rejected (not an episode) by {by}")
+    return 0
+
+
+def cmd_unassign(args) -> int:
+    conn, err = _open(args)
+    if err:
+        return err
+    if args.all:
+        state.delete_all_assignments(conn)
+        conn.close()
+        emit(args, {"ok": True, "status": "unassigned_all"},
+             human="all titles unassigned (cleared decisions)")
+        return 0
+
+    title_id = _resolve_title_arg(conn, args)
+    if title_id is None:
+        conn.close()
+        return fail(args, "no-title", "could not resolve title (provide --title or --disc + --playlist)")
+    if conn.execute("SELECT 1 FROM title WHERE id=?", (title_id,)).fetchone() is None:
+        conn.close()
+        return fail(args, "no-title", f"no title {title_id}")
+    state.delete_assignment(conn, title_id)
+    conn.close()
+    emit(args, {"ok": True, "title_id": title_id, "status": "unassigned"},
+         human=f"title {title_id} unassigned (cleared decision)")
     return 0
 
 
@@ -1051,7 +1102,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_assign = sub.add_parser("assign", help="confirm a title -> episode(s)")
     p_assign.add_argument("db", type=Path)
-    p_assign.add_argument("--title", type=int, required=True)
+    p_assign.add_argument("--title", type=int, help="internal title id")
+    p_assign.add_argument("--disc", help="disc name (e.g. EXPANSE_S1D1_NA)")
+    p_assign.add_argument("--playlist", type=int, help="playlist number (e.g. 800)")
     p_assign.add_argument("--episode", action="append", required=True,
                           help="SxxEyy; repeat for a two-parter")
     p_assign.add_argument("--note")
@@ -1061,16 +1114,28 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_confirm = sub.add_parser("confirm", help="accept a title's standing proposal")
     p_confirm.add_argument("db", type=Path)
-    p_confirm.add_argument("--title", type=int, required=True)
+    p_confirm.add_argument("--title", type=int, help="internal title id")
+    p_confirm.add_argument("--disc", help="disc name")
+    p_confirm.add_argument("--playlist", type=int, help="playlist number")
     p_confirm.add_argument("--agent", action="store_true")
     p_confirm.set_defaults(func=cmd_confirm)
 
     p_reject = sub.add_parser("reject", help="mark a title as not an episode")
     p_reject.add_argument("db", type=Path)
-    p_reject.add_argument("--title", type=int, required=True)
+    p_reject.add_argument("--title", type=int, help="internal title id")
+    p_reject.add_argument("--disc", help="disc name")
+    p_reject.add_argument("--playlist", type=int, help="playlist number")
     p_reject.add_argument("--note")
     p_reject.add_argument("--agent", action="store_true")
     p_reject.set_defaults(func=cmd_reject)
+
+    p_unassign = sub.add_parser("unassign", help="clear a title's assigned/confirmed/rejected decision")
+    p_unassign.add_argument("db", type=Path)
+    p_unassign.add_argument("--title", type=int, help="internal title id")
+    p_unassign.add_argument("--disc", help="disc name")
+    p_unassign.add_argument("--playlist", type=int, help="playlist number")
+    p_unassign.add_argument("--all", action="store_true", help="clear all assignments")
+    p_unassign.set_defaults(func=cmd_unassign)
 
     p_auto = sub.add_parser("auto", help="run the whole chain: align→resolve→"
                             "(escalate OCR)→resolve→elimination→resolve")
