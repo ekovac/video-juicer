@@ -329,7 +329,7 @@ def _run_step(s: dict, existing: Optional[dict], ctx: dict, workdir: Path,
     
     buf = ""
     last_print = 0
-    prog_re = re.compile(r"Encoding: task \d+ of \d+, (\d+\.\d+) %")
+    prog_re = re.compile(r"Encoding: task (\d+) of (\d+), (\d+\.\d+) %")
     while True:
         try:
             chunk = os.read(master_fd, 1024).decode('utf-8', errors='ignore')
@@ -341,7 +341,14 @@ def _run_step(s: dict, existing: Optional[dict], ctx: dict, workdir: Path,
             if char in ('\r', '\n'):
                 m = prog_re.search(buf)
                 if m and time.time() - last_print > 1.0:
-                    pct = float(m.group(1)) / 100.0
+                    task_num = int(m.group(1))
+                    total_tasks = int(m.group(2))
+                    # Ignore fast pre-passes (like subtitle scans) so they don't wildly skew the ETA
+                    if task_num < total_tasks:
+                        pct = 0.0
+                    else:
+                        pct = float(m.group(3)) / 100.0
+                        
                     current_dur = r.get("title_seconds", 0)
                     completed_dur = ctx.get("completed_duration", 0) + (current_dur * pct)
                     total_dur = ctx.get("total_duration", 1)
@@ -352,7 +359,7 @@ def _run_step(s: dict, existing: Optional[dict], ctx: dict, workdir: Path,
                         remaining = (total_dur - completed_dur) / speed
                         rem_h = int(remaining // 3600)
                         rem_m = int((remaining % 3600) // 60)
-                        sys.stdout.write(f"\rEncoding {s['ep_key']} [{pct*100:.1f}%] | Global ETA: {rem_h}h{rem_m:02d}m    ")
+                        sys.stdout.write(f"\rEncoding {s['ep_key']} [{pct*100:.1f}%] (Pass {task_num}/{total_tasks}) | Global ETA: {rem_h}h{rem_m:02d}m    ")
                         sys.stdout.flush()
                     last_print = time.time()
                 buf = ""
