@@ -262,8 +262,15 @@ def run_transcode(conn, args) -> dict:
                 "steps": [{"ep": s["ep_key"], "action": s["action"],
                            "target": s["target"]} for s in steps]}
 
-    import tempfile
+    import tempfile, time
     done = {"encoded": 0, "renamed": 0, "retagged": 0, "skipped": 0, "failed": 0}
+    
+    # Setup global progress tracking
+    encode_steps = [s for s in steps if s["action"] in ("encode", "reencode")]
+    ctx["total_duration"] = sum(s["record"].get("title_seconds", 0) for s in encode_steps)
+    ctx["completed_duration"] = 0
+    ctx["start_time"] = time.time()
+    
     with tempfile.TemporaryDirectory(prefix="vj-tc-", dir=args.scratch_dir) as tmp:
         workdir = Path(tmp)
         for s in steps:
@@ -310,15 +317,56 @@ def _run_step(s: dict, existing: Optional[dict], ctx: dict, workdir: Path,
     # fall back to the preset's container (MP4) and write MP4 bytes into a .mkv
     # name. Both guards ensure Matroska; _is_matroska below verifies it.
     part = target.with_name(target.stem + ".vjpart.mkv")
+    part.unlink(missing_ok=True)
     r = s["record"]
     cmd = [HANDBRAKE, "--format", "av_mkv", *s["opts"], "-i", str(r["image"]),
            "-t", str(r["title"]), "--preset", s["preset"], "-o", str(part)]
     log.info("transcode: encoding %s -> %s", s["ep_key"], target.name)
-    # Do NOT capture: a multi-hour HandBrake run streams continuous progress to
-    # stderr; buffering it (as discs.run does) would grow unbounded. No timeout.
-    res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    if res.returncode != 0:
-        raise OSError(f"HandBrake exited {res.returncode}")
+    import sys, re, time, pty, os
+    master_fd, slave_fd = pty.openpty()
+    p = subprocess.Popen(cmd, stdout=slave_fd, stderr=subprocess.STDOUT, close_fds=True)
+    os.close(slave_fd)
+    
+    buf = ""
+    last_print = 0
+    prog_re = re.compile(r"Encoding: task \d+ of \d+, (\d+\.\d+) %")
+    while True:
+        try:
+            chunk = os.read(master_fd, 1024).decode('utf-8', errors='ignore')
+        except OSError:
+            break
+        if not chunk:
+            break
+        for char in chunk:
+            if char in ('\r', '\n'):
+                m = prog_re.search(buf)
+                if m and time.time() - last_print > 1.0:
+                    pct = float(m.group(1)) / 100.0
+                    current_dur = r.get("title_seconds", 0)
+                    completed_dur = ctx.get("completed_duration", 0) + (current_dur * pct)
+                    total_dur = ctx.get("total_duration", 1)
+                    
+                    elapsed = time.time() - ctx.get("start_time", time.time())
+                    if completed_dur > 0:
+                        speed = completed_dur / elapsed
+                        remaining = (total_dur - completed_dur) / speed
+                        rem_h = int(remaining // 3600)
+                        rem_m = int((remaining % 3600) // 60)
+                        sys.stdout.write(f"\rEncoding {s['ep_key']} [{pct*100:.1f}%] | Global ETA: {rem_h}h{rem_m:02d}m    ")
+                        sys.stdout.flush()
+                    last_print = time.time()
+                buf = ""
+            else:
+                buf += char
+            
+    p.wait()
+    os.close(master_fd)
+    sys.stdout.write("\n")
+    if p.returncode != 0:
+        raise OSError(f"HandBrake exited {p.returncode}")
+    
+    ctx["completed_duration"] = ctx.get("completed_duration", 0) + r.get("title_seconds", 0)
+
     if not (part.exists() and part.stat().st_size > 0):
         raise OSError("HandBrake produced no output")
     if not _is_matroska(part):
