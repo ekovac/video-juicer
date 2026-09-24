@@ -26,8 +26,7 @@ from identify import (align, classify_disc, recover_by_elimination,
                       stream_signature, verify_title)
 import synopsis
 from synopsis import (assign_by_synopsis, full_transcript, rank_candidates,
-                      sample_transcript, subtitle_ocr_transcript,
-                      subtitle_transcript,
+                      sample_transcript, subtitle_cc, subtitle_ocr,
                       transcribe_and_rank)  # noqa: F401 (public re-export)
 
 # Map align's confidence label to a numeric evidence confidence.
@@ -407,6 +406,10 @@ def run_synopsis(conn, args) -> dict:
 
     model = getattr(args, "judge_model", None) or synopsis.JUDGE_MODEL
     retranscribe = getattr(args, "retranscribe", False)
+    # Refresh the transcript cache WITHOUT judging (no evidence written) — e.g.
+    # to backfill cue timings. Also lifts the multi-episode guard: that guard
+    # exists to avoid judging a play-all, and here nothing is judged.
+    transcribe_only = getattr(args, "transcribe_only", False)
     # Where the dialogue TEXT comes from. 'auto' prefers SUBTITLES (DVD closed
     # captions — exact words, whole episode, near-instant, no OCR) and falls back
     # to whisper audio when a title has none; 'subtitle'/'audio' force one.
@@ -436,8 +439,9 @@ def run_synopsis(conn, args) -> dict:
     # it doesn't apply so the chain falls through.
     methods = []   # (source, cache_windows, cache_length, extractor)
     if tsrc in ("auto", "subtitle"):
-        methods.append(("cc", 0, 0.0, subtitle_transcript))
-        methods.append(("subtitle-ocr", 0, 0.0, subtitle_ocr_transcript))
+        # subtitle extractors return (text, timed cues); audio returns text
+        methods.append(("cc", 0, 0.0, subtitle_cc))
+        methods.append(("subtitle-ocr", 0, 0.0, subtitle_ocr))
     if tsrc in ("auto", "audio"):
         methods.append(("audio", cache_windows, cache_length, _audio))
 
@@ -485,7 +489,8 @@ def run_synopsis(conn, args) -> dict:
                              getattr(args, "include_specials", False))
             season_key = disc.season_hint or 0
 
-            if title.duration > disc_cap.get(disc_id, float("inf")):
+            if title.duration > disc_cap.get(disc_id, float("inf")) \
+                    and not transcribe_only:
                 log.info("synopsis: skipping title %d (%.0fm) — multi-episode "
                          "(> 1.5× disc median), not a single-episode target",
                          tid, title.duration / 60)
@@ -503,15 +508,25 @@ def run_synopsis(conn, args) -> dict:
                         break
             if transcript is None:   # extract fresh, walking the fallback chain
                 for src, cw, cl, fn in methods:
-                    txt = fn(disc, title, workdir)
+                    res = fn(disc, title, workdir)
+                    txt, cues = res if isinstance(res, tuple) else (res, None)
                     if txt:
                         transcript, used = txt, src
-                        state.put_transcript(conn, tid, txt, cw, cl, src)
+                        state.put_transcript(conn, tid, txt, cw, cl, src, cues)
                         break
-                else:   # nothing produced text — cache empty so re-runs don't retry
-                    state.put_transcript(conn, tid, "", cache_windows, cache_length,
-                                         "audio")
+                else:   # nothing produced text — cache empty so re-runs don't retry,
+                    # but never clobber a good transcript (a --retranscribe that
+                    # failed transiently would otherwise wipe it)
+                    if not state.get_transcript(conn, tid):
+                        state.put_transcript(conn, tid, "", cache_windows,
+                                             cache_length, "audio")
+                    else:
+                        log.warning("synopsis: re-extraction of title %d produced "
+                                    "nothing; keeping the cached transcript", tid)
 
+            if transcribe_only:
+                recs.append((tid, season_key, pool, [], "", used))
+                continue
             if transcript:
                 ranked, evidence = rank_candidates(
                     transcript, pool, model, args.ollama_host)
@@ -519,6 +534,10 @@ def run_synopsis(conn, args) -> dict:
                 ranked, evidence = [], ("no subtitles found" if tsrc == "subtitle"
                                         else "no dialogue transcribed")
             recs.append((tid, season_key, pool, ranked, evidence, used))
+
+    if transcribe_only:   # extraction only: no judge calls, no evidence written
+        return {"ok": True, "transcribed": [
+            {"title_id": tid, "source": used} for tid, *_rest, used in recs]}
 
     # --- phase 2: bijection assignment over the rankings ---
     # Real episodes get a per-SEASON bijection (each disc pair aligns within its

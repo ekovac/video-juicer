@@ -135,17 +135,76 @@ def srt_to_text(srt: str) -> str:
     return " ".join(out).strip()
 
 
+# A timed caption: (start_s, end_s, text). Kept beside the flattened transcript
+# so position-aware passes (recap detection: recaps are rapid cuts) can use WHEN
+# a line was said, which the flat text throws away.
+Cue = tuple
+
+
+_SRT_TIME = re.compile(
+    r"(\d+):(\d\d):(\d\d)[,.](\d{3})\s*-->\s*(\d+):(\d\d):(\d\d)[,.](\d{3})")
+
+
+def srt_to_cues(srt: str) -> list:
+    """An SRT as [(start, end, text)] — one cue per block, markup stripped. No
+    roll-up dedup here (that's srt_to_text's job for the flat text); a cue's
+    timing is the point."""
+    cues = []
+    for block in srt.replace("\r", "").split("\n\n"):
+        m = _SRT_TIME.search(block)
+        if not m:
+            continue
+        g = [int(x) for x in m.groups()]
+        start = g[0] * 3600 + g[1] * 60 + g[2] + g[3] / 1000
+        end = g[4] * 3600 + g[5] * 60 + g[6] + g[7] / 1000
+        rows = [html.unescape(_SRT_TAG.sub("", r)).strip()
+                for r in block.splitlines()
+                if "-->" not in r and not r.strip().isdigit()]
+        text = " ".join(r for r in rows if r)
+        if text:
+            cues.append((round(start, 3), round(end, 3), text))
+    return cues
+
+
+def frames_to_cues(times: list, texts: list, end: float) -> list:
+    """Per-frame OCR of the change-only subtitle render → [(start, end, text)].
+    Each kept frame is a caption CHANGE, so a caption lasts until the next kept
+    frame (blank frames — a cleared caption — end the previous cue and start
+    nothing). Adjacent identical reads merge. [] if the timestamps and frames
+    don't line up (fail-soft: the flat text is still usable)."""
+    if len(times) != len(texts):
+        log.warning("synopsis: %d frame times for %d frames — no cue timings",
+                    len(times), len(texts))
+        return []
+    cues: list = []
+    for i, (t, text) in enumerate(zip(times, texts)):
+        text = " ".join(text.split())
+        if not text:
+            continue
+        stop = times[i + 1] if i + 1 < len(times) else end
+        if cues and cues[-1][2] == text and abs(cues[-1][1] - t) < 1e-6:
+            cues[-1] = (cues[-1][0], round(stop, 3), text)
+        else:
+            cues.append((round(t, 3), round(stop, 3), text))
+    return cues
+
+
 def subtitle_transcript(disc: Disc, title: Title, workdir: Path) -> str:
+    """Flat-text form of `subtitle_cc` (see there)."""
+    return subtitle_cc(disc, title, workdir)[0]
+
+
+def subtitle_cc(disc: Disc, title: Title, workdir: Path) -> tuple[str, list]:
     """Pull the episode's dialogue from its SUBTITLES — better than whisper (exact
     words, whole episode) and near-instant (no audio decode, no transcription).
 
     DVD path: the MPEG-2 video carries EIA-608 closed captions as TEXT (no OCR).
     Stream-copy the title to a local mpg (preserving the video user-data;
     `-nosound` keeps it small) then let ffmpeg's `subcc` decoder emit an SRT.
-    Returns "" when there are no captions (→ caller falls back to audio) or on a
-    non-DVD disc — Blu-ray subtitles are PGS bitmaps (would need OCR), a follow-up."""
+    Returns (text, cues); ("", []) when there are no captions (→ caller falls
+    back) or on a non-DVD disc — Blu-ray subtitles are PGS bitmaps (subtitle_ocr)."""
     if disc.format != "dvd":
-        return ""
+        return "", []
     mpg = workdir / f"cc_{title.id}.mpg"
     srt = workdir / f"cc_{title.id}.srt"
     for p in (mpg, srt):
@@ -155,18 +214,19 @@ def subtitle_transcript(disc: Disc, title: Title, workdir: Path) -> str:
              "-nosound", "-ovc", "copy", "-of", "mpeg", "-o", str(mpg),
              "-really-quiet"], timeout=900)
         if not (mpg.exists() and mpg.stat().st_size > 0):
-            return ""
+            return "", []
         # movie source exposes closed captions as a second output (subcc)
         run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi",
              "-i", f"movie={mpg}[out+subcc]", "-map", "0:1", str(srt)],
             timeout=900)
         if not srt.exists() or srt.stat().st_size == 0:
-            return ""
-        return srt_to_text(srt.read_text(errors="replace"))
+            return "", []
+        body = srt.read_text(errors="replace")
+        return srt_to_text(body), srt_to_cues(body)
     except (subprocess.TimeoutExpired, OSError) as e:
         log.warning("synopsis: subtitle extract failed (%s) %s title %d",
                     e, disc.path.name, title.id)
-        return ""
+        return "", []
     finally:
         for p in (mpg, srt):
             p.unlink(missing_ok=True)
@@ -188,6 +248,11 @@ def _probe_video_size(source: list) -> Optional[tuple]:
 
 
 def subtitle_ocr_transcript(disc: Disc, title: Title, workdir: Path) -> str:
+    """Flat-text form of `subtitle_ocr` (see there)."""
+    return subtitle_ocr(disc, title, workdir)[0]
+
+
+def subtitle_ocr(disc: Disc, title: Title, workdir: Path) -> tuple[str, list]:
     """OCR the BITMAP subtitle track (Blu-ray PGS or DVD VOBSUB) into dialogue —
     the fallback when there are no closed captions (BD never carries CC; some DVD
     sets don't either). ffmpeg renders ONLY the subtitle stream onto a black
@@ -197,11 +262,13 @@ def subtitle_ocr_transcript(disc: Disc, title: Title, workdir: Path) -> str:
 
     Blu-ray reads via the `bluray:` protocol directly; DVD has no ffmpeg protocol
     so mplayer first dumps the title's raw program stream (which carries the
-    subpicture) to a local file. Returns "" if there's no subtitle track / OCR
-    backend, so the caller falls through to whisper."""
+    subpicture) to a local file. Returns (text, cues); ("", []) if there's no
+    subtitle track / OCR backend, so the caller falls through to whisper. Cue
+    times come from a `showinfo` tap on the rendered frames (0.5 s resolution —
+    the render runs at 2 fps)."""
     from text_region import ocr_texts, paddle_available
     if disc.format not in ("bluray", "dvd") or not paddle_available():
-        return ""
+        return "", []
     frames = workdir / f"subf_{title.id}"
     frames.mkdir(exist_ok=True)
     dump = workdir / f"sub_{title.id}.{'mkv' if disc.format == 'bluray' else 'vob'}"
@@ -227,11 +294,11 @@ def subtitle_ocr_transcript(disc: Disc, title: Title, workdir: Path) -> str:
                  "-dumpstream", "-dumpfile", str(dump), "-really-quiet"],
                 timeout=dur * 2 + 300)
         if not (dump.exists() and dump.stat().st_size > 0):
-            return ""
+            return "", []
         if size is None:                       # DVD: probe the dumped VOB
             size = _probe_video_size([str(dump)])
         if not size:
-            return ""
+            return "", []
         w, h = size
         # render subs on black, keep only changed frames (one per distinct caption),
         # and DOWNSCALE to ≤960px wide — PGS text is large, OCRs fine at half res,
@@ -244,22 +311,26 @@ def subtitle_ocr_transcript(disc: Disc, title: Title, workdir: Path) -> str:
         # the outer timeout (~76 min/title, observed on Avatar). A finite bg ends
         # the graph at `dur` regardless. (The DVD .vob path has video and never
         # hit this, but the bound is correct there too.)
-        run(["ffmpeg", "-hide_banner", "-y", "-i", str(dump), "-t", str(dur),
-             "-filter_complex",
-             f"color=black:s={w}x{h}:r=2:d={dur}[bg];[bg][0:s:0]overlay=shortest=1,"
-             "mpdecimate,scale='min(960,iw)':-2",
-             "-fps_mode", "vfr", str(frames / "f%05d.png")],
-            timeout=dur * 3 + 300)
+        # `showinfo` (last, so it sees exactly the frames written) logs each
+        # frame's pts_time to stderr in output order — the cue timings.
+        r = run(["ffmpeg", "-hide_banner", "-y", "-i", str(dump), "-t", str(dur),
+                 "-filter_complex",
+                 f"color=black:s={w}x{h}:r=2:d={dur}[bg];[bg][0:s:0]overlay=shortest=1,"
+                 "mpdecimate,scale='min(960,iw)':-2,showinfo",
+                 "-fps_mode", "vfr", str(frames / "f%05d.png")],
+                timeout=dur * 3 + 300)
+        times = [float(t) for t in re.findall(r"pts_time:\s*([-0-9.]+)", r.stderr)]
+        texts = list(ocr_texts(sorted(frames.glob("f*.png"))))   # parallel OCR
         out: list[str] = []
-        for text in ocr_texts(sorted(frames.glob("f*.png"))):   # parallel OCR
+        for text in texts:
             text = " ".join(text.split())
             if text and (not out or text != out[-1]):
                 out.append(text)
-        return " ".join(out).strip()
+        return " ".join(out).strip(), frames_to_cues(times, texts, float(dur))
     except (subprocess.TimeoutExpired, OSError) as e:
         log.warning("synopsis: subtitle OCR failed (%s) %s title %d",
                     e, disc.path.name, title.id)
-        return ""
+        return "", []
     finally:
         dump.unlink(missing_ok=True)
         for png in frames.glob("f*.png"):

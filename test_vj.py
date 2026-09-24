@@ -1085,5 +1085,69 @@ class BenchScoreTests(unittest.TestCase):
         self.assertAlmostEqual(s["cost_usd"], 0.042)
 
 
+class CueTimingTests(Base):
+    """Timed subtitle cues: SRT parse, frame→cue timing, storage, and the
+    --transcribe-only extraction path."""
+
+    def test_srt_to_cues(self):
+        from synopsis import srt_to_cues
+        srt = ("1\n00:00:01,500 --> 00:00:03,000\n<i>Previously on</i>\n\n"
+               "2\n00:01:02,250 --> 00:01:04,000\nHOLDEN: Hold on.\nNAOMI: No.\n")
+        self.assertEqual(srt_to_cues(srt), [(1.5, 3.0, "Previously on"),
+                                            (62.25, 64.0, "HOLDEN: Hold on. NAOMI: No.")])
+
+    def test_frames_to_cues_ends_at_next_change_and_merges_repeats(self):
+        from synopsis import frames_to_cues
+        times = [0.0, 1.5, 3.0, 4.5, 6.0]
+        texts = ["", "Hello there", "Hello  there", "", "Bye"]
+        self.assertEqual(frames_to_cues(times, texts, 8.0),
+                         [(1.5, 4.5, "Hello there"), (6.0, 8.0, "Bye")])
+
+    def test_frames_to_cues_fails_soft_on_mismatch(self):
+        from synopsis import frames_to_cues
+        self.assertEqual(frames_to_cues([0.0], ["a", "b"], 5.0), [])
+
+    def test_cues_round_trip_and_absent_for_audio(self):
+        state.upsert_episodes(self.conn, [ep(1, 1, "E1", 1320.0)])
+        did = self.add_disc([title(1, 1320, [1320]), title(2, 1320, [1320])])
+        t1, t2 = state.title_id(self.conn, did, 1), state.title_id(self.conn, did, 2)
+        state.put_transcript(self.conn, t1, "a b", 0, 0.0, "subtitle-ocr",
+                             [(1.0, 2.5, "a"), (3.0, 4.0, "b")])
+        state.put_transcript(self.conn, t2, "whisper", 0, 0.0, "audio")
+        self.assertEqual(state.get_transcript_cues(self.conn, t1),
+                         [(1.0, 2.5, "a"), (3.0, 4.0, "b")])
+        self.assertIsNone(state.get_transcript_cues(self.conn, t2))
+
+    def test_transcribe_only_stores_cues_and_writes_no_evidence(self):
+        state.upsert_episodes(
+            self.conn, [ep(1, k, f"E{k}", 1320.0) for k in range(1, 4)])
+        ts = [Title(id=k, duration=1320.0, chapters=[1320.0], n_audio=2, n_sub=1,
+                    kind="episode-candidate") for k in range(1, 4)]
+        ts.append(Title(id=9, duration=2640.0, chapters=[2640.0], n_audio=2,
+                        n_sub=1, kind="episode-candidate"))   # 2x: guard lifted
+        did = self.add_disc(ts)
+        orig_cc, orig_rc = compute.subtitle_cc, compute.rank_candidates
+        compute.subtitle_cc = lambda d, t, w: (f"line {t.id}",
+                                               [(1.0, 2.0, f"line {t.id}")])
+        compute.rank_candidates = lambda *a: self.fail("judge must not be called")
+        try:
+            res = compute.run_synopsis(self.conn, auto_args(
+                disc=did, title=None, all=False, judge_model=None,
+                synopsis_windows=None, synopsis_length=None, retranscribe=True,
+                synopsis_source="tmdb", transcript_source="subtitle",
+                include_specials=False, transcribe_only=True))
+        finally:
+            compute.subtitle_cc, compute.rank_candidates = orig_cc, orig_rc
+        self.assertTrue(res["ok"])
+        self.assertEqual(len(res["transcribed"]), 4)
+        tid9 = state.title_id(self.conn, did, 9)
+        self.assertEqual(state.get_transcript_cues(self.conn, tid9),
+                         [(1.0, 2.0, "line 9")])
+        for k in (1, 2, 3, 9):
+            tid = state.title_id(self.conn, did, k)
+            self.assertFalse([e for e in state.evidence_for_title(self.conn, tid)
+                              if e["category"] == "synopsis"])
+
+
 if __name__ == "__main__":
     unittest.main()

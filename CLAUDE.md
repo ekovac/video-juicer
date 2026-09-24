@@ -658,6 +658,41 @@ LLM judge matches it against each candidate's plot synopsis.
   misranks — a cascade needs a common score scale first. Opus 5.5 was faster
   than Sonnet 5 here (Sonnet's adaptive thinking: p95 24 s).
 
+- **Recap trimming — tried, NOT on main (code on branch
+  `recap-trim-experiment`: `bench_synopsis.py --trim`, `synopsis.trim_recap`,
+  `synopsis.ngram_recap_cuts`).** The "previously on" recap is dense with
+  PRIOR-episode plot and pulls a judge one episode back: it caused Jev's
+  S02E10/E11 swap (both claimed "Cascade"). Text markers can't find it —
+  "Previously on" survives OCR in 7/61 Expanse transcripts, `(THEME MUSIC
+  PLAYING)` in 31/61 (S2-S3 only, and marks recap+cold-open end, not recap).
+  Three cutters were benchmarked (jev whole-transcript, 60 titles, final/top-1):
+  none 56/46; drop first 1500 chars 58/47; a Jev cutter (a Noul per opening
+  segment "is this recap?" + one change-point) 56/46 — it missed every
+  UNLABELLED recap and tracked segment POSITION, not content; and **shared
+  n-grams** 58/51 — a cue in the first 6 min is recap if it holds a RARE n-gram
+  (in 2..4 titles) that another title has ≥30 s LATER (the direction rule), one
+  change-point over the marks, theme caption caps the cut. The n-gram cutter
+  found real recaps (48/61 titles cut at 45-90 s, none of recap-less S4) but
+  bought only the one S02E10/E11 pair on Jev and nothing on Sonnet 5 (46→43,
+  inside its run-to-run churn: 5 fixed / 8 broken; Sonnet's errors lean to the
+  NEXT episode, which a recap can't cause). Judged not worth the complexity. If
+  revisited: the n-gram approach is the one that works; needs cue timings.
+
+- **Subtitle cue timings are kept (`transcript.cues_json`).** The subtitle
+  extractors (`subtitle_cc` from the SRT, `subtitle_ocr` via a `showinfo` tap on
+  the change-only render, 0.5 s resolution at the 2 fps render) return
+  `(text, [(start, end, text)])`; the flat `text` is byte-identical to before
+  (verified on Expanse S01E05), cues sit beside it (`state.get_transcript_cues`).
+  Audio/whisper transcripts carry no cues. Built for recap detection (recaps
+  are rapid ~1-2 s cues; see the branch note above) and kept as general
+  position-aware evidence.
+  Backfill without re-judging: `vj run synopsis db --title … --retranscribe
+  --transcript-source subtitle --transcribe-only` (no judge call, no evidence
+  written; lifts the multi-episode guard since nothing is judged). A failed
+  re-extraction never overwrites a cached non-empty transcript. Measured cost:
+  ~4.5 min wall / ~87 CPU-min per Expanse BD episode (the PP-OCR pool), slower
+  than the ~2 min figure measured on Avatar — budget hours for a series.
+
 ## Output / rip workflow
 
 - The manifest **`title` field is the number to pass to `HandBrakeCLI -t`.**

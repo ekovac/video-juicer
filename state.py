@@ -121,7 +121,9 @@ CREATE TABLE IF NOT EXISTS transcript (
     windows      INTEGER NOT NULL,      -- audio sampling params it was made with:
     length       REAL NOT NULL,         --   reuse only when both still match
     source       TEXT NOT NULL DEFAULT 'audio',  -- 'subtitle' (CC) | 'audio' (whisper)
-    updated_at   TEXT
+    updated_at   TEXT,
+    cues_json    TEXT                   -- [[start_s, end_s, text], …] for subtitle
+                                        -- sources; NULL = no timings (audio / old)
 );
 
 CREATE TABLE IF NOT EXISTS frame (
@@ -181,6 +183,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
     if tcols and "source" not in tcols:
         conn.execute("ALTER TABLE transcript ADD COLUMN "
                      "source TEXT NOT NULL DEFAULT 'audio'")
+    if tcols and "cues_json" not in tcols:
+        conn.execute("ALTER TABLE transcript ADD COLUMN cues_json TEXT")
 
 
 def _now(conn: sqlite3.Connection) -> str:
@@ -422,18 +426,32 @@ def get_transcript(conn: sqlite3.Connection, title_id: int,
 
 
 def put_transcript(conn: sqlite3.Connection, title_id: int, text: str,
-                   windows: int, length: float, source: str = "audio") -> None:
+                   windows: int, length: float, source: str = "audio",
+                   cues: Optional[list] = None) -> None:
     """Persist a title's dialogue text (+ how it was produced) so a later run — or
     a human/agent — can reuse it without re-extracting. `source` is 'subtitle'
     (closed captions) or 'audio' (whisper); `windows`/`length` are the audio
-    sampling params (0/0 for a full pass or a subtitle transcript)."""
+    sampling params (0/0 for a full pass or a subtitle transcript). `cues` are
+    the timed captions [(start, end, text)] a subtitle source also yields."""
     conn.execute(
-        "INSERT INTO transcript(title_id,text,windows,length,source,updated_at) "
-        "VALUES(?,?,?,?,?,?) ON CONFLICT(title_id) DO UPDATE SET "
+        "INSERT INTO transcript(title_id,text,windows,length,source,updated_at,"
+        "cues_json) VALUES(?,?,?,?,?,?,?) ON CONFLICT(title_id) DO UPDATE SET "
         "text=excluded.text, windows=excluded.windows, length=excluded.length, "
-        "source=excluded.source, updated_at=excluded.updated_at",
-        (title_id, text, windows, length, source, _now(conn)))
+        "source=excluded.source, updated_at=excluded.updated_at, "
+        "cues_json=excluded.cues_json",
+        (title_id, text, windows, length, source, _now(conn),
+         json.dumps([list(c) for c in cues]) if cues else None))
     conn.commit()
+
+
+def get_transcript_cues(conn: sqlite3.Connection,
+                        title_id: int) -> Optional[list]:
+    """A title's timed captions [(start, end, text)], or None if none stored."""
+    r = conn.execute("SELECT cues_json FROM transcript WHERE title_id=?",
+                     (title_id,)).fetchone()
+    if r is None or not r["cues_json"]:
+        return None
+    return [tuple(c) for c in json.loads(r["cues_json"])]
 
 
 # ---------------------------------------------------------------------------
