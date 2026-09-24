@@ -314,6 +314,12 @@ def _run_human(heuristic: str, r: dict) -> str:
                 lines.append(f"  disc {x['disc']} title {x['title']}: "
                              f"extra-like ({x['sig'][0]}A/{x['sig'][1]}S)")
         return "\n".join(lines)
+    if heuristic == "synopsis" and "transcribed" in r:     # --transcribe-only
+        lines = [f"synopsis: transcribed {len(r['transcribed'])} title(s) "
+                 "(no judge, no evidence)"]
+        for x in r["transcribed"]:
+            lines.append(f"  title {x['title_id']}: {x['source'] or 'no dialogue'}")
+        return "\n".join(lines)
     key = {"ocr": "ocr", "synopsis": "synopsis"}[heuristic]
     lines = [f"{heuristic}: {len(r[key])} title(s)"]
     for x in r[key]:
@@ -1048,6 +1054,9 @@ def build_parser() -> argparse.ArgumentParser:
                             "a text model, NOT the --vlm-model). A `claude-*` id "
                             "(e.g. claude-sonnet-5) routes to the Anthropic API "
                             "via ANTHROPIC_API_KEY instead of Ollama.")
+    p_run.add_argument("--transcribe-only", action="store_true",
+                       help="synopsis: extract/refresh transcripts (+ subtitle cue "
+                            "timings) only — no judge calls, no evidence written")
     p_run.add_argument("--retranscribe", action="store_true",
                        help="synopsis: force fresh transcript extraction, ignoring "
                             "any cached transcript (default: reuse the stored one)")

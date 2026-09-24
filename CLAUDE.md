@@ -658,6 +658,49 @@ LLM judge matches it against each candidate's plot synopsis.
   misranks — a cascade needs a common score scale first. Opus 5.5 was faster
   than Sonnet 5 here (Sonnet's adaptive thinking: p95 24 s).
 
+- **Recap trimming (`bench_synopsis.py --trim`, `synopsis.trim_recap`).** The
+  "previously on" recap is dense with PRIOR-episode plot and pulls the judge one
+  episode back: it caused Jev's S02E10/E11 swap (both claimed "Cascade"). Text
+  markers can't find it — "Previously on" survives OCR in 7/61 Expanse
+  transcripts, `(THEME MUSIC PLAYING)` in 31/61 (S2-S3 only) and marks the end of
+  recap+cold-open, not recap alone. Results (jev / jev-chunked, 60 titles):
+  none 56/57, **drop-head (first 1500 chars) 58/57**, Jev-judged cut 56/57. The
+  drop-head gain is exactly the S02E10/E11 pair. The Jev cutter (one Noul per
+  opening segment "is this recap?" + a single change-point in code) does NOT
+  work: it cut only 28/66 titles, missed every UNLABELLED recap, and its
+  probabilities track segment POSITION more than content — a lone line of
+  dialogue doesn't carry "recap-ness".
+  **What works: shared n-grams (`--trim ngram`, `synopsis.ngram_recap_cuts`,
+  code only).** A recap is verbatim clips of earlier episodes, so its lines recur
+  in their transcripts. A cue in the first 6 min is recap if it holds a RARE
+  n-gram (in 2..4 titles; stock phrases drop out) that another title has ≥30 s
+  LATER — the direction rule (E06's recap quoting E05's cold open is in both
+  openings; only the recap copy is earlier than its twin). One change-point over
+  the marks (`recap_cut`) tolerates OCR-broken lines; an SDH `(THEME MUSIC …)`
+  cue caps the cut. Corpus = every transcript in the DB (S2's recap quotes the S1
+  finale, a title the bench doesn't score). Needs cue timings. On Expanse it cut
+  48/61 golden titles at 45-90 s and correctly cut NONE of S4 (no recaps) or the
+  premiere; the one real miss is S02E01, whose OCR ran words together
+  ("Iflewhalf-wayacross"). Jev whole-transcript: 58/60 final at n=4 and n=5 (=
+  drop-head's, the same S02E10/E11 fix) but top-1 **51/60** at n=5 vs 46 untrimmed
+  / 47 drop-head — better raw rankings, and unlike drop-head it never eats a
+  recap-less cold open. Jev-chunked gains nothing. The remaining S01E05/E06 miss
+  is not recap-driven (both still top-pick E03 after trimming).
+
+- **Subtitle cue timings are kept (`transcript.cues_json`).** The subtitle
+  extractors (`subtitle_cc` from the SRT, `subtitle_ocr` via a `showinfo` tap on
+  the change-only render, 0.5 s resolution at the 2 fps render) return
+  `(text, [(start, end, text)])`; the flat `text` is byte-identical to before
+  (verified on Expanse S01E05), cues sit beside it (`state.get_transcript_cues`).
+  Audio/whisper transcripts carry no cues. Motivation: recaps are rapid cuts
+  (S01E05's recap = ~1-2 s cues), which timing exposes and flat text can't.
+  Backfill without re-judging: `vj run synopsis db --title … --retranscribe
+  --transcript-source subtitle --transcribe-only` (no judge call, no evidence
+  written; lifts the multi-episode guard since nothing is judged). A failed
+  re-extraction never overwrites a cached non-empty transcript. Measured cost:
+  ~4.5 min wall / ~87 CPU-min per Expanse BD episode (the PP-OCR pool), slower
+  than the ~2 min figure measured on Avatar — budget hours for a series.
+
 ## Output / rip workflow
 
 - The manifest **`title` field is the number to pass to `HandBrakeCLI -t`.**

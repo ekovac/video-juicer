@@ -1085,5 +1085,151 @@ class BenchScoreTests(unittest.TestCase):
         self.assertAlmostEqual(s["cost_usd"], 0.042)
 
 
+class RecapTrimTests(unittest.TestCase):
+    """Recap cut: one change-point over per-segment recap probabilities."""
+
+    def test_cut_after_recap_run(self):
+        from synopsis import recap_cut
+        self.assertEqual(recap_cut([0.9, 0.8, 0.85, 0.1, 0.2, 0.05]), 3)
+
+    def test_no_recap_means_no_cut(self):
+        from synopsis import recap_cut
+        self.assertEqual(recap_cut([0.2, 0.3, 0.1, 0.25]), 0)
+
+    def test_single_noisy_segment_does_not_cut_mid_episode(self):
+        from synopsis import recap_cut      # a lone 0.7 late on isn't a recap
+        self.assertEqual(recap_cut([0.1, 0.2, 0.7, 0.1, 0.1]), 0)
+
+    def test_segments_split_on_sentences_speakers_and_cues(self):
+        from synopsis import opening_segments
+        text = ("HOLDEN: We have to take that station now. (GASPING) "
+                "ALEX: We lost a pod out there, Captain! Is it bad?")
+        segs = opening_segments(text, min_len=10)
+        self.assertEqual([t for _, t in segs],
+                         ["HOLDEN: We have to take that station now.",
+                          "(GASPING) ALEX: We lost a pod out there, Captain!",
+                          "Is it bad?"])
+        for off, t in segs:          # offsets index the original text
+            self.assertTrue(text[off:].startswith(t.split()[0]))
+
+
+class CueTimingTests(Base):
+    """Timed subtitle cues: SRT parse, frame→cue timing, storage, and the
+    --transcribe-only extraction path."""
+
+    def test_srt_to_cues(self):
+        from synopsis import srt_to_cues
+        srt = ("1\n00:00:01,500 --> 00:00:03,000\n<i>Previously on</i>\n\n"
+               "2\n00:01:02,250 --> 00:01:04,000\nHOLDEN: Hold on.\nNAOMI: No.\n")
+        self.assertEqual(srt_to_cues(srt), [(1.5, 3.0, "Previously on"),
+                                            (62.25, 64.0, "HOLDEN: Hold on. NAOMI: No.")])
+
+    def test_frames_to_cues_ends_at_next_change_and_merges_repeats(self):
+        from synopsis import frames_to_cues
+        times = [0.0, 1.5, 3.0, 4.5, 6.0]
+        texts = ["", "Hello there", "Hello  there", "", "Bye"]
+        self.assertEqual(frames_to_cues(times, texts, 8.0),
+                         [(1.5, 4.5, "Hello there"), (6.0, 8.0, "Bye")])
+
+    def test_frames_to_cues_fails_soft_on_mismatch(self):
+        from synopsis import frames_to_cues
+        self.assertEqual(frames_to_cues([0.0], ["a", "b"], 5.0), [])
+
+    def test_cues_round_trip_and_absent_for_audio(self):
+        state.upsert_episodes(self.conn, [ep(1, 1, "E1", 1320.0)])
+        did = self.add_disc([title(1, 1320, [1320]), title(2, 1320, [1320])])
+        t1, t2 = state.title_id(self.conn, did, 1), state.title_id(self.conn, did, 2)
+        state.put_transcript(self.conn, t1, "a b", 0, 0.0, "subtitle-ocr",
+                             [(1.0, 2.5, "a"), (3.0, 4.0, "b")])
+        state.put_transcript(self.conn, t2, "whisper", 0, 0.0, "audio")
+        self.assertEqual(state.get_transcript_cues(self.conn, t1),
+                         [(1.0, 2.5, "a"), (3.0, 4.0, "b")])
+        self.assertIsNone(state.get_transcript_cues(self.conn, t2))
+
+    def test_transcribe_only_stores_cues_and_writes_no_evidence(self):
+        state.upsert_episodes(
+            self.conn, [ep(1, k, f"E{k}", 1320.0) for k in range(1, 4)])
+        ts = [Title(id=k, duration=1320.0, chapters=[1320.0], n_audio=2, n_sub=1,
+                    kind="episode-candidate") for k in range(1, 4)]
+        ts.append(Title(id=9, duration=2640.0, chapters=[2640.0], n_audio=2,
+                        n_sub=1, kind="episode-candidate"))   # 2x: guard lifted
+        did = self.add_disc(ts)
+        orig_cc, orig_rc = compute.subtitle_cc, compute.rank_candidates
+        compute.subtitle_cc = lambda d, t, w: (f"line {t.id}",
+                                               [(1.0, 2.0, f"line {t.id}")])
+        compute.rank_candidates = lambda *a: self.fail("judge must not be called")
+        try:
+            res = compute.run_synopsis(self.conn, auto_args(
+                disc=did, title=None, all=False, judge_model=None,
+                synopsis_windows=None, synopsis_length=None, retranscribe=True,
+                synopsis_source="tmdb", transcript_source="subtitle",
+                include_specials=False, transcribe_only=True))
+        finally:
+            compute.subtitle_cc, compute.rank_candidates = orig_cc, orig_rc
+        self.assertTrue(res["ok"])
+        self.assertEqual(len(res["transcribed"]), 4)
+        tid9 = state.title_id(self.conn, did, 9)
+        self.assertEqual(state.get_transcript_cues(self.conn, tid9),
+                         [(1.0, 2.0, "line 9")])
+        for k in (1, 2, 3, 9):
+            tid = state.title_id(self.conn, did, k)
+            self.assertFalse([e for e in state.evidence_for_title(self.conn, tid)
+                              if e["category"] == "synopsis"])
+
+
+class NgramRecapTests(unittest.TestCase):
+    """ngram_recap_cuts: an opening that repeats rare n-grams found LATER in
+    another episode is a recap; the cut lands where that stops."""
+
+    E1 = [(5.0, 8.0, "We lost the ship near the rings of Saturn."),
+          (600.0, 603.0, "HOLDEN: The protomolecule is loose on Eros station."),
+          (700.0, 703.0, "Get the crew to the medical bay right now.")]
+
+    def e2(self):
+        return [(2.0, 4.0, "Previously on The Show..."),
+                (4.0, 7.0, "(GASPS) The protomolecule is loose on Eros station."),
+                (7.5, 9.0, "Get the crew to the medical bay right now."),
+                (60.0, 63.0, "A brand new scene starts with fresh dialogue here."),
+                (65.0, 68.0, "Nobody has said these particular words before today.")]
+
+    def test_recap_cut_where_shared_lines_stop(self):
+        from synopsis import ngram_recap_cuts
+        cuts = ngram_recap_cuts({"e1": self.E1, "e2": self.e2()})
+        self.assertEqual(cuts["e2"], 60.0)
+        self.assertEqual(cuts["e1"], 0.0)     # its copies are the ORIGINALS
+
+    def test_direction_quoted_cold_open_is_not_a_recap_in_the_source(self):
+        from synopsis import ngram_recap_cuts
+        # e1's cold-open line (t=40) is quoted in e2's recap (t=3): only e2 cuts
+        e1 = [(40.0, 43.0, "Somebody sabotaged the reactor on purpose, Captain."),
+              (90.0, 93.0, "Unrelated words that only this episode contains.")]
+        e2 = [(3.0, 6.0, "Somebody sabotaged the reactor on purpose, Captain."),
+              (50.0, 53.0, "Completely different lines from the second episode.")]
+        cuts = ngram_recap_cuts({"e1": e1, "e2": e2})
+        self.assertEqual((cuts["e1"], cuts["e2"]), (0.0, 50.0))
+
+    def test_stock_phrase_in_many_episodes_is_not_evidence(self):
+        from synopsis import ngram_recap_cuts
+        stock = "what the hell are you doing"
+        docs = {f"e{k}": [(1.0, 2.0, stock), (200.0, 201.0, stock),
+                          (300.0, 301.0, f"unique line number {k} alpha beta")]
+                for k in range(6)}
+        self.assertTrue(all(v == 0.0 for v in ngram_recap_cuts(docs).values()))
+
+    def test_theme_caption_caps_the_cut(self):
+        from synopsis import ngram_recap_cuts
+        e2 = self.e2()[:3] + [(30.0, 32.0, "(THEME MUSIC PLAYING)"),
+                              (60.0, 63.0, "The protomolecule is loose on Eros station.")]
+        cuts = ngram_recap_cuts({"e1": self.E1, "e2": e2})
+        self.assertLessEqual(cuts["e2"], 30.0)
+
+    def test_cut_text_at_finds_the_cue_in_flat_text(self):
+        from synopsis import cut_text_at
+        cues = self.e2()
+        flat = " ".join(c[2] for c in cues)
+        self.assertTrue(cut_text_at(flat, cues, 60.0).startswith("A brand new scene"))
+        self.assertEqual(cut_text_at(flat, cues, 0.0), flat)
+
+
 if __name__ == "__main__":
     unittest.main()

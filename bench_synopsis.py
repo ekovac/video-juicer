@@ -77,6 +77,7 @@ class Case:
     transcript: str
     source: str
     pool: list = field(repr=False)
+    trim: dict = field(default_factory=dict)   # recap-trim meta (--trim)
 
 
 def load_cases(conn, include_multi: bool = False) -> tuple[list[Case], dict]:
@@ -182,10 +183,80 @@ def run_judge(judge: str, case: Case, args, show: str) -> dict:
     raise ValueError(f"unknown judge {judge!r} (want claude-* or jev[-chunked])")
 
 
+# --- recap trimming (--trim) -----------------------------------------------
+
+DROP_HEAD_CHARS = 1500     # ~a typical Expanse recap; the zero-model baseline
+
+
+def apply_trim(cases: list[Case], method: str, args, show: str, conn=None) -> None:
+    """Replace each case's transcript with its recap-trimmed version, in place.
+    `drop-head` cuts a fixed prefix (no model); `jev` asks Jev per opening
+    segment (synopsis.trim_recap), cached in --out/trim-jev.jsonl since the cut
+    is judge-independent. Trim cost/latency land in case.trim and are charged
+    to every judge that runs on the trimmed text. `ngram` cuts where the opening
+    stops sharing rare n-grams with other titles' transcripts (every transcript
+    in the DB is the corpus — incl. titles not benchmarked, e.g. a finale a
+    later recap quotes); code only, needs stored cue timings."""
+    if method == "none":
+        return
+    if method == "ngram":
+        docs = {}
+        for r in conn.execute("SELECT title_id FROM transcript"):
+            cues = state.get_transcript_cues(conn, r["title_id"])
+            if cues:
+                docs[r["title_id"]] = cues
+        cuts = synopsis.ngram_recap_cuts(docs, n=args.ngram_n)
+        for c in cases:
+            t = cuts.get(c.title_id, 0.0)
+            trimmed = synopsis.cut_text_at(c.transcript, docs.get(c.title_id, []), t)
+            c.trim = {"cut_s": t, "cut": len(c.transcript) - len(trimmed)}
+            c.transcript = trimmed
+        return
+    if method == "drop-head":
+        for c in cases:
+            c.trim = {"cut": min(DROP_HEAD_CHARS, len(c.transcript) // 4)}
+            c.transcript = c.transcript[c.trim["cut"]:]
+        return
+    path = Path(args.out) / f"trim-{method}.jsonl"
+    cache = {}
+    if path.exists() and not args.fresh:
+        for line in path.read_text().splitlines():
+            r = json.loads(line)
+            cache[r["title_id"]] = r
+    todo = [c for c in cases if c.title_id not in cache]
+    if todo and args.report_only:
+        raise SystemExit(f"--report-only: {len(todo)} titles have no cached trim")
+
+    def one(c):
+        t0 = time.monotonic()
+        _text, meta = synopsis.trim_recap(c.transcript, show, args.jev_model)
+        meta["latency_s"] = time.monotonic() - t0
+        meta["title_id"] = c.title_id
+        return meta
+    if todo:
+        with path.open("w" if args.fresh else "a") as fh, \
+                ThreadPoolExecutor(max_workers=args.concurrency) as ex:
+            for meta in ex.map(one, todo):
+                cache[meta["title_id"]] = meta
+                fh.write(json.dumps(meta) + "\n")
+    for c in cases:
+        c.trim = cache[c.title_id]
+        c.transcript = c.transcript[c.trim["cut"]:]
+
+
 # --- result cache -----------------------------------------------------------
 
 def _results_path(out: Path, judge: str) -> Path:
+    """Per-judge cache; a trimmed run is its own judge label (`jev+trim=jev`)."""
     return out / f"{judge}.jsonl"
+
+
+def _judge_key(judge: str, trim: str) -> str:
+    return judge if trim == "none" else f"{judge}+trim={trim}"
+
+
+def _model_of(key: str) -> str:
+    return key.split("+trim=")[0]
 
 
 def load_results(out: Path, judge: str) -> dict[int, dict]:
@@ -200,19 +271,20 @@ def load_results(out: Path, judge: str) -> dict[int, dict]:
     return res
 
 
-def collect(judge: str, cases: list[Case], args, show: str) -> dict[int, dict]:
+def collect(key: str, cases: list[Case], args, show: str) -> dict[int, dict]:
     """Query `judge` for every case not already cached (errors are retried on
     the next run — they're cached with an `error` and skipped only once OK)."""
+    judge = _model_of(key)
     out = Path(args.out)
-    done = {} if args.fresh else load_results(out, judge)
+    done = {} if args.fresh else load_results(out, key)
     todo = [c for c in cases if c.title_id not in done or done[c.title_id].get("error")]
     if args.fresh:
-        _results_path(out, judge).unlink(missing_ok=True)
+        _results_path(out, key).unlink(missing_ok=True)
     if not todo:
         return done
     log.info("%s: %d titles to judge (%d cached)", judge, len(todo),
              len(cases) - len(todo))
-    fh = _results_path(out, judge).open("a")
+    fh = _results_path(out, key).open("a")
     t0 = time.monotonic()
     with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
         futs = {pool.submit(run_judge, judge, c, args, show): c for c in todo}
@@ -268,7 +340,8 @@ def score(judge: str, cases: list[Case], results: dict[int, dict]) -> dict:
 
     per_title, top1, final = [], {}, {}
     lat, cost_in, cost_out, tin, tout, errors, truncated = [], 0.0, 0.0, 0, 0, 0, 0
-    pin, pout = PRICES.get(_price_key(judge), (0.0, 0.0))
+    pin, pout = PRICES.get(_price_key(_model_of(judge)), (0.0, 0.0))
+    trim_in, trim_lat = 0, 0.0
     for c in cases:
         r = results.get(c.title_id)
         if r is None:
@@ -280,8 +353,11 @@ def score(judge: str, cases: list[Case], results: dict[int, dict]) -> dict:
         vf = _verdict(assigned.get(c.title_id), c.gold)
         top1[v1] = top1.get(v1, 0) + 1
         final[vf] = final.get(vf, 0) + 1
+        t_lat = c.trim.get("latency_s", 0.0)
+        trim_in += c.trim.get("input_tokens", 0)
+        trim_lat += t_lat
         if r.get("latency_s"):
-            lat.append(r["latency_s"])
+            lat.append(r["latency_s"] + t_lat)
         tin += r.get("input_tokens", 0)
         tout += r.get("output_tokens", 0)
         truncated += r.get("stop_reason") == "max_tokens"
@@ -291,6 +367,7 @@ def score(judge: str, cases: list[Case], results: dict[int, dict]) -> dict:
             "final": assigned.get(c.title_id, "-"), "top1_verdict": v1,
             "final_verdict": vf, "evidence": r.get("evidence", r.get("error", ""))})
     cost_in, cost_out = tin * pin / 1e6, tout * pout / 1e6
+    cost_in += trim_in * PRICES["jev"][0] / 1e6      # the recap-trim pass
     n_gold = sum(1 for c in cases if c.gold and c.title_id in results)
     lat_sorted = sorted(lat)
     return {
@@ -301,7 +378,7 @@ def score(judge: str, cases: list[Case], results: dict[int, dict]) -> dict:
         "latency_median_s": statistics.median(lat) if lat else 0.0,
         "latency_p95_s": (lat_sorted[max(0, math.ceil(0.95 * len(lat_sorted)) - 1)]
                           if lat else 0.0),   # nearest-rank
-        "input_tokens": tin, "output_tokens": tout,
+        "input_tokens": tin, "output_tokens": tout, "trim_input_tokens": trim_in,
         "cost_usd": cost_in + cost_out,
         "cost_per_title_usd": (cost_in + cost_out) / max(1, len(per_title)),
         "models_seen": sorted({r.get("model") for r in results.values()
@@ -373,6 +450,15 @@ def main(argv=None) -> int:
                          "production uses 2048, which can truncate thinking models)")
     ap.add_argument("--effort", choices=["low", "medium", "high", "xhigh", "max"],
                     help="claude effort (not sent to Haiku); default = model default")
+    ap.add_argument("--trim", choices=["none", "drop-head", "jev", "ngram"],
+                    default="none",
+                    help="strip the opening recap before judging: drop-head = "
+                         f"first {DROP_HEAD_CHARS} chars, jev = Jev-judged cut "
+                         "(synopsis.trim_recap), ngram = cut where the opening "
+                         "stops sharing rare n-grams with other episodes "
+                         "(synopsis.ngram_recap_cuts); cached as <judge>+trim=…")
+    ap.add_argument("--ngram-n", type=int, default=4,
+                    help="n-gram length for --trim ngram (default 4)")
     ap.add_argument("--jev-model", default=synopsis.JEV_MODEL,
                     help="TypeSafe model id (pin e.g. jev-1.13.0 for repeatability)")
     args = ap.parse_args(argv)
@@ -387,18 +473,22 @@ def main(argv=None) -> int:
              len(cases) - n_gold, skipped)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
+    apply_trim(cases, args.trim, args, show, conn)
+    trim_label = (f"ngram{args.ngram_n}" if args.trim == "ngram" else args.trim)
 
     summaries = []
     for judge in args.judge or DEFAULT_JUDGES:
-        results = (load_results(out, judge) if args.report_only
-                   else collect(judge, cases, args, show))
+        key = _judge_key(judge, trim_label)
+        results = (load_results(out, key) if args.report_only
+                   else collect(key, cases, args, show))
         if results:
-            summaries.append(score(judge, cases, results))
-    (out / "summary.json").write_text(json.dumps(
-        {"db": str(args.db), "show": show, "skipped": skipped,
+            summaries.append(score(key, cases, results))
+    stem = "summary" if args.trim == "none" else f"summary+trim={trim_label}"
+    (out / f"{stem}.json").write_text(json.dumps(
+        {"db": str(args.db), "show": show, "skipped": skipped, "trim": args.trim,
          "prices_per_mtok": PRICES, "judges": summaries}, indent=2))
     report = render(summaries)
-    (out / "summary.md").write_text(report + "\n")
+    (out / f"{stem}.md").write_text(report + "\n")
     print(report)
     return 0
 
