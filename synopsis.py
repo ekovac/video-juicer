@@ -30,6 +30,7 @@ import os
 import re
 import subprocess
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Optional
@@ -310,29 +311,42 @@ def sample_transcript(disc: Disc, title: Title, workdir: Path,
     return "\n".join(parts).strip()
 
 
-def _anthropic_text(model: str, prompt: str) -> str:
-    """One text-only Anthropic Messages call. A quick swap for the Ollama judge:
-    a Claude-id model routes here (via `_ollama_text`) so `run synopsis
-    --judge-model claude-sonnet-5` uses a frontier judge with no other changes.
-    Needs ANTHROPIC_API_KEY in the env; same text→_extract_json output contract."""
+def anthropic_message(model: str, prompt: str, max_tokens: int = 2048,
+                      effort: Optional[str] = None) -> tuple[str, dict]:
+    """One text-only Anthropic Messages call → (reply text, raw response meta:
+    `usage` + `stop_reason`). The usage is what bench_synopsis prices; the judge
+    path only needs the text (`_anthropic_text`).
+
+    `max_tokens` caps TOTAL output, thinking included — Sonnet 5 runs adaptive
+    thinking by default and Opus 5.5 always thinks, so a tight cap can end the
+    turn mid-thought with no text (`stop_reason == "max_tokens"`)."""
     key = os.environ.get("ANTHROPIC_API_KEY")
     if not key:
         raise RuntimeError("ANTHROPIC_API_KEY not set (needed for a claude judge)")
     # No `temperature`: it's deprecated on current Claude models (a 400), and
     # they're near-deterministic at greedy defaults anyway.
-    body = json.dumps({
-        "model": model, "max_tokens": 2048,
-        "messages": [{"role": "user", "content": prompt}],
-    }).encode()
+    payload = {"model": model, "max_tokens": max_tokens,
+               "messages": [{"role": "user", "content": prompt}]}
+    if effort:
+        payload["output_config"] = {"effort": effort}
     req = urllib.request.Request(
-        "https://api.anthropic.com/v1/messages", data=body,
+        "https://api.anthropic.com/v1/messages", data=json.dumps(payload).encode(),
         headers={"content-type": "application/json", "x-api-key": key,
                  "anthropic-version": "2023-06-01"})
-    with urllib.request.urlopen(req, timeout=300) as resp:
+    with urllib.request.urlopen(req, timeout=600) as resp:
         data = json.loads(resp.read())
     parts = [b.get("text", "") for b in data.get("content", [])
              if b.get("type") == "text"]
-    return "".join(parts).strip()
+    return "".join(parts).strip(), {"usage": data.get("usage") or {},
+                                    "stop_reason": data.get("stop_reason")}
+
+
+def _anthropic_text(model: str, prompt: str) -> str:
+    """One text-only Anthropic Messages call. A quick swap for the Ollama judge:
+    a Claude-id model routes here (via `_ollama_text`) so `run synopsis
+    --judge-model claude-sonnet-5` uses a frontier judge with no other changes.
+    Needs ANTHROPIC_API_KEY in the env; same text→_extract_json output contract."""
+    return anthropic_message(model, prompt)[0]
 
 
 def _ollama_text(model: str, prompt: str, host: str, retries: int = 3) -> str:
@@ -451,11 +465,25 @@ def rank_candidates(transcript: str, candidates: list[Episode],
         return [], "no transcript"
     if len(pool) < 2:
         return [], "need >=2 synopses to discriminate"
+    if model.startswith("jev"):      # TypeSafe System One: typed Choice, not text
+        ranked, evidence, _meta = jev_rank(transcript, pool, model)
+        return ranked, evidence
+    reply = _ollama_text(model, rank_prompt(transcript, pool, top_k), host)
+    return parse_ranking(reply, pool, top_k)
+
+
+def rank_prompt(transcript: str, pool: list[Episode],
+                top_k: int = RANK_TOP_K) -> str:
+    """The stage-1 judge prompt for `pool` (episodes WITH a synopsis — the
+    candidate numbers index this list)."""
     listing = "\n".join(
         f"{i+1}. {e.name}: {e.synopsis}" for i, e in enumerate(pool))
-    reply = _ollama_text(
-        model, _STAGE1.format(candidates=listing, transcript=transcript,
-                              k=top_k), host)
+    return _STAGE1.format(candidates=listing, transcript=transcript, k=top_k)
+
+
+def parse_ranking(reply: str, pool: list[Episode],
+                  top_k: int = RANK_TOP_K) -> tuple[list, str]:
+    """A judge reply → ([(episode, borda_score)], evidence); see rank_candidates."""
     obj = _extract_json(reply) or {}
     ranked, seen = [], set()
     for pos, num in enumerate(obj.get("ranking") or []):
@@ -469,6 +497,135 @@ def rank_candidates(transcript: str, candidates: list[Episode],
         if len(ranked) >= top_k:
             break
     return ranked, (obj.get("evidence") or "").strip() or "judge abstained"
+
+
+# --- Jev (TypeSafe System One) judge ---------------------------------------
+# A different shape of judge: Jev doesn't generate a ranking, it answers a typed
+# Choice over the candidate episodes and returns a calibrated probability for
+# EVERY option. That distribution drops straight into assign_by_synopsis as the
+# score matrix — probabilities instead of the Borda ranks we derive from an LLM's
+# list — and a "none" option gives it an explicit abstention (commentary /
+# featurettes / whisper noise). Priced per INPUT token only (output is free).
+# Limits (jev-1.13): 32k tokens for state + the longest question; ≤255 options.
+TYPESAFE_URL = "https://api.typesafe.ai/v1/systemone"
+JEV_MODEL = "jev-latest"
+JEV_NONE = "none of these"
+JEV_MIN_P = 0.02          # options below this don't enter the assignment
+# Jev loses accuracy as `state` fills with material irrelevant to the decision
+# (TypeSafe's jaggedness notes) and a 45-min transcript is mostly that, so the
+# chunked mode asks the same Choice of ~1.5k-token slices and averages.
+JEV_CHUNK_CHARS = 6000
+
+
+def typesafe_system_one(state, questions: dict, model: str = JEV_MODEL,
+                        retries: int = 4) -> dict:
+    """POST one System One evaluation; returns the response JSON (`answers`,
+    `model` = the versioned id that answered, `usage`). Retries 429/529/5xx with
+    backoff, honouring `retry-after`. Needs TYPESAFE_API_KEY."""
+    key = os.environ.get("TYPESAFE_API_KEY")
+    if not key:
+        raise RuntimeError("TYPESAFE_API_KEY not set (needed for a jev judge)")
+    body = json.dumps({"state": state, "model": model,
+                       "questions": questions}).encode()
+    for attempt in range(retries + 1):
+        req = urllib.request.Request(
+            TYPESAFE_URL, data=body,
+            headers={"Content-Type": "application/json",
+                     "Authorization": f"Bearer {key}"})
+        try:
+            with urllib.request.urlopen(req, timeout=300) as resp:
+                return json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            if e.code not in (429, 500, 502, 503, 529) or attempt >= retries:
+                detail = e.read().decode(errors="replace")[:500]
+                raise RuntimeError(f"typesafe {e.code}: {detail}") from e
+            wait = float(e.headers.get("retry-after") or 2 ** (attempt + 1))
+            log.warning("typesafe %d; retry %d/%d in %.0fs",
+                        e.code, attempt + 1, retries, wait)
+            time.sleep(wait)
+    raise RuntimeError("unreachable")
+
+
+def jev_question(pool: list[Episode], show: str = "") -> tuple[dict, dict]:
+    """The episode Choice → (question, {option key: Episode}). Option keys and
+    descriptions are both sent to the model, so the key carries the title and the
+    description the synopsis. Instructions spell the condition out literally —
+    Jev reads questions at face value and has no system prompt to lean on."""
+    series = f"the TV series {show}" if show else "a TV series"
+    opts = {f"S{e.season:02d}E{e.number:02d} {e.name}": e for e in pool}
+    criteria = {k: e.synopsis for k, e in opts.items()}
+    criteria[JEV_NONE] = ("`transcript` is not dialogue from an episode — e.g. "
+                          "cast or crew commentary, a featurette, or garbled "
+                          "repeated words — or it fits none of the synopses.")
+    question = {
+        "type": "choice",
+        "instructions": {
+            "question": f"`transcript` is subtitle dialogue from one episode of "
+                        f"{series}. Which episode's synopsis describes the "
+                        "events in `transcript`?",
+            "how_to_judge": [
+                "The dialogue never quotes the synopsis; match on events, "
+                "places and situations the characters talk about or react to.",
+                "The main characters and the season-long storyline appear in "
+                "every episode, so they do not tell episodes apart. Decide on "
+                "details specific to one episode: plot events, guest "
+                "characters, named locations, one-off objects or situations.",
+            ],
+        },
+        "criteria": criteria,
+    }
+    return question, opts
+
+
+def _chunks(text: str, size: int) -> list[str]:
+    """Split on whitespace into ~`size`-char slices (never mid-word)."""
+    out, cur, n = [], [], 0
+    for w in text.split():
+        if n + len(w) > size and cur:
+            out.append(" ".join(cur))
+            cur, n = [], 0
+        cur.append(w)
+        n += len(w) + 1
+    if cur:
+        out.append(" ".join(cur))
+    return out
+
+
+def jev_rank(transcript: str, candidates: list[Episode], model: str = JEV_MODEL,
+             show: str = "", chunk_chars: int = 0) -> tuple[list, str, dict]:
+    """Jev's answer to "which episode is this dialogue?" → ([(episode, p)] best
+    first, evidence, meta). `p` is Jev's probability (averaged over slices when
+    `chunk_chars` > 0); only options ≥ JEV_MIN_P are returned, and ([], …) when
+    "none" is the most probable answer. meta = {input_tokens, output_tokens,
+    requests, model} for costing."""
+    pool = [e for e in candidates if e.synopsis]
+    meta = {"input_tokens": 0, "output_tokens": 0, "requests": 0, "model": model}
+    if not transcript:
+        return [], "no transcript", meta
+    if len(pool) < 2:
+        return [], "need >=2 synopses to discriminate", meta
+    question, opts = jev_question(pool, show)
+    slices = _chunks(transcript, chunk_chars) if chunk_chars else [transcript]
+    total: dict = {}
+    for text in slices:
+        resp = typesafe_system_one({"transcript": text},
+                                   {"episode": question}, model)
+        usage = resp.get("usage") or {}
+        meta["input_tokens"] += usage.get("input_tokens", 0)
+        meta["output_tokens"] += usage.get("output_tokens", 0)
+        meta["requests"] += 1
+        meta["model"] = resp.get("model", model)
+        probs = resp["answers"]["episode"]["probabilities"]
+        for k, p in probs.items():
+            total[k] = total.get(k, 0.0) + p / len(slices)
+    order = sorted(total.items(), key=lambda kv: -kv[1])
+    top_key, top_p = order[0]
+    runner = next((f"{k} p={p:.2f}" for k, p in order[1:] if k != JEV_NONE), "")
+    evidence = f"{top_key} p={top_p:.2f}; next {runner}"
+    if top_key == JEV_NONE:
+        return [], f"jev: none of these p={top_p:.2f}", meta
+    ranked = [(opts[k], p) for k, p in order if k in opts and p >= JEV_MIN_P]
+    return ranked, evidence, meta
 
 
 def transcribe_and_rank(disc: Disc, title: Title, candidates: list[Episode],

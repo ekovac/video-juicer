@@ -50,6 +50,9 @@ Layout:
   adjudicate (`assign`/`confirm`/`reject`). Conflict computed here.
 - `export.py` — manifest + rip script from the adjudicated assignments.
 - `vj.py` — the CLI entry point wiring all verbs.
+- `bench_synopsis.py` — benchmark synopsis judges (accuracy / latency / cost)
+  against a project DB whose assignments are golden, replaying its CACHED
+  transcripts (no disc access). Opens the DB read-only.
 
 Run (per-verb; see README for the full flow): `vj init db --tmdb-id <id>` →
 `vj scan db <discs>` → (optional `vj hint disc db --disc … --season N --episodes
@@ -611,6 +614,49 @@ LLM judge matches it against each candidate's plot synopsis.
   a duplicate-free rip plan, and it helps on shows with distinctive episodes);
   the next lever is a stronger judge (see the OpenAI/HF backend in Future
   features), not more assignment cleverness.
+
+- **Jev judge (TypeSafe System One, `--judge-model jev-latest`) — a typed
+  Choice, not a generated ranking.** `synopsis.jev_rank` asks ONE Choice whose
+  options are the season's episodes (key `SxxEyy Name`, description = synopsis)
+  plus a `none of these` abstention, with the transcript as `state`. Jev returns
+  a calibrated probability for every option, which feeds `assign_by_synopsis`
+  directly (probabilities instead of Borda ranks); `none` on top = abstain.
+  Billed per INPUT token only (jev-1.13: $0.042/Mtok, ~8k tok/title → ~$0.0003).
+  Limits: 32k tokens state+longest question, ≤255 options — an Expanse transcript
+  (≤29k chars) + a 13-episode pool fits whole. TypeSafe documents that accuracy
+  drops as `state` fills with irrelevant material, and a full transcript is mostly
+  that, so `bench_synopsis.py` also runs a `jev-chunked` variant (~6k-char slices,
+  probabilities averaged). Jev reads instructions literally; the prompt states the
+  "regulars/season arc aren't evidence" rule as explicit criteria.
+- **Benchmarking judges: `bench_synopsis.py <db>`** replays cached transcripts
+  through each judge and scores against the DB's assignments (golden): final
+  (post-bijection) accuracy with wrong split from abstain, raw top-1, false claims
+  on distractor titles (transcribed but unassigned — featurettes, whisper noise),
+  per-call latency, and cost from reported usage × `PRICES`. Per-judge JSONL cache
+  in `--out` (resumable; `--report-only` re-scores free). Claude judges run with
+  `--max-tokens 16000`: the production judge caps output at 2048 INCLUDING
+  thinking, which can truncate Sonnet 5 / Opus 5.5 (a `max_tokens` stop reads as
+  an abstention) — the report counts truncations.
+
+- **Benchmark result — The Expanse (2026-09-23, 60 golden single-episode titles
+  + 6 distractors, PGS-OCR transcripts, same prompt for all Claude judges):**
+  | judge | final acc | wrong | abstain | median call | cost |
+  |---|---|---|---|---|---|
+  | claude-haiku-4-5 | 23/60 | 27 | 10 | 3.7 s | $0.52 |
+  | claude-sonnet-5 | 46/60 | 8 | 6 | 4.9 s | $1.65 |
+  | claude-opus-5-5 | **60/60** | 0 | 0 | 3.6 s | $2.77 |
+  | jev (jev-1.13.0) | 56/60 | 4 | 0 | 0.4 s | $0.019 |
+  | jev-chunked | 57/60 | 3 | 0 | 1.4 s | $0.028 |
+  No judge falsely claimed a distractor. **This overturns the Magicians 4-title
+  finding that Haiku ties Sonnet** — on a full season-scale run Haiku is
+  confidently wrong on 27/60; don't recommend it as the API judge. Misses for
+  every judge are ADJACENT episodes (serialized arc: S02E09/10/11, S03E08/09),
+  and Jev's two S02 misses were confident (both titles p≈0.7 on "Cascade", the
+  word spoken in both), so Jev's probability alone can't gate escalation. A naive
+  Jev→Opus cascade (escalate top-p < T, Opus Borda rescaled to sum 1) did NOT
+  beat Jev alone at any T: mixing Borda and probability scales in one bijection
+  misranks — a cascade needs a common score scale first. Opus 5.5 was faster
+  than Sonnet 5 here (Sonnet's adaptive thinking: p95 24 s).
 
 ## Output / rip workflow
 

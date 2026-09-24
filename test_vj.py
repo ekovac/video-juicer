@@ -998,5 +998,92 @@ class TranscodeTests(unittest.TestCase):
             self.assertFalse(tc._is_matroska(Path(d) / "missing.mkv"))
 
 
+class JevJudgeTests(unittest.TestCase):
+    """synopsis.jev_rank over a mocked TypeSafe endpoint: probabilities in,
+    ranked (episode, p) out; slice-averaging; `none` as an abstention."""
+
+    def setUp(self):
+        import synopsis
+        self.syn = synopsis
+        self.pool = [Episode(1, n, f"Ep{n}", None, overview=f"plot {n}")
+                     for n in (1, 2, 3)]
+        self.calls = []
+        self.orig = synopsis.typesafe_system_one
+
+    def tearDown(self):
+        self.syn.typesafe_system_one = self.orig
+
+    def _mock(self, answers):
+        it = iter(answers)
+
+        def fake(state_, questions, model="jev-latest"):
+            self.calls.append((state_, questions))
+            probs = next(it)
+            return {"model": "jev-1.13.0", "usage": {"input_tokens": 100,
+                                                     "output_tokens": 5},
+                    "answers": {"episode": {"type": "choice",
+                                            "probabilities": probs}}}
+        self.syn.typesafe_system_one = fake
+
+    def test_ranks_by_probability_and_drops_tiny(self):
+        self._mock([{"S01E01 Ep1": 0.1, "S01E02 Ep2": 0.89, "S01E03 Ep3": 0.01,
+                     self.syn.JEV_NONE: 0.0}])
+        ranked, ev, meta = self.syn.jev_rank("words", self.pool)
+        self.assertEqual([(e.number, p) for e, p in ranked], [(2, 0.89), (1, 0.1)])
+        self.assertEqual(meta["input_tokens"], 100)
+        self.assertEqual(meta["model"], "jev-1.13.0")
+        q = self.calls[0][1]["episode"]
+        self.assertIn(self.syn.JEV_NONE, q["criteria"])      # abstention option
+        self.assertEqual(q["criteria"]["S01E03 Ep3"], "plot 3")
+
+    def test_none_is_an_abstention(self):
+        self._mock([{"S01E01 Ep1": 0.2, "S01E02 Ep2": 0.1, "S01E03 Ep3": 0.0,
+                     self.syn.JEV_NONE: 0.7}])
+        ranked, ev, _ = self.syn.jev_rank("you you you", self.pool)
+        self.assertEqual(ranked, [])
+        self.assertIn("none", ev)
+
+    def test_chunked_averages_slices(self):
+        self._mock([{"S01E01 Ep1": 1.0, "S01E02 Ep2": 0.0, "S01E03 Ep3": 0.0,
+                     self.syn.JEV_NONE: 0.0},
+                    {"S01E01 Ep1": 0.2, "S01E02 Ep2": 0.8, "S01E03 Ep3": 0.0,
+                     self.syn.JEV_NONE: 0.0}])
+        ranked, _, meta = self.syn.jev_rank("aaaa bbbb", self.pool, chunk_chars=4)
+        self.assertEqual(meta["requests"], 2)
+        self.assertEqual([self.calls[0][0], self.calls[1][0]],
+                         [{"transcript": "aaaa"}, {"transcript": "bbbb"}])
+        self.assertEqual([(e.number, round(p, 2)) for e, p in ranked],
+                         [(1, 0.6), (2, 0.4)])
+
+    def test_chunks_never_split_words(self):
+        parts = self.syn._chunks("alpha beta gamma delta", 11)
+        self.assertEqual(parts, ["alpha beta", "gamma delta"])
+
+
+class BenchScoreTests(unittest.TestCase):
+    """bench_synopsis.score: top-1 vs post-bijection verdicts, distractor false
+    claims, and cost from the price table."""
+
+    def test_bijection_and_verdicts(self):
+        import bench_synopsis as b
+        pool = [Episode(1, n, f"Ep{n}", None, overview="x") for n in (1, 2)]
+        cases = [b.Case(1, "D1", 800, 1, {"S01E01"}, "t", "subtitle-ocr", pool),
+                 b.Case(2, "D1", 801, 1, {"S01E02"}, "t", "subtitle-ocr", pool),
+                 b.Case(3, "D1", 900, 1, set(), "t", "audio", pool)]
+        res = {  # both golden titles top-pick E01; the stronger one keeps it
+            1: {"ranked": [["S01E01", 0.9], ["S01E02", 0.1]], "latency_s": 1.0,
+                "input_tokens": 1_000_000, "output_tokens": 0},
+            2: {"ranked": [["S01E01", 0.6], ["S01E02", 0.4]], "latency_s": 3.0,
+                "input_tokens": 0, "output_tokens": 0},
+            3: {"ranked": [], "latency_s": 2.0, "input_tokens": 0,
+                "output_tokens": 0}}
+        s = b.score("jev", cases, res)
+        self.assertEqual(s["top1"], {"correct": 1, "wrong": 1, "abstain": 1})
+        self.assertEqual(s["final"], {"correct": 2, "abstain": 1})   # bijection fixed #2
+        self.assertEqual(s["n_golden"], 2)
+        self.assertEqual(s["latency_serial_s"], 6.0)
+        self.assertAlmostEqual(s["cost_usd"], 0.042)
+
+
 if __name__ == "__main__":
     unittest.main()
