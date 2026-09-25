@@ -39,7 +39,7 @@ import review
 import state
 import wiki
 from discs import (
-    Tmdb, grouped_seasons, log, scan_disc,
+    Tmdb, fetch_order_maps, grouped_seasons, log, scan_disc,
 )
 
 # ---------------------------------------------------------------------------
@@ -108,7 +108,18 @@ def cmd_init(args) -> int:
     state.set_project(conn, tmdb_id=args.tmdb_id, show_name=show, year=year,
                       episode_order=args.episode_order)
     state.upsert_episodes(conn, episodes)
+    # Cache TMDB's alternative orderings so `status`/`gaps` can tell when the
+    # discs follow one of them instead of the project's numbering. Best effort:
+    # a network hiccup here mustn't fail init (`vj orders` refetches).
+    try:
+        groups = fetch_order_maps(tmdb, args.tmdb_id)
+        state.put_order_maps(conn, groups)
+    except Exception as e:  # noqa: BLE001
+        groups = []
+        log.warning("init: couldn't fetch TMDB episode groups (%s); "
+                    "run `vj orders` later", e)
     conn.close()
+    others = [g["name"] for g in groups]
 
     n_specials = len(specials)
     emit(args,
@@ -118,7 +129,51 @@ def cmd_init(args) -> int:
          human=(f"initialised {args.db}\n"
                 f"  {show} ({year}) [tmdb {args.tmdb_id}]\n"
                 f"  {len(seasons)} seasons, {len(episodes)} episodes"
-                f"{f' (+{n_specials} specials)' if n_specials else ''}"))
+                f"{f' (+{n_specials} specials)' if n_specials else ''}\n"
+                f"  numbered in {'TMDB aired order' if args.episode_order == 'aired' else args.episode_order}"
+                + (f"; TMDB also has: {', '.join(others)} — if your discs follow "
+                   "one of those, re-init with --episode-order <alias|id>"
+                   if others else "")))
+    return 0
+
+
+def cmd_orders(args) -> int:
+    """Fetch/refresh TMDB's alternative orderings into the project and report
+    which ordering each season's discs actually follow."""
+    conn, err = _open(args)
+    if err:
+        return err
+    if args.refresh or not state.order_maps(conn):
+        api_key = args.tmdb_api_key or os.environ.get("TMDB_API_KEY")
+        if not api_key:
+            conn.close()
+            return fail(args, "no-api-key",
+                        "TMDB_API_KEY not set and --tmdb-api-key not given")
+        tmdb_id = int(state.get_project(conn)["tmdb_id"])
+        tmdb = Tmdb(api_key, args.cache_dir / str(tmdb_id))
+        state.put_order_maps(conn, fetch_order_maps(tmdb, tmdb_id))
+    maps = state.order_maps(conn)
+    checks = review.order_check(conn)
+    project = state.order_label(conn)
+    conn.close()
+    lines = [f"episodes numbered in {project}",
+             "TMDB orderings: " + (", ".join(
+                 f"{g['name']} (type {g['type']}, id {gid})"
+                 for gid, g in maps.items()) or "none")]
+    for c in checks:
+        b = c["best_group"]
+        best = f"; best TMDB fit: {b['name']} {b['fraction']:.0%}" if b else ""
+        flag = " ‼ MISMATCH" if c["mismatch"] else (
+            " ‼ unexplained" if c["unexplained"] else "")
+        lines.append(f"  S{c['season']:02d}: {c['identified']} identified titles, "
+                     f"{c['project_fraction']:.0%} in project order{best}{flag}")
+    if not checks:
+        lines.append("  (no season has enough content-identified titles in a "
+                     "meaningful disc order to check)")
+    emit(args, {"ok": True, "episode_order": project,
+                "groups": {gid: {"name": g["name"], "type": g["type"]}
+                           for gid, g in maps.items()},
+                "seasons": checks}, human="\n".join(lines))
     return 0
 
 
@@ -419,18 +474,43 @@ def _resolve_disc(conn, value):
                   + ", ".join(n for _, n in rows) or "(none)")
 
 
+def _order_mismatch_lines(items: list[dict]) -> list[str]:
+    """Human lines for review.order_mismatches (status + gaps share them)."""
+    lines = []
+    for m in items:
+        pct = f"{m['project_fraction']:.0%}"
+        if m["mismatch"]:
+            g = m["best_group"]
+            lines.append(
+                f"  ‼ S{m['season']:02d}: discs follow TMDB '{g['name']}' "
+                f"({g['fraction']:.0%} in sequence), not the project's "
+                f"{m['project_order']} ({pct}) — disc position ≠ episode number. "
+                f"Numbers in outputs are {m['project_order']}; re-init with "
+                f"--episode-order {g['selector']} to number by the discs.")
+        else:
+            hint = ("" if m["maps_cached"] else
+                    "; run `vj orders` to check TMDB's alternative orderings")
+            lines.append(
+                f"  ‼ S{m['season']:02d}: disc order follows neither the "
+                f"project's {m['project_order']} ({pct} in sequence) nor any "
+                f"cached TMDB ordering{hint}")
+    return lines
+
+
 def cmd_status(args) -> int:
     conn, err = _open(args)
     if err:
         return err
     r = review.summarize(conn)
     conn.close()
-    lines = [f"{r['show']}: {r['titles']} titles scanned",
+    lines = [f"{r['show']}: {r['titles']} titles scanned "
+             f"(episodes numbered in {r['episode_order']})",
              f"  assignments: {r['assignments_by_status'] or '(none)'}"]
     for s in r["seasons"]:
         lines.append(f"  S{s['season']:02d}: {s['matched']}/{s['total']} episodes matched")
     for w in r.get("order_warnings", []):
         lines.append(f"  ⚠ {w['disc']}: order unverified — {w['reason']}")
+    lines += _order_mismatch_lines(r.get("order_mismatches", []))
     for p in r.get("packaging", []):
         n = len(p["asserted"])
         tag = "" if p["scanned"] else " (not scanned yet)"
@@ -456,6 +536,7 @@ def cmd_gaps(args) -> int:
     for w in r.get("order_warnings", []):
         lines.append(f"  ⚠ order unverified: {w['disc']} ({w['titles']} titles) "
                      f"— {w['reason']}")
+    lines += _order_mismatch_lines(r.get("order_mismatches", []))
     _sig = {"assign": "→ ASSIGN", "reject": "→ REJECT",
             "run-ocr": "→ run ocr", "review": "→ review"}
     for g in r["gaps"]:
@@ -984,6 +1065,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_scan.add_argument("images", nargs="+", type=Path,
                         help="disc images (.iso) or backup directories")
     p_scan.set_defaults(func=cmd_scan)
+
+    p_orders = sub.add_parser(
+        "orders", help="cache TMDB's alternative episode orderings (DVD, "
+                       "production…) and check which one the discs follow")
+    p_orders.add_argument("db", type=Path, help="existing state file")
+    p_orders.add_argument("--refresh", action="store_true",
+                          help="refetch from TMDB even if already cached")
+    p_orders.add_argument("--tmdb-api-key", default=None)
+    p_orders.add_argument("--cache-dir", type=Path, default=Path(".tmdb_cache"))
+    p_orders.set_defaults(func=cmd_orders)
 
     p_enrich = sub.add_parser(
         "enrich", help="add richer episode synopses from a local Wikipedia dump")

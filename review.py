@@ -15,7 +15,7 @@ import sqlite3
 from collections import defaultdict
 
 import state
-from discs import Assignment
+from discs import GROUP_TYPE_ALIASES, Assignment
 from identify import assess_ordering
 
 # A title-card read is only trustworthy if the title's DURATION also fits the
@@ -175,6 +175,117 @@ def _conflict(conn, tid: int, threshold: float) -> tuple[bool, set]:
 # ---------------------------------------------------------------------------
 
 
+def _content_identity(conn, tid: int, accept: float) -> int | None:
+    """The episode a title IS by content, independent of its position: an
+    accepted title-card read, else a synopsis-assigned episode, else an
+    adjudicated (confirmed) assignment. Runtime-align is deliberately excluded —
+    it is a position guess, the very thing an order check must not assume."""
+    ev = {e["category"]: e for e in state.evidence_for_title(conn, tid)}
+    ocr = ev.get("title-card-ocr")
+    if ocr and ocr["episode_id"] and (ocr["confidence"] or 0) >= accept:
+        return ocr["episode_id"]
+    syn = ev.get("synopsis")
+    if syn and syn["episode_id"]:
+        return syn["episode_id"]
+    a = state.get_assignment(conn, tid)
+    if a and a["status"] == "confirmed":
+        eids = json.loads(a["episode_ids_json"])
+        if eids:
+            return eids[0]
+    return None
+
+
+def _in_order_fraction(keys: list) -> float:
+    """Share of consecutive pairs whose (season, number) doesn't go DOWN (a
+    repeat is fine: a two-parter whose card lacks the part number reads twice)."""
+    pairs = list(zip(keys, keys[1:]))
+    return sum(1 for a, b in pairs if b >= a) / len(pairs) if pairs else 1.0
+
+
+# Thresholds are relative, not "must be perfect": a single title-card misread
+# costs one pair (VB S3: one wrong read → 0.91 for the ordering the discs
+# really follow). A mismatch = the project's ordering is out of sequence AND a
+# TMDB group fits clearly better; "unexplained" = out of sequence, nothing fits.
+ORDER_MIN_TITLES = 4       # fewer identified titles can't show a pattern
+ORDER_FIT = 0.85           # a TMDB group "fits" the discs at/above this
+ORDER_MISFIT = 0.9         # the project's ordering is out of sequence at/below
+ORDER_MARGIN = 0.05        # …and the fitting group beats it by at least this
+ORDER_LOST = 0.8           # out of sequence with no fitting group
+
+
+def order_check(conn, accept: float = 0.8) -> list[dict]:
+    """Per season: do the discs' episodes, in PLAY order, follow the project's
+    numbering — or one of TMDB's alternative orderings (cached by `vj orders`)?
+
+    Walks each season's titles in disc order (disc hint, then play order),
+    takes each one's CONTENT identity (`_content_identity`), and scores every
+    ordering by the share of consecutive titles that go up in it. A season is a
+    mismatch when the project's ordering is out of sequence (≤ ORDER_MISFIT)
+    while a TMDB group fits (≥ ORDER_FIT) — e.g. Venture Bros: the DVDs are in
+    TMDB 'DVD Order' but the project was created `aired`, so disc position N is
+    not episode N. Only discs whose play order is meaningful are used: DVDs, and
+    Blu-rays with a play-all (plain .mpls order is not broadcast order)."""
+    eps = {r["id"]: r for r in conn.execute("SELECT * FROM episode")}
+    maps = state.order_maps(conn)
+    project = state.order_label(conn)
+    by_season: dict = defaultdict(list)
+    for d in conn.execute("SELECT id, format, season_hint, disc_hint FROM disc "
+                          "WHERE season_hint IS NOT NULL ORDER BY season_hint, "
+                          "disc_hint, id"):
+        if d["format"] != "dvd" and not conn.execute(
+                "SELECT 1 FROM title WHERE disc_id=? AND kind='play-all'",
+                (d["id"],)).fetchone():
+            continue
+        # only titles assigned as episodes: an extra or duplicate that flashes
+        # an episode's card (VB's 17-min "Red Means Stop" featurette) isn't
+        # part of the disc's episode sequence
+        for t in conn.execute(
+                "SELECT t.id FROM title t JOIN assignment a ON a.title_id=t.id "
+                "WHERE t.disc_id=? AND t.kind='episode-candidate' AND "
+                "a.status IN ('proposed','confirmed') "
+                "ORDER BY t.order_key, t.title_number", (d["id"],)):
+            eid = _content_identity(conn, t["id"], accept)
+            # specials (S00) sit wherever the publisher put them — they don't
+            # belong to any season's sequence, so they'd only add noise
+            if eid in eps and eps[eid]["season"] != 0:
+                by_season[d["season_hint"]].append(eps[eid])
+    out = []
+    for season, seq in sorted(by_season.items()):
+        if len(seq) < ORDER_MIN_TITLES:
+            continue
+        proj = _in_order_fraction([(e["season"], e["number"]) for e in seq])
+        best = None
+        for gid, g in maps.items():
+            keys = [g["map"].get((e["aired_season"], e["aired_number"])
+                                 if e["aired_season"] is not None
+                                 else (e["season"], e["number"])) for e in seq]
+            if None in keys:
+                continue
+            frac = _in_order_fraction(keys)
+            if best is None or frac > best["fraction"]:
+                alias = next((a for a, t in GROUP_TYPE_ALIASES.items()
+                              if t == g["type"]), None)
+                best = {"group_id": gid, "name": g["name"], "fraction": frac,
+                        # what `vj init --episode-order` accepts for it
+                        "selector": alias or gid}
+        mismatch = (proj <= ORDER_MISFIT and best is not None
+                    and best["fraction"] >= ORDER_FIT
+                    and best["fraction"] - proj >= ORDER_MARGIN)
+        if best:
+            best["fraction"] = round(best["fraction"], 3)
+        out.append({"season": season, "identified": len(seq),
+                    "project_order": project, "project_fraction": round(proj, 3),
+                    "best_group": best, "mismatch": mismatch,
+                    "unexplained": proj <= ORDER_LOST and not mismatch,
+                    "maps_cached": bool(maps)})
+    return out
+
+
+def order_mismatches(conn) -> list[dict]:
+    """The seasons from `order_check` worth surfacing (mismatch/unexplained)."""
+    return [c for c in order_check(conn) if c["mismatch"] or c["unexplained"]]
+
+
 def summarize(conn) -> dict:
     proj = state.get_project(conn)
     # per-season episode coverage (an episode is "covered" if some assignment,
@@ -198,6 +309,8 @@ def summarize(conn) -> dict:
     return {"ok": True, "show": proj.get("show_name"),
             "titles": n_titles, "assignments_by_status": by_status,
             "seasons": seasons, "order_warnings": order_warnings(conn),
+            "episode_order": state.order_label(conn),
+            "order_mismatches": order_mismatches(conn),
             "packaging": _packaging_status(conn)}
 
 
@@ -361,7 +474,8 @@ def gaps(conn, threshold: float = 0.5, accept: float = 0.8) -> dict:
     title_gaps.sort(key=lambda g: (_order.get(g["suggestion"]["action"], 4),
                                    g["title_id"]))
     return {"ok": True, "gaps": title_gaps, "missing_episodes": missing,
-            "order_warnings": warns, "n_gaps": len(title_gaps),
+            "order_warnings": warns, "order_mismatches": order_mismatches(conn),
+            "n_gaps": len(title_gaps),
             "n_missing": len(missing)}
 
 

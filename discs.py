@@ -566,6 +566,20 @@ GROUP_TYPE_ALIASES = {
 }
 
 
+def fetch_order_maps(tmdb: Tmdb, tv_id: int) -> list[dict]:
+    """Every TMDB episode group for the series, as order maps for
+    state.put_order_maps: each episode keyed by its AIRED (season, number) and
+    mapped to the group's (season, number) — group order 0 is its specials."""
+    groups = []
+    for meta in tmdb.episode_groups(tv_id):
+        detail = tmdb.episode_group(meta["id"])
+        eps = [(e["season_number"], e["episode_number"], g["order"], e["order"] + 1)
+               for g in detail["groups"] for e in g["episodes"]]
+        groups.append({"id": meta["id"], "name": meta["name"],
+                       "type": meta.get("type"), "episodes": eps})
+    return groups
+
+
 def grouped_seasons(tmdb: Tmdb, tv_id: int, selector: str,
                     fallback_rt: Optional[float]
                     ) -> tuple[dict[int, list[Episode]], list[Episode]]:

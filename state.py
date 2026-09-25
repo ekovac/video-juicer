@@ -105,6 +105,20 @@ CREATE TABLE IF NOT EXISTS assignment (
     decided_at       TEXT
 );
 
+CREATE TABLE IF NOT EXISTS episode_order_map (
+    -- TMDB's alternative orderings (episode groups: DVD, production, digital…)
+    -- cached so order checks run offline. Keyed by the AIRED numbering — TMDB's
+    -- stable identity for an episode — mapped to that group's (season, number).
+    group_id      TEXT NOT NULL,
+    group_name    TEXT NOT NULL,        -- e.g. 'DVD Order'
+    group_type    INTEGER,              -- TMDB type (3 = DVD, 6 = production, …)
+    aired_season  INTEGER NOT NULL,
+    aired_number  INTEGER NOT NULL,
+    season        INTEGER NOT NULL,
+    number        INTEGER NOT NULL,
+    PRIMARY KEY (group_id, aired_season, aired_number)
+);
+
 CREATE TABLE IF NOT EXISTS background (
     disc_name     TEXT PRIMARY KEY,     -- canonical disc basename (state.disc_name)
     episodes_json TEXT NOT NULL,        -- [[season, number], …] the box says are here
@@ -442,6 +456,47 @@ def put_transcript(conn: sqlite3.Connection, title_id: int, text: str,
         (title_id, text, windows, length, source, _now(conn),
          json.dumps([list(c) for c in cues]) if cues else None))
     conn.commit()
+
+
+def put_order_maps(conn: sqlite3.Connection, groups: list[dict]) -> int:
+    """Replace the cached TMDB orderings. `groups`: [{id, name, type, episodes:
+    [(aired_season, aired_number, season, number)]}]. Returns rows written."""
+    conn.execute("DELETE FROM episode_order_map")
+    n = 0
+    for g in groups:
+        for a_s, a_n, s_, n_ in g["episodes"]:
+            conn.execute(
+                "INSERT OR REPLACE INTO episode_order_map VALUES(?,?,?,?,?,?,?)",
+                (g["id"], g["name"], g.get("type"), a_s, a_n, s_, n_))
+            n += 1
+    conn.commit()
+    return n
+
+
+def order_maps(conn: sqlite3.Connection) -> dict:
+    """{group_id: {"name", "type", "map": {(aired_s, aired_n): (s, n)}}}."""
+    out: dict = {}
+    try:
+        rows = conn.execute("SELECT * FROM episode_order_map").fetchall()
+    except sqlite3.OperationalError:     # a read-only DB older than the table
+        return out
+    for r in rows:
+        g = out.setdefault(r["group_id"], {"name": r["group_name"],
+                                           "type": r["group_type"], "map": {}})
+        g["map"][(r["aired_season"], r["aired_number"])] = (r["season"], r["number"])
+    return out
+
+
+def order_label(conn: sqlite3.Connection) -> str:
+    """Human name of the project's episode numbering: 'aired' → "TMDB aired
+    order"; a group alias/id → its cached TMDB name when known."""
+    order = get_project(conn).get("episode_order") or "aired"
+    if order == "aired":
+        return "TMDB aired order"
+    for gid, g in order_maps(conn).items():
+        if order == gid:
+            return f"TMDB '{g['name']}'"
+    return f"TMDB episode group '{order}'"
 
 
 def get_transcript_cues(conn: sqlite3.Connection,

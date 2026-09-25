@@ -1201,5 +1201,73 @@ class CueTimingTests(Base):
                               if e["category"] == "synopsis"])
 
 
+class OrderCheckTests(Base):
+    """review.order_check: do the discs, in play order, follow the project's
+    numbering or a cached TMDB ordering? (Venture Bros: DVD order ≠ aired.)"""
+
+    NAMES = ["A", "B", "C", "D", "E", "F"]
+    # TMDB 'DVD Order' swaps aired E02 and E05 (disc positions 2 and 5)
+    DVD = {(1, 1): (1, 1), (1, 2): (1, 5), (1, 3): (1, 3), (1, 4): (1, 4),
+           (1, 5): (1, 2), (1, 6): (1, 6)}
+
+    def setup_show(self, disc_content, fmt="dvd", extra=None):
+        state.upsert_episodes(self.conn, [ep(1, n, self.NAMES[n - 1], 1320.0)
+                                          for n in range(1, 7)])
+        ts = [Title(id=k, duration=1320.0, chapters=[1320.0],
+                    kind="episode-candidate", order_key=k)
+              for k in range(1, len(disc_content) + 1)]
+        if extra:
+            ts.append(Title(id=99, duration=1000.0, chapters=[1000.0],
+                            kind="episode-candidate", order_key=99))
+        d = Disc(path=Path("/d/SHOW_S1D1.iso"), format=fmt, label="X",
+                 season_hint=1, disc_hint=1)
+        d.titles = ts
+        did = state.add_disc(self.conn, d)
+        for k, aired in enumerate(disc_content, 1):      # title card reads
+            tid = state.title_id(self.conn, did, k)
+            eid = state.episode_id(self.conn, 1, aired)
+            state.put_evidence(self.conn, tid, "title-card-ocr", episode_id=eid,
+                               verdict="read", confidence=1.0)
+            # runtime-align assigned by POSITION (the Venture Bros failure)
+            state.set_assignment(self.conn, tid, [state.episode_id(self.conn, 1, k)],
+                                 status="proposed", decided_by="heuristic:runtime-align")
+        if extra:                  # an unassigned extra flashing an episode card
+            tid = state.title_id(self.conn, did, 99)
+            state.put_evidence(self.conn, tid, "title-card-ocr",
+                               episode_id=state.episode_id(self.conn, 1, extra),
+                               verdict="read", confidence=1.0)
+        state.put_order_maps(self.conn, [{
+            "id": "g-dvd", "name": "DVD Order", "type": 3,
+            "episodes": [(a[0], a[1], b[0], b[1]) for a, b in self.DVD.items()]}])
+        return did
+
+    def test_discs_in_dvd_order_flag_a_mismatch_naming_the_group(self):
+        self.setup_show([1, 5, 3, 4, 2, 6])     # disc order = DVD order
+        [c] = review.order_check(self.conn)
+        self.assertTrue(c["mismatch"])
+        self.assertEqual(c["best_group"]["name"], "DVD Order")
+        self.assertEqual(c["best_group"]["fraction"], 1.0)
+        self.assertLess(c["project_fraction"], 0.9)
+        self.assertEqual(review.order_mismatches(self.conn), [c])
+
+    def test_discs_in_project_order_are_fine(self):
+        self.setup_show([1, 2, 3, 4, 5, 6])
+        self.assertEqual(review.order_mismatches(self.conn), [])
+
+    def test_unassigned_extra_with_a_card_is_ignored(self):
+        self.setup_show([1, 2, 3, 4, 5, 6], extra=2)   # extra after E06 reads E02
+        self.assertEqual(review.order_mismatches(self.conn), [])
+
+    def test_bluray_without_play_all_is_not_checked(self):
+        self.setup_show([1, 5, 3, 4, 2, 6], fmt="bluray")
+        self.assertEqual(review.order_check(self.conn), [])
+
+    def test_order_label_names_the_projects_numbering(self):
+        self.setup_show([1, 2, 3, 4, 5, 6])
+        self.assertEqual(state.order_label(self.conn), "TMDB aired order")
+        state.set_project(self.conn, episode_order="g-dvd")
+        self.assertEqual(state.order_label(self.conn), "TMDB 'DVD Order'")
+
+
 if __name__ == "__main__":
     unittest.main()
