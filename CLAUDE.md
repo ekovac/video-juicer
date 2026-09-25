@@ -694,7 +694,10 @@ LLM judge matches it against each candidate's plot synopsis.
   Cremation Creek parts swapped — both parts share ONE Wikipedia summary),
   Haiku 78/81 ($0.93), Sonnet 5 78/81 ($2.75). On an EPISODIC show Jev matches
   or beats the frontier judges at ~1% of Opus's cost; the serialized Expanse is
-  where it trails. **Lesson: a "golden" DB can be wrong.** vb_full.db first scored
+  where it trails. The local default qwen2.5:14b-instruct (Ollama, ~7 s/title,
+  free): **20/60 Expanse, 59/81 VB**, 5/8 false claims on VB's decoys — the
+  weakest judge and the only one that routinely claims featurettes/duplicates.
+  **Lesson: a "golden" DB can be wrong.** vb_full.db first scored
   every judge at ~66-69/81 — all five unanimously "missed" the same 12 titles.
   They were right: the DB's own title-card OCR agreed with them, and the 12 were
   unadjudicated runtime-align PROPOSALS that had overridden 1.0 title-card reads

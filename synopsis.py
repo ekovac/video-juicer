@@ -420,12 +420,11 @@ def _anthropic_text(model: str, prompt: str) -> str:
     return anthropic_message(model, prompt)[0]
 
 
-def _ollama_text(model: str, prompt: str, host: str, retries: int = 3) -> str:
-    """One text-only chat with retries (mirrors identify.ollama_chat's resilience
-    to the daemon's OOM-restart, minus the image payload). A `claude-*` model id
-    routes to the Anthropic backend instead — the retry/backoff also rides out a
-    429/503/529 rate-limit or overload there."""
-    is_claude = model.startswith("claude")
+def ollama_message(model: str, prompt: str,
+                   host: str = "http://localhost:11434") -> tuple[str, dict]:
+    """One text-only Ollama chat → (reply text, meta: `usage` in Anthropic's
+    field names + `stop_reason`), so bench_synopsis can meter a local judge the
+    same way as an API one. No retries here; `_ollama_text` adds them."""
     # Ollama defaults num_ctx to 2048 and SILENTLY truncates a longer prompt to
     # its TAIL — on a full-episode transcript (~5k+ tokens) that drops most of the
     # dialogue the judge needs, and it abstains on every title (observed on the
@@ -451,18 +450,29 @@ def _ollama_text(model: str, prompt: str, host: str, retries: int = 3) -> str:
     think = os.environ.get("VJ_JUDGE_THINK")
     if think is not None:
         payload["think"] = think.strip().lower() not in ("false", "0", "no", "off")
-    body = json.dumps(payload).encode()
+    req = urllib.request.Request(
+        f"{host}/api/chat", data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=300) as resp:
+        data = json.loads(resp.read())
+    usage = {"input_tokens": data.get("prompt_eval_count", 0),
+             "output_tokens": data.get("eval_count", 0)}
+    return ((data["message"].get("content") or "").strip(),
+            {"usage": usage, "stop_reason": data.get("done_reason"),
+             "num_ctx": num_ctx})
+
+
+def _ollama_text(model: str, prompt: str, host: str, retries: int = 3) -> str:
+    """One text-only judge call with retries (mirrors identify.ollama_chat's
+    resilience to the daemon's OOM-restart, minus the image payload). A
+    `claude-*` model id routes to the Anthropic backend instead — the
+    retry/backoff also rides out a 429/503/529 rate-limit or overload there."""
     delays = [5, 15, 30]
     for attempt in range(retries + 1):
         try:
-            if is_claude:
+            if model.startswith("claude"):
                 return _anthropic_text(model, prompt)
-            req = urllib.request.Request(
-                f"{host}/api/chat", data=body,
-                headers={"Content-Type": "application/json"})
-            with urllib.request.urlopen(req, timeout=300) as resp:
-                data = json.loads(resp.read())
-            return (data["message"].get("content") or "").strip()
+            return ollama_message(model, prompt, host)[0]
         except Exception as e:  # noqa: BLE001
             if attempt >= retries:
                 raise

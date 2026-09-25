@@ -15,9 +15,11 @@ are treated as golden. Measures what the judge choice actually changes:
   * wall-clock — per-call latency (serial Σ, median, p95)
   * cost — from each response's reported token usage × the price table
 
-Judges: any `claude-*` model id (the production stage-1 prompt, unchanged), and
-`jev` / `jev-chunked` (TypeSafe's Jev answering a typed Choice; see
-synopsis.jev_rank). Results are cached per judge in --out as JSONL, so a run
+Judges: any `claude-*` model id and any Ollama model (e.g. `qwen2.5:14b-instruct`)
+— both with the production stage-1 prompt and settings, unchanged — and `jev` /
+`jev-chunked` (TypeSafe's Jev answering a typed Choice; see synopsis.jev_rank).
+Local Ollama judges cost $0 in the report (electricity/GPU not counted) and run
+one call at a time, since Ollama queues concurrent requests. Results are cached per judge in --out as JSONL, so a run
 resumes where it stopped and re-scoring is free; --fresh re-queries.
 
   python3 bench_synopsis.py expanse.db --out bench/        # all default judges
@@ -31,6 +33,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import sqlite3
 import statistics
 import sys
@@ -165,6 +168,38 @@ def judge_claude(case: Case, model: str, max_tokens: int, effort) -> dict:
             "stop_reason": meta["stop_reason"], "model": model}
 
 
+def judge_ollama(case: Case, model: str, host: str) -> dict:
+    """A local Ollama judge — the same prompt and num_ctx/num_predict sizing as
+    `run synopsis` (synopsis.ollama_message). Retries a daemon restart."""
+    pool = [e for e in case.pool if e.synopsis]
+    prompt = synopsis.rank_prompt(case.transcript, pool)
+    retries = 0
+    while True:
+        t0 = time.monotonic()
+        try:
+            reply, meta = synopsis.ollama_message(model, prompt, host)
+            break
+        except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+            if retries >= 3:
+                raise RuntimeError(f"ollama: {e}") from e
+            retries += 1
+            log.warning("%s: %s, retry %d in %ds", model, e, retries, 10 * retries)
+            time.sleep(10 * retries)
+    latency = time.monotonic() - t0
+    ranked, evidence = synopsis.parse_ranking(reply, pool)
+    u = meta["usage"]
+    return {"ranked": [[label(e), s] for e, s in ranked], "evidence": evidence,
+            "latency_s": latency, "requests": 1, "retries": retries,
+            "input_tokens": u["input_tokens"], "output_tokens": u["output_tokens"],
+            # Ollama's "length" is the num_predict cap — count it as truncated
+            "stop_reason": "max_tokens" if meta["stop_reason"] == "length"
+            else meta["stop_reason"], "model": model}
+
+
+def _is_local(judge: str) -> bool:
+    return not (judge.startswith("claude") or judge.startswith("jev"))
+
+
 def judge_jev(case: Case, chunked: bool, model: str, show: str) -> dict:
     t0 = time.monotonic()
     ranked, evidence, meta = synopsis.jev_rank(
@@ -184,13 +219,15 @@ def run_judge(judge: str, case: Case, args, show: str) -> dict:
     if judge.startswith("claude"):
         effort = None if "haiku" in judge else args.effort   # Haiku 4.5: no effort
         return judge_claude(case, judge, args.max_tokens, effort)
-    raise ValueError(f"unknown judge {judge!r} (want claude-* or jev[-chunked])")
+    return judge_ollama(case, judge, args.ollama_host)      # any other id: Ollama
 
 
 # --- result cache -----------------------------------------------------------
 
 def _results_path(out: Path, judge: str) -> Path:
-    return out / f"{judge}.jsonl"
+    """Per-judge cache file. Characters some filesystems reject (exFAT/NTFS:
+    the `:` in an Ollama tag like `qwen2.5:14b-instruct`) become `_`."""
+    return out / (re.sub(r'[:<>"/\\|?*]', "_", judge) + ".jsonl")
 
 
 def load_results(out: Path, judge: str) -> dict[int, dict]:
@@ -219,7 +256,8 @@ def collect(judge: str, cases: list[Case], args, show: str) -> dict[int, dict]:
              len(cases) - len(todo))
     fh = _results_path(out, judge).open("a")
     t0 = time.monotonic()
-    with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
+    workers = 1 if _is_local(judge) else args.concurrency   # Ollama queues anyway
+    with ThreadPoolExecutor(max_workers=workers) as pool:
         futs = {pool.submit(run_judge, judge, c, args, show): c for c in todo}
         for i, fut in enumerate(as_completed(futs), 1):
             c = futs[fut]
@@ -239,7 +277,7 @@ def collect(judge: str, cases: list[Case], args, show: str) -> dict[int, dict]:
                      r["latency_s"])
     fh.close()
     log.info("%s: batch wall-clock %.0fs at concurrency %d", judge,
-             time.monotonic() - t0, args.concurrency)
+             time.monotonic() - t0, workers)
     return done
 
 
@@ -378,6 +416,9 @@ def main(argv=None) -> int:
                          "production uses 2048, which can truncate thinking models)")
     ap.add_argument("--effort", choices=["low", "medium", "high", "xhigh", "max"],
                     help="claude effort (not sent to Haiku); default = model default")
+    ap.add_argument("--ollama-host", default="http://localhost:11434",
+                    help="Ollama server for local judges (any model id that isn't "
+                         "claude-* or jev*)")
     ap.add_argument("--jev-model", default=synopsis.JEV_MODEL,
                     help="TypeSafe model id (pin e.g. jev-1.13.0 for repeatability)")
     args = ap.parse_args(argv)

@@ -135,7 +135,7 @@ Summaries are matched to episodes by title (Wikipedia's numbering can differ).
 `--judge-model` picks the judge: an Ollama model (default
 `qwen2.5:14b-instruct`), a `claude-*` model via `ANTHROPIC_API_KEY`, or
 TypeSafe's Jev (`jev-latest`) via `TYPESAFE_API_KEY`. Measured on two full series
-(`bench_synopsis.py`, below):
+(`bench_synopsis.py`, below; correct final answers):
 
 | Judge | The Expanse (60, serialized) | Venture Bros (81, episodic) | Cost for both |
 |---|---|---|---|
@@ -143,6 +143,11 @@ TypeSafe's Jev (`jev-latest`) via `TYPESAFE_API_KEY`. Measured on two full serie
 | Jev (chunked) | 57/60 | 81/81 | ~$0.10 |
 | Sonnet 5 | 46/60 | 78/81 | ~$4.40 |
 | Haiku 4.5 | 23/60 | 78/81 | ~$1.45 |
+| qwen2.5:14b-instruct (Ollama, default) | 20/60 | 59/81 | free (local, ~7 s/title) |
+
+The local default is the weakest judge and the only one that often claims
+non-episode titles as episodes (5 of 8 featurettes/duplicates on Venture Bros);
+use it offline only with a `gaps` review. Jev is nearly free and close to Opus.
 
 ### Benchmarking judges
 
