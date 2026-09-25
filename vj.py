@@ -557,10 +557,17 @@ def _resolve_title_arg(conn, args) -> int | None:
     disc = getattr(args, "disc", None)
     playlist = getattr(args, "playlist", None)
     if disc is not None and playlist is not None:
-        row = conn.execute("SELECT t.id FROM title t JOIN disc d ON t.disc_id = d.id "
-                           "WHERE d.label=? AND t.title_number=?", (disc, playlist)).fetchone()
-        if row:
-            return row[0]
+        # Disc identity is the image/backup-dir BASENAME (state.disc_name), not
+        # the volume label — labels are blank/wrong/identical across a box set
+        # (every VB disc is labelled alike). The label is accepted only when it
+        # names exactly one disc.
+        discs = conn.execute("SELECT id, path, label FROM disc").fetchall()
+        ids = [d["id"] for d in discs if state.disc_name(d["path"]) == disc]
+        if not ids:
+            by_label = [d["id"] for d in discs if d["label"] == disc]
+            ids = by_label if len(by_label) == 1 else []
+        if len(ids) == 1:
+            return state.title_id(conn, ids[0], int(playlist))
     return None
 
 

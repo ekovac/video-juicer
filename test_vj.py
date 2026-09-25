@@ -861,6 +861,21 @@ class WikiReaderTests(unittest.TestCase):
         self.assertEqual(len(s), 3)
 
 
+class TitleArgTests(Base):
+    """--disc resolves by image basename; a shared volume label can't pick one."""
+
+    def test_disc_name_not_label(self):
+        d1 = self.add_disc([title(4, 1320, [1320])], path="/d/VB_S1D1.iso")
+        d2 = self.add_disc([title(4, 1320, [1320])], disc_hint=2, path="/d/VB_S1D2.iso")
+        # both discs carry the same volume label ("S1D1", from add_disc)
+        args = types.SimpleNamespace(title=None, disc="VB_S1D2", playlist=4)
+        self.assertEqual(vj._resolve_title_arg(self.conn, args),
+                         state.title_id(self.conn, d2, 4))
+        args.disc = "S1D1"                     # ambiguous label -> no guess
+        self.assertIsNone(vj._resolve_title_arg(self.conn, args))
+        self.assertNotEqual(d1, d2)
+
+
 class WikiMatchTests(unittest.TestCase):
     """wiki.match_summaries: title-first, so a Wikipedia list numbered
     differently from TMDB still files each summary under the right episode."""
