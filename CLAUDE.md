@@ -664,6 +664,20 @@ LLM judge matches it against each candidate's plot synopsis.
   beat Jev alone at any T: mixing Borda and probability scales in one bijection
   misranks — a cascade needs a common score scale first. Opus 5.5 was faster
   than Sonnet 5 here (Sonnet's adaptive thinking: p95 24 s).
+- **Benchmark result — Venture Bros (2026-09-24, 81 golden titles + 8
+  distractors, CC / VOBSUB-OCR / whisper transcripts, Wikipedia synopses):**
+  jev-chunked **81/81** ($0.067), Opus 5.5 80/81 ($5.20), jev 79/81 (the
+  Cremation Creek parts swapped — both parts share ONE Wikipedia summary),
+  Haiku 78/81 ($0.93), Sonnet 5 78/81 ($2.75). On an EPISODIC show Jev matches
+  or beats the frontier judges at ~1% of Opus's cost; the serialized Expanse is
+  where it trails. **Lesson: a "golden" DB can be wrong.** vb_full.db first scored
+  every judge at ~66-69/81 — all five unanimously "missed" the same 12 titles.
+  They were right: the DB's own title-card OCR agreed with them, and the 12 were
+  unadjudicated runtime-align PROPOSALS that had overridden 1.0 title-card reads
+  (disc order = TMDB DVD order; the project was `aired`). When every judge agrees
+  against the golden set, audit the golden set (evidence, status, decided_by)
+  before believing the scores. Golden specials (S00) are skipped — the default
+  pool is the disc's season, so no judge can name them.
 
 - **Recap trimming — tried, NOT on main (code on branch
   `recap-trim-experiment`: `bench_synopsis.py --trim`, `synopsis.trim_recap`,

@@ -84,7 +84,9 @@ def load_cases(conn, include_multi: bool = False) -> tuple[list[Case], dict]:
     distractors (titles with a non-empty transcript but no assignment), each with
     its cached transcript and the candidate pool `run synopsis` would use.
     Multi-episode golden titles are skipped by default: `run synopsis` never
-    judges them (its >1.5× median guard), so they aren't part of the task."""
+    judges them (its >1.5× median guard), so they aren't part of the task.
+    Golden SPECIALS (S00) are skipped too: the default pool is the disc's season,
+    so no judge could name them."""
     seasons, specials = _season_pools(conn)
     all_eps = [e for n in sorted(seasons) for e in seasons[n]] + specials
     by_id = {r["id"]: r for r in conn.execute(
@@ -97,7 +99,7 @@ def load_cases(conn, include_multi: bool = False) -> tuple[list[Case], dict]:
     rows = conn.execute(
         "SELECT t.id, t.title_number, d.path, d.season_hint FROM title t "
         "JOIN disc d ON d.id = t.disc_id ORDER BY d.id, t.title_number").fetchall()
-    cases, skipped = [], {"multi-episode": 0, "no-transcript": 0}
+    cases, skipped = [], {"multi-episode": 0, "special": 0, "no-transcript": 0}
     for r in rows:
         tid = r["id"]
         text, src = None, None
@@ -108,6 +110,9 @@ def load_cases(conn, include_multi: bool = False) -> tuple[list[Case], dict]:
                 break
         if tid in gold and len(gold[tid]) > 1 and not include_multi:
             skipped["multi-episode"] += 1
+            continue
+        if tid in gold and any(g.startswith("S00") for g in gold[tid]):
+            skipped["special"] += 1
             continue
         if not text:
             if tid in gold:
