@@ -1162,9 +1162,10 @@ def build_parser() -> argparse.ArgumentParser:
                             "any cached transcript (default: reuse the stored one)")
     p_run.add_argument("--transcript-source", choices=["auto", "subtitle", "audio"],
                        default="auto",
-                       help="synopsis: dialogue source — auto prefers DVD closed "
-                            "captions (exact, whole-episode, near-instant) and "
-                            "falls back to whisper audio; subtitle/audio force one")
+                       help="synopsis: dialogue source — auto tries DVD closed "
+                            "captions (exact, near-instant), then OCR of the "
+                            "bitmap subtitle track (Blu-ray PGS / DVD VOBSUB), "
+                            "then whisper audio; subtitle/audio force a tier")
     p_run.add_argument("--synopsis-source", choices=["auto", "wikipedia", "tmdb"],
                        default="auto",
                        help="synopsis: which plot summary to judge against "

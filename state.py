@@ -134,7 +134,7 @@ CREATE TABLE IF NOT EXISTS transcript (
     text         TEXT NOT NULL,         -- the title's dialogue text
     windows      INTEGER NOT NULL,      -- audio sampling params it was made with:
     length       REAL NOT NULL,         --   reuse only when both still match
-    source       TEXT NOT NULL DEFAULT 'audio',  -- 'subtitle' (CC) | 'audio' (whisper)
+    source       TEXT NOT NULL DEFAULT 'audio',  -- 'cc' | 'subtitle-ocr' | 'audio' (whisper)
     updated_at   TEXT,
     cues_json    TEXT                   -- [[start_s, end_s, text], …] for subtitle
                                         -- sources; NULL = no timings (audio / old)
@@ -443,8 +443,9 @@ def put_transcript(conn: sqlite3.Connection, title_id: int, text: str,
                    windows: int, length: float, source: str = "audio",
                    cues: Optional[list] = None) -> None:
     """Persist a title's dialogue text (+ how it was produced) so a later run — or
-    a human/agent — can reuse it without re-extracting. `source` is 'subtitle'
-    (closed captions) or 'audio' (whisper); `windows`/`length` are the audio
+    a human/agent — can reuse it without re-extracting. `source` is 'cc' (DVD
+    closed captions), 'subtitle-ocr' (bitmap subtitle track) or 'audio'
+    (whisper); `windows`/`length` are the audio
     sampling params (0/0 for a full pass or a subtitle transcript). `cues` are
     the timed captions [(start, end, text)] a subtitle source also yields."""
     conn.execute(

@@ -1,206 +1,232 @@
 # video-juicer
 
 Maps the titles on DVD/Blu-ray disc images (or `BDMV`/`VIDEO_TS` backup dirs) to
-TMDB episodes, without reading the multi-GB video payload. Peak RSS ≈ 140 MB
-regardless of image size.
+TMDB episodes. Scanning reads disc *metadata* only — IFO tables via `lsdvd`,
+`.mpls` playlists via `7z` — never the multi-GB video payload (peak RSS ≈ 140 MB
+regardless of image size). The heavier identifiers (title-card OCR, dialogue
+transcripts) read only the titles you point them at.
 
 Modelled on **MusicBrainz Picard**: heuristics are on-demand *evidence
 producers*, not a black-box pipeline. Each run attaches evidence to a
-title→episode hypothesis; a human or an agent adjudicates the result. All state
-lives in a SQLite **project file**. Design rationale and schema: `DESIGN.md`.
-The *why* behind the heuristics and their traps: `CLAUDE.md`.
+title→episode hypothesis; a human or an agent adjudicates. All state lives in a
+SQLite **project file**. Architecture and schema: `DESIGN.md`. The *why* behind
+every heuristic and the traps it avoids: `CLAUDE.md`.
+
+`vj` below is `python3 vj.py`. Every verb emits JSON when stdout is not a TTY
+(or with `--json`) and human-readable text otherwise; errors are structured.
+`vj <verb> --help` documents each verb; `vj run --list` lists the heuristics.
 
 ## Workflow
 
 ```bash
 export TMDB_API_KEY=...
 
-# 1. create the project + pull the episode list from TMDB
-vj init show.db --tmdb-id 2418
+# 1. create the project + pull the episode list (and TMDB's alternative orderings)
+vj init show.db --tmdb-id 2418                  # add --episode-order dvd if the discs are in DVD order
+vj scan show.db /path/to/*.iso                  # metadata only
 
-# 2. scan disc images (metadata only — never the payload)
-vj scan show.db /path/to/*.iso
+# (optional) facts you know from the box: which episodes each disc holds
+vj hint disc show.db --disc SHOW_S1D1 --season 1 --episodes 1-4
 
-# 3. run heuristics; each records evidence, decides nothing
-vj run align show.db                      # metadata runtime alignment (all seasons)
-vj run ocr   show.db --disc 1             # OCR title cards (keeps the frame)
-vj run ocr   show.db --all                # …or every title on every disc (gate makes it fast)
-vj run ocr   show.db --title 205 --include-specials   # ID a leftover as an S00 special
+# 2. produce evidence — each run records findings, decides nothing
+vj run align show.db                            # runtime alignment, every season
+vj run streams show.db                          # flag episode-length extras by audio/sub layout
+vj run ocr show.db --disc SHOW_S1D1             # read on-screen title cards (keeps the frame)
+vj run ocr show.db --all                        # …or every candidate title
+vj run synopsis show.db --all                   # identify by dialogue (no-title-card shows)
 
-# 4. turn agreeing evidence into proposed assignments
+# 3. turn agreeing evidence into proposals
 vj resolve show.db
 
-# 5. review + adjudicate what's uncertain
-vj board  show.db                         # rich overview: every title + evidence, one screen
-vj status show.db                         # coverage summary
-vj orders show.db                         # which TMDB ordering (aired/DVD/…) the discs follow
-vj gaps   show.db                         # the worklist: conflicts + missing eps
-vj show   show.db --title 7               # all evidence for one title
-vj frame  show.db --title 7 --out /tmp/card.jpg   # eyeball the OCR frame
-vj play   show.db S01E03                  # watch the assigned title in VLC
-vj play   show.db --title 7 --at-card     # preview a candidate at its title card
-vj confirm show.db --title 7              # accept the proposal
-vj assign  show.db --title 9 --episode S02E05     # or set it yourself
-vj reject  show.db --title 12             # not an episode
-vj run align show.db                      # re-run: confirmed=anchor, rejected=excluded
-                                          #   (fixes a whole shifted run from one confirmation)
+# 4. review and adjudicate what's uncertain
+vj board   show.db                              # every disc's titles + all evidence, one screen
+vj status  show.db                              # coverage, order warnings, packaging checks
+vj gaps    show.db                              # the worklist, each item with a suggested action
+vj show    show.db --title 7                    # all evidence for one title (also --episode S01E03)
+vj frame   show.db --title 7 --out card.jpg     # eyeball the title card OCR read
+vj play    show.db S01E03                       # watch the title assigned to an episode
+vj assign  show.db --title 9 --episode S02E05   # decide it yourself (repeat --episode for a two-parter)
+vj confirm show.db --disc SHOW_S1D1 --playlist 4  # accept a proposal (titles by id or disc+number)
+vj reject  show.db --title 12                   # not an episode
+vj unassign show.db --title 12                  # undo a decision
 
-# 6. emit outputs from the adjudicated state
+# 5. outputs from the adjudicated state
 vj export show.db --manifest m.json --rip-script rip.sh --output-prefix /mnt/media
-
-# ...or run the HandBrake jobs directly, tagging outputs and skipping up-to-date ones
-vj transcode show.db --output-prefix /mnt/media --include-proposed
+vj transcode show.db --output-prefix /mnt/media  # or run the encodes directly (idempotent)
 ```
 
-Steps 3-4 can be run in one shot with **`vj auto show.db`**, which scripts
-`align → resolve → (OCR-escalate only order-unverifiable discs, when a VLM is up
-and the show captions titles) → resolve → elimination → resolve`. It only ever
-*proposes* — you still review `gaps` and confirm. Verifiable discs (DVD with
-disc hints, runtime-separable, play-all-corroborated) skip OCR entirely, so
-`auto` on a clean DVD boxset is near-instant.
+Steps 2–3 run in one shot with **`vj auto show.db`**:
+`align → resolve → (OCR only the discs whose order can't be verified, when a VLM
+is up and the show has title cards) → resolve → elimination → resolve`. It only
+ever *proposes*; you still review `gaps` and confirm. A clean DVD box set with
+disc hints never pays for OCR.
 
-`vj <verb> --help` documents each verb. Every verb emits JSON when stdout is not
-a TTY (or with `--json`) and human-readable text otherwise; errors are
-structured. `vj run --list` lists the available heuristics.
+Runs are incremental and transactional: re-running a heuristic **upserts** its
+finding (one row per title per heuristic), re-scanning a disc replaces that
+disc's rows, and human/agent decisions are sticky — nothing automatic overwrites
+a `confirmed`/`rejected` title or a human/agent assignment. **Re-run `resolve`
+after any evidence producer**: it proposes what newly agrees and *withdraws* a
+stale proposal that new evidence contradicts (it then shows up in `gaps`).
 
-Because the state file is SQLite, runs are incremental and transactional by
-construction — no manifest merge/lock dance. Re-running a heuristic **upserts**
-its finding (one row per title per category); re-scanning a disc replaces that
-disc's rows. Human/agent decisions are sticky: `resolve` never overwrites a
-`confirmed`/`rejected` title.
+Keep project databases, manifests and rip scripts outside the repo (this
+workspace uses `/run/media/ekovac/MediaScratc/video-juicer-artifacts/`).
 
-Project databases are artifacts, not repo content — keep them out of the repo
-(this workspace uses `/run/media/ekovac/MediaScratc/video-juicer-artifacts/`).
+## The evidence model
 
-## The evidence model in one paragraph
+Three layers (`DESIGN.md` has the schema):
 
-Three layers (see `DESIGN.md` for the schema): **facts** (`disc`/`title`/
-`episode`) written at ingest; **evidence** — one upserted row per (title,
-category), where categories are the sources `runtime-align`, `title-card-ocr`,
-`synopsis`, `elimination`; and **assignment** — the thin adjudicated answer, one
-per title, `unresolved`/`proposed`/`confirmed`/`rejected`. *Conflict* is not
-stored — `gaps` computes it on the fly (two categories naming different
-episodes). OCR keeps the actual frame it read (as a BLOB) so a reviewer — or a
-stronger VLM on demand — can judge whether it's a real title card.
+- **Facts** — `disc`/`title`/`episode`, written at `scan`/`init`.
+- **Evidence** — one row per (title, heuristic), replaced when that heuristic
+  re-runs: `runtime-align`, `stream-signature`, `title-card-ocr`, `synopsis`,
+  `elimination`. A row may say "not an episode" or "no card readable".
+- **Assignment** — the thin decided answer per title:
+  `proposed` (by `resolve`), `confirmed`, or `rejected`, with who decided
+  (`heuristic:<name>`, `human`, `agent`).
 
-## Outputs
+*Conflict* is never stored — `gaps` computes it (two heuristics naming different
+episodes). OCR keeps the frame it read, and synopsis keeps the transcript, so a
+reviewer can check the evidence itself.
 
-`vj export` regenerates, from the confirmed assignments (add `--include-proposed`
-to include proposals):
+## The heuristics
 
-- a **manifest** (`--manifest`): one record per title — episode mapping, runtime
-  delta, provenance (`identified_by`: `human`/`agent`/`heuristic:<category>`),
-  video/audio format, and a suggested Plex/Jellyfin path.
-- a runnable **HandBrake rip script** (`--rip-script`): a `bash` file with the
-  common knobs hoisted into shell variables (`PREFIX`, `PRESET`,
-  `HANDBRAKE_OPTS`), one `HandBrakeCLI` call per episode, with format-outlier
-  episodes split into a `$PRESET_ALT` block.
+| `vj run …` | Evidence | Needs | Use when |
+|---|---|---|---|
+| `align` | disc order × runtimes → episodes (DP; calibrates TMDB's broadcast-slot runtimes) | nothing | always, first. Scan the whole season/series before running it |
+| `streams` | titles whose audio/subtitle layout is poorer than the disc's episodes (likely extras) | HandBrake scan (Blu-ray) | episode-length extras confuse alignment |
+| `ocr` | the on-screen title card, matched to the season's episode names | ffmpeg, mencoder, Tesseract, Ollama VLM | the show has title cards; order is unverified (Blu-ray) |
+| `synopsis` | dialogue judged against episode plot summaries | subtitles or whisper; a judge model | no title cards, order unverified |
+| `elimination` | a disc's lone unmatched title → its one missing adjacent episode | run after `resolve` | a premiere/finale without a card |
 
-Or skip the script and let the tool run the jobs itself:
+`align` honours decisions: a `confirmed` title is a hard anchor (confirm one
+title of a shifted run and re-align to shift the whole run) and a `rejected`
+title is excluded. `vj hint disc` adds the box's episode list as a soft
+constraint.
 
-- **`vj transcode`** runs `HandBrakeCLI` for each episode directly, writes
-  Matroska tags into every output (episode name, show, season/episode, TMDB id,
-  plus `VJ_*` provenance), and is **idempotent**: each output carries a
-  `VJ_RECIPE` tag hashing exactly the encode inputs (source disc + title index +
-  preset + opts), so a re-run **re-encodes only what changed** in the project and
-  skips the rest. A metadata-only change (episode renamed) is a cheap rename +
-  re-tag, never a re-encode. `--dry-run` shows the encode/rename/retag/skip plan;
-  `--force` re-encodes regardless; `--handbrake-preset-alt` gives format-outliers
-  a different preset. Needs **mkvtoolnix** (`mkvpropedit`/`mkvextract`) for the
-  tags, and assumes `.mkv` outputs.
+### Title-card OCR
 
-The manifest **`title` field is the number to pass to your ripper**
-(`HandBrakeCLI -t N`). For DVD it's the lsdvd/HandBrake title number directly.
-For **Blu-ray** the tool reports HandBrake's title index from a per-disc scan —
-**not** the raw `.mpls` id and **not** a player's title number, which differ
-(see `CLAUDE.md`). `--output-prefix DIR` sets the script's `PREFIX`; the whole
-Plex/Jellyfin tree is built under it.
+Tesseract reads plain cards first (tens of ms/frame); a vision model (Ollama,
+default `qwen3-vl:2B`) is the fallback for stylized cards. A text-region detector
+(PaddleOCR detection via RapidOCR) keeps text-less scene frames away from the
+VLM (~92% pruned at 100% recall on real cards); if a show paints its title into
+the scene art, pass `--no-text-filter`. `--include-specials` lets a leftover
+title match an S00 special.
+
+### Synopsis identification
+
+For shows without title cards. Dialogue comes from, in order: DVD closed
+captions (exact text, seconds), OCR of the bitmap subtitle track (Blu-ray PGS /
+DVD VOBSUB; minutes per episode), then whisper audio. Transcripts — with caption
+timings when they came from subtitles — are cached in the project, so swapping
+the judge costs only the judge calls (`--transcribe-only` extracts without
+judging; `--retranscribe` forces a fresh pass).
+
+The judge compares each title's dialogue with every episode's plot summary in
+its season, then a one-episode-per-title assignment (Hungarian) settles the
+season. Plot summaries: TMDB's, or — much better — Wikipedia's, from a local
+dump:
+
+```bash
+vj enrich wikipedia show.db --snapshot enwiki-…-multistream.xml.bz2 \
+    --index enwiki-…-multistream-index.txt.bz2 --page "List of <Show> episodes"
+```
+
+Summaries are matched to episodes by title (Wikipedia's numbering can differ).
+
+`--judge-model` picks the judge: an Ollama model (default
+`qwen2.5:14b-instruct`), a `claude-*` model via `ANTHROPIC_API_KEY`, or
+TypeSafe's Jev (`jev-latest`) via `TYPESAFE_API_KEY`. Measured on two full series
+(`bench_synopsis.py`, below):
+
+| Judge | The Expanse (60, serialized) | Venture Bros (81, episodic) | Cost for both |
+|---|---|---|---|
+| Opus 5.5 | 60/60 | 80/81 | ~$8 |
+| Jev (chunked) | 57/60 | 81/81 | ~$0.10 |
+| Sonnet 5 | 46/60 | 78/81 | ~$4.40 |
+| Haiku 4.5 | 23/60 | 78/81 | ~$1.45 |
+
+### Benchmarking judges
+
+`bench_synopsis.py <db>` replays a project's cached transcripts through any set
+of judges and scores them against the project's assignments: accuracy (wrong
+counted separately from abstaining), false claims on non-episode titles, latency
+and cost. Results are cached per judge, so runs resume and `--report-only`
+re-scores for free. If every judge "misses" the same titles, audit the reference
+project before believing the scores — that's how 12 bad Venture Bros assignments
+were found.
 
 ## Episode ordering
 
-`vj init --episode-order dvd` matches against a TMDB *episode group* instead of
-the default aired order — essential for shows whose discs reorder episodes or
-fold specials into seasons. Accepts an alias (`dvd`, `digital`, `absolute`,
-`production`, `story`, `tv`) or an explicit TMDB episode-group id; records then
-carry the aired numbering as an `aired` cross-reference. Every output states its numbering
-(manifest `episode_order`, rip-script header, `VJ_ORDER` tag), and `vj status`
-warns when the discs follow a different TMDB ordering than the project — set
-your media server's per-show episode ordering to match. The TMDB type enum:
-**DVD order is type 3** (verified on live data), digital is 4, production is 6.
+"S01E03" means different episodes in different orderings — Venture Bros' DVDs
+follow TMDB's *DVD Order*, which reshuffles seasons 1–3 against aired order. So:
+
+- **Choose at `init`.** `--episode-order` takes `aired` (default), an alias
+  (`dvd`, `digital`, `absolute`, `production`, `story`, `tv`) or a TMDB
+  episode-group id. `init` lists the show's other orderings.
+- **Detection.** `vj status`/`gaps` warn when a season's discs, in play order,
+  follow a different TMDB ordering than the project (judged from title cards,
+  synopsis and confirmed decisions — never from alignment's position guesses),
+  and say which `--episode-order` would match. `vj orders show.db` shows the
+  per-season fit and fetches TMDB's orderings for projects created before this.
+- **Stamping.** Every output states its numbering: manifest `episode_order` (plus
+  `aired` cross-references for a non-aired project), the rip script's header, and
+  a `VJ_ORDER` Matroska tag. Media servers match files by SxxEyy — set the show's
+  episode ordering in Plex/Jellyfin to the same one.
+
+## Outputs
+
+`vj export` writes, from the confirmed assignments (`--include-proposed` adds
+proposals — run `gaps` first):
+
+- a **manifest** (`--manifest`): one record per episode title — mapping, runtime
+  delta, provenance (`identified_by`), numbering (`episode_order`), video/audio
+  format, and a Plex/Jellyfin path
+  (`Show (Year) {tmdb-ID}/Season NN/Show (Year) - SxxEyy - Name.mkv`);
+- a runnable **HandBrake script** (`--rip-script`) with the knobs hoisted into
+  variables (`PREFIX`, `PRESET`, `HANDBRAKE_OPTS`); episodes whose video format
+  differs from the rest (Avatar's 480i finale in a 1080p set) rip with
+  `$PRESET_ALT`.
+
+**`vj transcode`** runs the encodes itself and writes Matroska tags (show,
+season/episode, name, TMDB id, `VJ_*` provenance). It is idempotent: a
+`VJ_RECIPE` tag hashes exactly the encode inputs, so a re-run re-encodes only
+what changed, renames/re-tags on a metadata-only change, and skips the rest.
+Encodes go to a `.part` file and move into place when complete. `--dry-run`
+shows the plan; `--force` re-encodes everything.
+
+The manifest's **`title` is the number to pass to `HandBrakeCLI -t`**. On DVD
+it's the lsdvd title; on **Blu-ray** it's HandBrake's own title index — not the
+`.mpls` id and not a player's title number, which all differ (one Enterprise
+episode was `.mpls` 1 = HandBrake 2 = VLC 19).
 
 ## Requirements
 
-- `lsdvd`, `7z` — disc scanning (`init` also needs network for TMDB, cached to
+- **Always:** Python 3, `lsdvd`, `7z`, and `TMDB_API_KEY` (responses cached in
   `.tmdb_cache/`).
-- `ffmpeg`, `mencoder`, and a running **Ollama** with a vision model
-  (default `qwen3-vl:2B`) — for `vj run ocr`.
-- `HandBrakeCLI` — the Blu-ray title-number scan at export time, and the encodes
-  when using `vj transcode`.
-- `mkvtoolnix` (`mkvpropedit`, `mkvextract`) — only for `vj transcode` (writes and
-  reads the Matroska output tags). Not needed for `vj export`.
-- **Text-region detector** (recommended) — `vj run ocr` gates the slow VLM pass
-  with an OCR-free detector so it only reads frames that plausibly bear a title.
-  The detector is **PaddleOCR PP-OCRv3 detection via RapidOCR**
-  (`pip install rapidocr-onnxruntime`, Apache-2.0, model bundled) — ~92% of scene
-  frames pruned at 100% recall on real cards. Not installed → the gate fails open
-  (no speedup, no risk). It's *recall-first*, but a show whose title is painted
-  into the scene art (Adventure Time) can defeat any text detector — use
-  `vj run ocr --no-text-filter` there.
+- **Blu-ray / export:** `HandBrakeCLI` — the per-disc scan supplies stream counts
+  and the rip title numbers, and runs the encodes for `vj transcode`.
+- **OCR:** `ffmpeg`, `mencoder`, `pytesseract` + Tesseract, Ollama with a vision
+  model; recommended `rapidocr-onnxruntime` for the text-region gate (missing →
+  the gate is skipped, no risk).
+- **Synopsis:** `ffmpeg`, `mplayer`/`mencoder` (DVD), `rapidocr-onnxruntime`
+  (subtitle OCR), `faster-whisper` (audio fallback), `scipy` (the assignment),
+  and a judge (Ollama, or `ANTHROPIC_API_KEY` / `TYPESAFE_API_KEY`). A Wikipedia
+  multistream dump for `vj enrich` is optional but strongly recommended.
+- **Transcode:** `mkvtoolnix` (`mkvpropedit`, `mkvextract`) for the tags.
 
 ## Tests
 
 ```bash
-python3 -m unittest test_identify_episodes test_vj -v
+python3 -m unittest test_identify_episodes test_vj
 ```
 
-`test_identify_episodes` covers the heuristic library (play-all detector, DP
-aligner, MPLS parser, OCR fuzzy-matching) on synthetic tables and a checked-in
-sample playlist. `test_vj` covers the state/compute/review/export layers. Neither
-needs disc images or network.
+`test_identify_episodes` covers the heuristic library (play-all detection, the
+aligner, MPLS parsing, OCR matching) on synthetic data and a checked-in sample
+playlist; `test_vj` covers the state/compute/review/export/transcode layers.
+Neither needs disc images or network.
 
-## Hard-won implementation notes
+## See also
 
-These describe the heuristic library, which is unchanged by the Picard rewrite —
-only how it's invoked changed (verbs, not one pipeline).
-
-- **TMDB runtimes are often broadcast-slot lengths** (30 min with ads) while
-  discs carry the actual ~22 min episode. A per-season median ratio between disc
-  and TMDB durations calibrates this; matching accepts whichever of raw/scaled
-  runtime fits. Without it, four of seven Venture Bros. seasons fail entirely.
-- **Thinking VLMs (qwen3-vl) need token headroom**: a tight `num_predict` gets
-  exhausted by the reasoning phase and `content` comes back empty with
-  `done_reason: length`. `VLM_NUM_PREDICT=8192` (a cap, not a target). On
-  truncation the code returns `""` — it does **not** fall back to the partial
-  `thinking` text, which is chain-of-thought, not a transcription, and
-  fuzzy-matches confident-wrong titles.
-- **Title cards may be at the end** of the episode (all Venture Bros. seasons),
-  sometimes as an `EPISODE: <name>` line inside the credits. Scan both ends, and
-  let the end window run to the last frame.
-- **Sample frames at ≤2 s.** A title card is on screen only ~2-4 s, so a coarse
-  stride (4-8 s) phase-skips it — producing confident "no title found" misses
-  that look like the show has no titles. `extract_frames` defaults to 1.5 s.
-- **Title-card position varies by show; scan a primary band, widen on miss.**
-  Venture Bros. cards are at the end; Star Trek: Enterprise captions the title
-  after a variable-length cold open (140-274 s normally; 306-374 s on
-  recap-delayed premieres). `verify_title` runs a cheap primary pass (front
-  0-280 s + the tail) and only widens the front to 720 s on a NO-CARD result,
-  learning a per-disc anchor so only the first episode pays full cost.
-- **The closed candidate set makes noisy OCR workable.** We match a transcription
-  against the season's episode names — we don't need a perfect read. Tesseract
-  reads plain block cards instantly and returns `""` on scene frames; the VLM
-  fallback covers stylized script cards Tesseract can't. Larger models can
-  "helpfully" translate non-English titles (`qwen2.5vl` rendered "Día de los
-  Dangerous" as "Day of the Dangerous"), so the prompt demands verbatim
-  transcription and the matcher tolerates diacritics/case.
-- **Match part numbers flexibly.** TMDB writes "Storm Front (1)" but the card may
-  read "PART ONE"/"PART I"/"PART 1"; `canon_parts` collapses them to the digit
-  so the part still aligns *and* still discriminates part 1 from part 2.
-- **Ollama has a memory leak** and may be OOM-killed mid-request; VLM calls retry
-  with backoff and a generous timeout to ride out the daemon restart + model
-  reload. Point OCR scratch at a real disk, not tmpfs.
-- **Blu-ray "title number" is not universal across tools.** Three schemes coexist:
-  the raw `.mpls` playlist id (`ffmpeg -playlist`), HandBrake's filtered-playlist
-  title index (what you rip with), and a player's HDMV title-object list from
-  `index.bdmv` (VLC). On one Enterprise disc an episode was `.mpls` 1 = HandBrake
-  title 2 = VLC title 19. The tool identifies by `.mpls` but **emits HandBrake's
-  number**.
+- `DESIGN.md` — architecture, schema, verb contracts, decisions.
+- `CLAUDE.md` — every heuristic's rationale, measured results, and failure modes.
+- `BDJ_NOTES.md` — parked experiments with Blu-ray Java navigation (discs whose
+  episode order exists only in BD-J code).

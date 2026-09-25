@@ -38,7 +38,8 @@ HEURISTICS = {
     "streams": "flag episode-length titles whose audio/subtitle layout is "
                "unlike their disc's episodes (likely extras)",
     "ocr": "OCR each title's title card; keeps the winning frame",
-    "synopsis": "judge sampled dialogue against TMDB synopses",
+    "synopsis": "identify titles by content: whole-episode dialogue (subtitles, "
+                "else whisper) judged against episode synopses, one episode per title",
     "elimination": "pin a disc's lone unmatched candidate to its one missing "
                    "adjacent episode (run after resolve)",
 }
