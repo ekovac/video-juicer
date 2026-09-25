@@ -424,6 +424,30 @@ Three sources of canonical episode ORDER, cheapest first:
 - Alt ordering via episode groups: `--episode-order dvd`. **DVD order is TMDB
   type 3** (digital=4, production=6) — verified on live data; a prior session
   wrongly believed DVD was type 4.
+- **An episode number is meaningless without its ORDERING — keep them together.**
+  Venture Bros' DVDs are in TMDB "DVD Order" (S1 swaps 7 episodes vs aired; S2
+  E03↔E07; S3 E03↔E04) while the project was `aired`: runtime-align mapped disc
+  position N to aired episode N and 12 titles got the wrong episode, while a
+  separate rip was numbered by disc order — "S01E03" named different episodes in
+  the DB and the files. Two defenses:
+  1. **Detection** (`review.order_check`, shown in `vj status`/`gaps`, and `vj
+     orders`): per season, walk titles in disc order (DVDs, and Blu-rays WITH a
+     play-all — bare .mpls order isn't broadcast order), take each title's
+     CONTENT identity (accepted title-card read > synopsis > confirmed
+     assignment; never runtime-align, which is the position guess under test),
+     skip specials and unassigned extras, and score each ordering by the share
+     of consecutive titles that don't go backwards. Project ordering ≤0.9 while a
+     TMDB group fits ≥0.85 and beats it by ≥0.05 → "discs follow TMDB '<group>'…
+     re-init with --episode-order <alias>". Thresholds tolerate one misread (VB
+     S3: a wrong "ORB" read → 0.91). On VB it flags exactly S1-S3 and passes
+     S4-S7 (where DVD = aired). TMDB's groups are cached in
+     `episode_order_map` (keyed by AIRED numbers) by `vj init`, or `vj orders`
+     for an older project.
+  2. **Stamping**: every manifest record carries `episode_order` (+ `aired`
+     cross-refs for a non-aired project), the rip script's header states the
+     numbering, and `vj transcode` writes `VJ_ORDER` (in the META hash, so older
+     outputs get it via a cheap retag, never a re-encode). A media server matches
+     by SxxEyy — its per-show episode ordering must match this.
 - A 2-part pilot/finale may be one TMDB entry (Enterprise "Broken Bow" = S01E01,
   86 min, with no E02 — numbering jumps E01→E03).
 

@@ -1269,5 +1269,40 @@ class OrderCheckTests(Base):
         self.assertEqual(state.order_label(self.conn), "TMDB 'DVD Order'")
 
 
+class OrderStampTests(Base):
+    """The numbering travels with every output: manifest, rip script, tags."""
+
+    def test_manifest_rip_script_and_tags_carry_the_ordering(self):
+        import identify
+        import transcode
+        state.upsert_episodes(self.conn, [
+            Episode(1, 3, "Mid-Life Chrysalis", 1320.0, aired_season=1,
+                    aired_number=8)])
+        state.set_project(self.conn, episode_order="dvd")
+        did = self.add_disc([title(4, 1320, [1320])])
+        tid = state.title_id(self.conn, did, 4)
+        state.set_assignment(self.conn, tid, [state.episode_id(self.conn, 1, 3)],
+                             status="confirmed", decided_by="human")
+        [rec] = export_mod.build_records(self.conn)
+        self.assertEqual(rec["episode_order"], "TMDB episode group 'dvd'")
+        self.assertEqual(rec["episode_order_id"], "dvd")
+        self.assertEqual(rec["aired"], ["S01E08"])        # cross-reference
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            identify.emit_rip_commands([rec], "Fast 1080p30")
+        self.assertIn("# Episode numbering: TMDB episode group 'dvd'", buf.getvalue())
+        meta = transcode.meta_fields(rec, "Show", 2004, 2418)
+        self.assertEqual(meta["VJ_ORDER"], "TMDB episode group 'dvd'")
+
+    def test_aired_project_has_no_aired_cross_reference(self):
+        state.upsert_episodes(self.conn, [ep(1, 1, "Pilot", 1320.0)])
+        did = self.add_disc([title(1, 1320, [1320])])
+        state.set_assignment(self.conn, state.title_id(self.conn, did, 1),
+                             [state.episode_id(self.conn, 1, 1)], status="confirmed", decided_by="human")
+        [rec] = export_mod.build_records(self.conn)
+        self.assertEqual(rec["episode_order"], "TMDB aired order")
+        self.assertNotIn("aired", rec)
+
+
 if __name__ == "__main__":
     unittest.main()

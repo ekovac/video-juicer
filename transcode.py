@@ -61,10 +61,16 @@ def encode_recipe(record: dict, preset: str, opts: list[str]) -> dict:
 def meta_fields(record: dict, show: str, year: Optional[int],
                 tmdb_id: Optional[int]) -> dict:
     """Descriptive metadata. A change here => rename/re-tag, never a re-encode."""
-    return {"SHOW": show, "YEAR": str(year or ""), "TMDB": str(tmdb_id or ""),
+    meta = {"SHOW": show, "YEAR": str(year or ""), "TMDB": str(tmdb_id or ""),
             "SEASON": str(record["season"]),
             "EPISODES": _episode_tag_for(record),
             "TITLE": record["episode_name"]}
+    # Which numbering SEASON/EPISODES are in (TMDB aired vs DVD order name
+    # different episodes). Part of the META hash on purpose: outputs made before
+    # this tag existed pick it up on the next run via the cheap retag path.
+    if record.get("episode_order"):
+        meta["VJ_ORDER"] = record["episode_order"]
+    return meta
 
 
 def _episode_tag_for(record: dict) -> str:

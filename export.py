@@ -28,6 +28,12 @@ def build_records(conn, include_proposed: bool = False) -> list[dict]:
     year = int(proj["year"]) if proj.get("year") not in (None, "None") else None
     tmdb_id = int(proj["tmdb_id"]) if proj.get("tmdb_id") else None
 
+    # Every record says which numbering its SxxEyy are in: "S01E03" names a
+    # different episode in TMDB aired vs DVD order (Venture Bros), and a media
+    # server matches files by number — so the ordering must travel with it.
+    order_id = proj.get("episode_order") or "aired"
+    order_label = state.order_label(conn)
+
     wanted = ("confirmed", "proposed") if include_proposed else ("confirmed",)
     disc_cache: dict[int, object] = {}
     records = []
@@ -48,6 +54,9 @@ def build_records(conn, include_proposed: bool = False) -> list[dict]:
         # was this title's identity confirmed by a title card?
         oc = state.get_frame(conn, a["title_id"], "title-card-ocr")
         e0 = eps[0]
+        aired = [r for r in (conn.execute(
+            "SELECT aired_season, aired_number FROM episode WHERE id=?",
+            (e,)).fetchone() for e in eids) if r["aired_season"] is not None]
         records.append({
             "image": str(disc.path),
             "title": rip_title_number(disc, title),
@@ -55,6 +64,12 @@ def build_records(conn, include_proposed: bool = False) -> list[dict]:
             "season": e0.season,
             "episodes": [e.number for e in eps],
             "episode_name": " & ".join(e.name for e in eps),
+            "episode_order": order_label,
+            "episode_order_id": order_id,
+            # the same episodes in TMDB aired numbering, when the project isn't
+            # aired (a cross-reference for libraries set to aired order)
+            **({"aired": [f"S{r['aired_season']:02d}E{r['aired_number']:02d}"
+                          for r in aired]} if order_id != "aired" and aired else {}),
             "title_seconds": round(title.duration, 1),
             "tmdb_seconds": sum(e.runtime or 0 for e in eps),
             "confidence": a["status"],

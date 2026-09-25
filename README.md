@@ -33,6 +33,7 @@ vj resolve show.db
 # 5. review + adjudicate what's uncertain
 vj board  show.db                         # rich overview: every title + evidence, one screen
 vj status show.db                         # coverage summary
+vj orders show.db                         # which TMDB ordering (aired/DVD/…) the discs follow
 vj gaps   show.db                         # the worklist: conflicts + missing eps
 vj show   show.db --title 7               # all evidence for one title
 vj frame  show.db --title 7 --out /tmp/card.jpg   # eyeball the OCR frame
@@ -121,7 +122,10 @@ Plex/Jellyfin tree is built under it.
 the default aired order — essential for shows whose discs reorder episodes or
 fold specials into seasons. Accepts an alias (`dvd`, `digital`, `absolute`,
 `production`, `story`, `tv`) or an explicit TMDB episode-group id; records then
-carry the aired numbering as an `aired` cross-reference. The TMDB type enum:
+carry the aired numbering as an `aired` cross-reference. Every output states its numbering
+(manifest `episode_order`, rip-script header, `VJ_ORDER` tag), and `vj status`
+warns when the discs follow a different TMDB ordering than the project — set
+your media server's per-show episode ordering to match. The TMDB type enum:
 **DVD order is type 3** (verified on live data), digital is 4, production is 6.
 
 ## Requirements

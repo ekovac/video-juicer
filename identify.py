@@ -1169,6 +1169,12 @@ def emit_rip_commands(records: list[dict], preset: str,
 
     print("#!/usr/bin/env bash")
     print("set -euo pipefail")
+    orders = sorted({r["episode_order"] for r in eps if r.get("episode_order")})
+    if orders:
+        print(f"# Episode numbering: {' / '.join(orders)}. Set your media "
+              "server's episode")
+        print("# ordering for this show to match, or SxxEyy will map to the "
+              "wrong episodes.")
     print()
     print(f"PREFIX={shlex.quote(str(output_prefix) if output_prefix else '.')}")
     print(f"PRESET={shlex.quote(preset)}")
