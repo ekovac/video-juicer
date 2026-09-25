@@ -416,8 +416,16 @@ def gaps(conn, threshold: float = 0.5, accept: float = 0.8) -> dict:
                               f"duplicate of {f['episode']} "
                               f"(title {primary[f['episode_id']]} kept)"}
             else:
-                suggestion = {"action": "assign", "episode": f["episode"], "why":
-                              "title-card OCR, duration corroborates"}
+                why = "title-card OCR, duration corroborates"
+                cur = json.loads(a["episode_ids_json"]) if a else []
+                if cur and f["episode_id"] not in cur:
+                    r = conn.execute("SELECT season,number FROM episode WHERE id=?",
+                                     (cur[0],)).fetchone()
+                    why += (f" — REPLACES the current {status} "
+                            f"{_sxxeyy(r['season'], r['number'])} "
+                            f"({a['decided_by']})")
+                suggestion = {"action": "assign", "episode": f["episode"],
+                              "why": why}
         elif conflict:
             suggestion = {"action": "review",
                           "why": "sources disagree, no corroborated OCR read"}
@@ -600,10 +608,16 @@ def resolve(conn, threshold: float = 0.5) -> dict:
     Policy: among a title's evidence rows that name an episode at confidence
     >= threshold, if they all name the SAME episode, propose it (decided_by
     consensus, or the single source). If they disagree it's a conflict — leave
-    it unresolved for `gaps` to surface. Sticky human/agent/confirmed/rejected
-    assignments are never touched."""
+    it unresolved for `gaps` to surface, WITHDRAWING any earlier heuristic
+    proposal: evidence arrives over time (align, then OCR a day later), and a
+    proposal made before the conflicting read existed would otherwise keep
+    claiming the wrong episode for everything that trusts proposals (export
+    --include-proposed, transcode, the order checks). Venture Bros kept 12 such
+    stale runtime-align proposals over 1.0 title-card reads. Sticky
+    human/agent/confirmed/rejected assignments are never touched."""
     proposed = 0
     skipped_conflict = 0
+    withdrawn = []
     for t in conn.execute("SELECT id FROM title ORDER BY id"):
         tid = t["id"]
         a = state.get_assignment(conn, tid)
@@ -618,6 +632,9 @@ def resolve(conn, threshold: float = 0.5) -> dict:
         eps = {e["episode_id"] for e in rows}
         if len(eps) > 1:
             skipped_conflict += 1
+            if a and a["status"] == "proposed":
+                state.delete_assignment(conn, tid)
+                withdrawn.append(tid)
             continue
         best = max(rows, key=lambda e: e["confidence"] or 0)
         episode_ids = [best["episode_id"]]
@@ -634,4 +651,5 @@ def resolve(conn, threshold: float = 0.5) -> dict:
         state.set_assignment(conn, tid, episode_ids, status="proposed",
                              decided_by=decided)
         proposed += 1
-    return {"ok": True, "proposed": proposed, "conflicts": skipped_conflict}
+    return {"ok": True, "proposed": proposed, "conflicts": skipped_conflict,
+            "withdrawn": withdrawn}

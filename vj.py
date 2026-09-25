@@ -659,7 +659,9 @@ def cmd_resolve(args) -> int:
     r = review.resolve(conn, args.threshold)
     conn.close()
     emit(args, r, human=f"proposed {r['proposed']} assignment(s); "
-                        f"{r['conflicts']} left as conflicts")
+                        f"{r['conflicts']} left as conflicts"
+                        + (f" ({len(r['withdrawn'])} stale proposal(s) withdrawn "
+                           "— see `vj gaps`)" if r["withdrawn"] else ""))
     return 0
 
 

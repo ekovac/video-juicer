@@ -827,6 +827,21 @@ LLM judge matches it against each candidate's plot synopsis.
   and leaving holes. No hand-bumping every downstream episode. (`GAP_INTERIOR`
   is tiny — it only breaks ties among within-tolerance matches; a real
   mid-season missing episode is still gapped.)
+- **`resolve` withdraws a stale proposal when new evidence conflicts.** Evidence
+  arrives over time (align, then OCR a day later). `resolve` used to skip a
+  conflicted title but LEAVE its earlier heuristic proposal, so the proposal kept
+  claiming the wrong episode for everything that trusts proposals (`export
+  --include-proposed`, `transcode`, the order check, a benchmark "golden" set).
+  Venture Bros kept 12 runtime-align proposals over 1.0 title-card reads. Now a
+  conflict deletes a `proposed` heuristic assignment (never human/agent/confirmed/
+  rejected) and reports it in `withdrawn`; `gaps`' assign suggestion says which
+  proposal it REPLACES. Replayed on the pre-fix VB DB: 11 withdrawn — 9 of the
+  12 real errors, plus 2 genuine OCR-vs-align disagreements (a Cremation Creek
+  part-2 card reading "Part I", a garbled read) that deserve a look anyway. The
+  other 3 errors had only BELOW-accept OCR (no episode stored), so no stored
+  evidence contradicted them — `run synopsis` evidence would. Rule: re-run
+  `resolve` after any evidence producer, and never trust `--include-proposed`
+  output without a `gaps` pass.
 - **Box-packaging hints: `vj hint disc` feeds a SOFT constraint into `align`.**
   Box sets print an episode→disc mapping; `vj hint disc <db> --disc <name>
   --season N --episodes 1-4` (and/or `--titles "A" "B"`, resolved to numbers via

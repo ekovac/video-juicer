@@ -411,9 +411,12 @@ class AlignAnchorComputeTests(Base):
 
 
 class ResolveTests(Base):
-    def _one_title(self):
+    def _one_title(self, kind=""):
         state.upsert_episodes(self.conn, [ep(1, 1, "A", 1320.0), ep(1, 2, "B", 1320.0)])
-        did = self.add_disc([title(1, 1320, [660, 660])])
+        t = title(1, 1320, [660, 660])
+        if kind:
+            t.kind = kind
+        did = self.add_disc([t])
         return state.title_id(self.conn, did, 1)
 
     def test_agreement_proposes_consensus(self):
@@ -452,6 +455,45 @@ class ResolveTests(Base):
         self.assertEqual(a["decided_by"], "human")
         import json
         self.assertEqual(json.loads(a["episode_ids_json"]), [e2])
+
+    def test_later_conflicting_evidence_withdraws_the_stale_proposal(self):
+        # the Venture Bros sequence: align + resolve propose by POSITION, then
+        # OCR reads a different episode's card a day later
+        tid = self._one_title("episode-candidate")
+        e1 = state.episode_id(self.conn, 1, 1)
+        e2 = state.episode_id(self.conn, 1, 2)
+        state.put_evidence(self.conn, tid, "runtime-align", episode_id=e1, confidence=0.9)
+        review.resolve(self.conn)
+        self.assertEqual(state.get_assignment(self.conn, tid)["status"], "proposed")
+        state.put_evidence(self.conn, tid, "title-card-ocr", episode_id=e2, confidence=1.0)
+        r = review.resolve(self.conn)
+        self.assertEqual(r["withdrawn"], [tid])
+        self.assertIsNone(state.get_assignment(self.conn, tid))   # no stale claim
+        hit = [x for x in review.gaps(self.conn)["gaps"] if x["title_id"] == tid][0]
+        self.assertEqual(hit["suggestion"]["action"], "assign")
+        self.assertEqual(hit["suggestion"]["episode"], "S01E02")
+
+    def test_agent_decision_survives_a_conflict(self):
+        tid = self._one_title()
+        e1 = state.episode_id(self.conn, 1, 1)
+        e2 = state.episode_id(self.conn, 1, 2)
+        state.set_assignment(self.conn, tid, [e2], status="proposed",
+                             decided_by="agent")
+        state.put_evidence(self.conn, tid, "runtime-align", episode_id=e1, confidence=0.9)
+        state.put_evidence(self.conn, tid, "title-card-ocr", episode_id=e2, confidence=1.0)
+        r = review.resolve(self.conn)
+        self.assertEqual(r["withdrawn"], [])
+        self.assertEqual(state.get_assignment(self.conn, tid)["decided_by"], "agent")
+
+    def test_gaps_says_which_proposal_an_assign_replaces(self):
+        tid = self._one_title("episode-candidate")
+        e1 = state.episode_id(self.conn, 1, 1)
+        e2 = state.episode_id(self.conn, 1, 2)
+        state.set_assignment(self.conn, tid, [e1], status="proposed",
+                             decided_by="heuristic:runtime-align")
+        state.put_evidence(self.conn, tid, "title-card-ocr", episode_id=e2, confidence=1.0)
+        hit = [x for x in review.gaps(self.conn)["gaps"] if x["title_id"] == tid][0]
+        self.assertIn("REPLACES the current proposed S01E01", hit["suggestion"]["why"])
 
 
 class ExportTests(Base):
