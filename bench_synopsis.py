@@ -15,7 +15,8 @@ are treated as golden. Measures what the judge choice actually changes:
   * wall-clock — per-call latency (serial Σ, median, p95)
   * cost — from each response's reported token usage × the price table
 
-Judges: any `claude-*` model id and any Ollama model (e.g. `qwen2.5:14b-instruct`)
+Judges: `kev` (the local open-weight Kev server; see synopsis.KEV_URL), any
+`claude-*` model id, and any Ollama model (e.g. `qwen2.5:14b-instruct`)
 — both with the production stage-1 prompt and settings, unchanged — and `jev` /
 `jev-chunked` (TypeSafe's Jev answering a typed Choice; see synopsis.jev_rank).
 Local Ollama judges cost $0 in the report (electricity/GPU not counted) and run
@@ -197,7 +198,23 @@ def judge_ollama(case: Case, model: str, host: str) -> dict:
 
 
 def _is_local(judge: str) -> bool:
+    """Runs on this machine (Ollama or Kev): $0, and calls go one at a time."""
     return not (judge.startswith("claude") or judge.startswith("jev"))
+
+
+def judge_kev(case: Case, show: str) -> dict:
+    """The local Kev server: Jev's question, always chunked, with Kev's
+    abstain rule (synopsis.KEV_NONE_WINS)."""
+    t0 = time.monotonic()
+    ranked, evidence, meta = synopsis.jev_rank(
+        case.transcript, case.pool, "kev", show, synopsis.JEV_CHUNK_CHARS,
+        none_wins=synopsis.KEV_NONE_WINS)
+    return {"ranked": [[label(e), round(p, 4)] for e, p in ranked],
+            "evidence": evidence, "latency_s": time.monotonic() - t0,
+            "requests": meta["requests"], "retries": 0,
+            "input_tokens": meta["input_tokens"],
+            "output_tokens": meta["output_tokens"],
+            "stop_reason": None, "model": meta["model"]}
 
 
 def judge_jev(case: Case, chunked: bool, model: str, show: str) -> dict:
@@ -216,6 +233,8 @@ def judge_jev(case: Case, chunked: bool, model: str, show: str) -> dict:
 def run_judge(judge: str, case: Case, args, show: str) -> dict:
     if judge.startswith("jev"):
         return judge_jev(case, judge.endswith("-chunked"), args.jev_model, show)
+    if judge.startswith("kev"):
+        return judge_kev(case, show)
     if judge.startswith("claude"):
         effort = None if "haiku" in judge else args.effort   # Haiku 4.5: no effort
         return judge_claude(case, judge, args.max_tokens, effort)

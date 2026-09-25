@@ -132,22 +132,49 @@ vj enrich wikipedia show.db --snapshot enwiki-…-multistream.xml.bz2 \
 
 Summaries are matched to episodes by title (Wikipedia's numbering can differ).
 
-`--judge-model` picks the judge: an Ollama model (default
-`qwen2.5:14b-instruct`), a `claude-*` model via `ANTHROPIC_API_KEY`, or
-TypeSafe's Jev (`jev-latest`) via `TYPESAFE_API_KEY`. Measured on two full series
+`--judge-model` picks the judge. The default is **`kev`**: a local
+[Kev](https://github.com/jaredpalmer/kev) server, an open-weight (Apache-2.0)
+Jev-like decision model (`VJ_KEV_URL`, default
+`http://127.0.0.1:8009/v1/systemone`). If it isn't running, `run synopsis` stops
+before extracting anything and says so — it never falls back to a weaker judge
+on its own. Alternatives: TypeSafe's Jev (`jev-latest`, `TYPESAFE_API_KEY`), a
+`claude-*` model (`ANTHROPIC_API_KEY`), or any Ollama text model (e.g.
+`qwen2.5:14b-instruct`, the previous default). Measured on two full series
 (`bench_synopsis.py`, below; correct final answers):
 
 | Judge | The Expanse (60, serialized) | Venture Bros (81, episodic) | Cost for both |
 |---|---|---|---|
 | Opus 5.5 | 60/60 | 80/81 | ~$8 |
 | Jev (chunked) | 57/60 | 81/81 | ~$0.10 |
+| kev-4B (local, open-weight) | 50/60 | 79/81 | free (local GPU, ~3–5 s/title) |
 | Sonnet 5 | 46/60 | 78/81 | ~$4.40 |
 | Haiku 4.5 | 23/60 | 78/81 | ~$1.45 |
 | qwen2.5:14b-instruct (Ollama, default) | 20/60 | 59/81 | free (local, ~7 s/title) |
 
-The local default is the weakest judge and the only one that often claims
-non-episode titles as episodes (5 of 8 featurettes/duplicates on Venture Bros);
-use it offline only with a `gaps` review. Jev is nearly free and close to Opus.
+kev-4B is the strongest local judge (it never abstains, so its misses are wrong
+answers — review `gaps`). The Ollama default is the weakest judge and the only
+one that often claims non-episode titles as episodes (5 of 8 featurettes and
+duplicates on Venture Bros). Jev is nearly free and close to Opus.
+
+#### Running the Kev server
+
+Kev needs Python 3.12/3.13 and a GPU (CUDA, ROCm, or Apple Silicon); Kev-4B needs
+roughly 9 GB of GPU memory in bf16.
+
+```bash
+git clone https://github.com/jaredpalmer/kev.git && cd kev
+uv sync --extra serve
+uv run --extra serve python -m kev.serve --run jaredpalmer/kev-4b --port 8009
+```
+
+On an AMD RDNA4 card (RX 9070) with ROCm torch 2.8 the stock server segfaults:
+Qwen3.5's gated-delta-rule calls `torch.linalg.solve_triangular`, which crashes on
+that ROCm build. Launch it through a wrapper that sends those layers down their
+pure-matmul path, with CUDA graphs off (details in CLAUDE.md):
+
+```bash
+KEV_CUDA_GRAPHS=0 .venv/bin/python ../kev-rocm-serve.py --run jaredpalmer/kev-4b --port 8009
+```
 
 ### Benchmarking judges
 
@@ -214,7 +241,8 @@ episode was `.mpls` 1 = HandBrake 2 = VLC 19).
   the gate is skipped, no risk).
 - **Synopsis:** `ffmpeg`, `mplayer`/`mencoder` (DVD), `rapidocr-onnxruntime`
   (subtitle OCR), `faster-whisper` (audio fallback), `scipy` (the assignment),
-  and a judge (Ollama, or `ANTHROPIC_API_KEY` / `TYPESAFE_API_KEY`). A Wikipedia
+  and a judge: a running Kev server (the default), or Ollama /
+  `ANTHROPIC_API_KEY` / `TYPESAFE_API_KEY`. A Wikipedia
   multistream dump for `vj enrich` is optional but strongly recommended.
 - **Transcode:** `mkvtoolnix` (`mkvpropedit`, `mkvextract`) for the tags.
 

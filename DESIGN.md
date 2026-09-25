@@ -174,10 +174,16 @@ self-selecting by disc format: DVD closed captions (text) → OCR of the bitmap
 subtitle track (PGS/VOBSUB, RapidOCR) → whisper audio. `--transcribe-only`
 refreshes the cache without judging or writing evidence; a failed re-extraction
 never overwrites a cached transcript. Titles longer than 1.5× the disc median
-are skipped as multi-episode. The judge is pluggable by model id: an Ollama model
-(default), `claude-*` (Anthropic Messages API), or `jev-*` (TypeSafe System One:
-one typed Choice over the season's episodes plus a "none" option, whose
-probabilities feed the assignment directly).
+are skipped as multi-episode. The judge is pluggable by model id: `kev`
+(default — a local, open-weight Kev server), `jev-*` (TypeSafe's hosted System
+One), `claude-*` (Anthropic Messages API), or any Ollama model. Kev and Jev share
+one wire protocol and one question: a typed Choice over the season's episodes
+plus a "none" option, whose probabilities feed the assignment directly (Kev
+always on chunked dialogue, abstaining only when "none" is a clear majority). A
+local judge's server is probed before any extraction; an unreachable default
+stops the run rather than falling back. Evidence confidence is the assigned
+episode's score relative to the title's best, so rank-scored (LLM) and
+probability-scored (Jev/Kev) judges share `resolve`'s threshold.
 
 ### Resolve — evidence → proposals
 
@@ -284,7 +290,7 @@ agent would run, with a fixed policy.
 | `discs.py` | data model (`Disc`/`Title`/`Episode`/`Assignment`), disc scanning, MPLS parsing, dedup, play-all ordering, HandBrake scan, TMDB client + episode groups |
 | `identify.py` | heuristics: alignment, ordering assessment, title-card OCR, elimination, filenames, rip script |
 | `text_region.py` | OCR-free text detection (VLM gate) and RapidOCR text reading |
-| `synopsis.py` | transcript extraction (CC / subtitle OCR / whisper), judge backends (Ollama / Anthropic / TypeSafe Jev), ranking, the assignment |
+| `synopsis.py` | transcript extraction (CC / subtitle OCR / whisper), judge backends (Kev / TypeSafe Jev / Anthropic / Ollama), ranking, the assignment |
 | `wiki.py` | offline Wikipedia multistream reader; summary parsing and title matching |
 | `compute.py` | `vj run` — heuristics as evidence producers |
 | `review.py` | inspect (status/gaps/board/show), resolve, order checks |
@@ -312,6 +318,9 @@ agent would run, with a fixed policy.
 - **Judges are pluggable by model id and benchmarked, not assumed.** The best
   judge differs by show (serialized vs episodic); `bench_synopsis.py` measures it.
   (2026-09-23)
+- **The default judge is open-weight and local (Kev-4B)**, chosen by benchmark
+  over the previous Ollama default; a missing server is an error, not a silent
+  downgrade. (2026-09-25)
 
 ## History
 

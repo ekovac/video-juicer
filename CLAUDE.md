@@ -697,6 +697,37 @@ LLM judge matches it against each candidate's plot synopsis.
   where it trails. The local default qwen2.5:14b-instruct (Ollama, ~7 s/title,
   free): **20/60 Expanse, 59/81 VB**, 5/8 false claims on VB's decoys — the
   weakest judge and the only one that routinely claims featurettes/duplicates.
+  **kev-4B** (github.com/jaredpalmer/kev — open-weight Apache-2.0 Jev-like model
+  on Qwen3.5-4B, same /v1/systemone API, local AMD GPU): **50/60 Expanse, 79/81
+  VB**, 1/6 and 0/8 false claims, ~3-5 s/title — the best open-weight judge by
+  far, behind only Jev/Opus. Two kev specifics in `synopsis.jev_rank`: always
+  chunked (trained on ≤384-token states), and "none of these" only abstains at
+  ≥0.5 (`KEV_NONE_WINS`) — kev's calibrated probabilities are flat on dialogue, so
+  averaged over chunks the abstain option (~0.15-0.20) otherwise edges out the
+  right episode (12-title probe: 8/12 with Jev's rule → 10/12). It never
+  abstains in practice, so its misses are wrong answers, not abstentions.
+  **Running kev on this box (RX 9070, gfx1201, ROCm torch 2.8+rocm6.4 in
+  `~/.local/share/video-juicer/kev/.venv`, Python 3.13 via uv):** stock
+  `kev.serve` SEGFAULTS — the reference Qwen3.5 gated-delta-rule calls
+  `torch.linalg.solve_triangular`, which crashes inside the model on this ROCm
+  build (bf16 is unimplemented; a standalone fp32 solve works). Launch through
+  `~/.local/share/video-juicer/kev-rocm-serve.py` (flips the module's
+  `is_torchdynamo_exporting` so it takes its pure-matmul forward-substitution
+  branch) with `KEV_CUDA_GRAPHS=0` (graph capture probes the same layers).
+  **kev is the DEFAULT judge (2026-09-25)** — open-weight, local, and 2.5× the
+  previous default on the serialized show. `run_synopsis` probes the server
+  (`synopsis.judge_unreachable`) BEFORE extracting any transcript and stops with
+  instructions if it's down — no silent fallback to qwen. Making it the default
+  surfaced a latent bug: synopsis evidence confidence was `score / RANK_TOP_K`,
+  which assumes Borda ranks (6 = 1st); Jev/Kev scores are probabilities (~0.2 for
+  a correct pick), so every Jev/Kev pick landed at ~0.04 — under `resolve`'s 0.5
+  threshold, never proposed. Confidence is now score / the title's own best
+  score (identical for Borda judges; 1.0 for a Jev/Kev first choice).
+  Zero-shot **laya** (NandhaKishorM/laya, a BERT-sized System One clone) was
+  unusable: 0/24 on a 12-title probe with both question shapes, and 2-5/13 even
+  matching IDENTICAL synopsis text — its README says the base checkpoints are
+  near chance without fine-tuning; its 256-token option budget also truncates
+  synopsis-bearing Choice options.
   **Lesson: a "golden" DB can be wrong.** vb_full.db first scored
   every judge at ~66-69/81 — all five unanimously "missed" the same 12 titles.
   They were right: the DB's own title-card OCR agreed with them, and the 12 were

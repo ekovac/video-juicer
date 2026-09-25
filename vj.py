@@ -1150,10 +1150,11 @@ def build_parser() -> argparse.ArgumentParser:
                        help="synopsis: seconds of audio per window when "
                             "--synopsis-windows is set (default 40)")
     p_run.add_argument("--judge-model", default=None,
-                       help="synopsis: TEXT model for the synopsis judge (default "
-                            "a text model, NOT the --vlm-model). A `claude-*` id "
-                            "(e.g. claude-sonnet-5) routes to the Anthropic API "
-                            "via ANTHROPIC_API_KEY instead of Ollama.")
+                       help="synopsis: the judge. Default `kev` (the local Kev "
+                            "server, VJ_KEV_URL); `jev-latest` (TypeSafe, "
+                            "TYPESAFE_API_KEY); a `claude-*` id (ANTHROPIC_API_KEY); "
+                            "or any Ollama text model, e.g. qwen2.5:14b-instruct "
+                            "(NOT the --vlm-model).")
     p_run.add_argument("--transcribe-only", action="store_true",
                        help="synopsis: extract/refresh transcripts (+ subtitle cue "
                             "timings) only — no judge calls, no evidence written")

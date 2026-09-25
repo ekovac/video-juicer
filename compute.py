@@ -411,6 +411,13 @@ def run_synopsis(conn, args) -> dict:
     # to backfill cue timings. Also lifts the multi-episode guard: that guard
     # exists to avoid judging a play-all, and here nothing is judged.
     transcribe_only = getattr(args, "transcribe_only", False)
+    # Fail FAST if the judge's local server is down — before transcript
+    # extraction, which can take hours of subtitle OCR. Never fall back to a
+    # weaker judge silently.
+    if not transcribe_only:
+        why = synopsis.judge_unreachable(model)
+        if why:
+            return {"ok": False, "error": "judge-unreachable", "message": why}
     # Where the dialogue TEXT comes from. 'auto' prefers SUBTITLES (DVD closed
     # captions — exact words, whole episode, near-instant, no OCR) and falls back
     # to whisper audio when a title has none; 'subtitle'/'audio' force one.
@@ -572,7 +579,12 @@ def run_synopsis(conn, args) -> dict:
         if tid in assigned:
             ep, score, rank = assigned[tid]
             ep_id = state.episode_id(conn, ep.season, ep.number)
-            conf = round(score / synopsis.RANK_TOP_K, 3)
+            # relative to this title's own best score, so both judge kinds land
+            # on one scale: Borda ranks (LLMs: 6 for 1st) and probabilities
+            # (Jev/Kev: ~0.2 even for a correct pick). 1.0 = its first choice;
+            # lower = the bijection moved it down its shortlist. (score/RANK_TOP_K
+            # put every Jev/Kev pick under resolve's 0.5 threshold.)
+            conf = round(score / ranked[0][1], 3) if ranked and ranked[0][1] else 0.0
             verdict = (f"S{ep.season:02d}E{ep.number:02d} "
                        f"(rank {rank}/{len(ranked)}): {evidence}")
             payload = {"rank": rank, "assigned": True, "shortlist": shortlist,

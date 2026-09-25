@@ -205,6 +205,53 @@ class StreamSignatureComputeTests(Base):
 
 
 class SynopsisGuardTests(Base):
+    def test_probability_judge_evidence_clears_resolve_threshold(self):
+        # Jev/Kev score by probability (~0.2 for a correct pick); confidence is
+        # relative to the title's best score, so its first choice is 1.0 and
+        # resolve can propose it (it used to be score/6 ≈ 0.04 — never proposed)
+        state.upsert_episodes(self.conn, [ep(1, k, f"E{k}", 1320.0) for k in range(1, 4)])
+        did = self.add_disc([Title(id=k, duration=1320.0, chapters=[1320.0],
+                                   kind="episode-candidate") for k in range(1, 4)])
+        orig_ft, orig_rc = compute.full_transcript, compute.rank_candidates
+        compute.full_transcript = lambda d, t, w: f"dialogue {t.id}"
+        compute.rank_candidates = lambda tr, pool, model, host: (
+            [(pool[int(tr.split()[1]) - 1], 0.22),
+             (pool[int(tr.split()[1]) % 3], 0.05)], "ev")     # a distinct runner-up
+        try:
+            res = compute.run_synopsis(self.conn, auto_args(
+                disc=did, title=None, all=False, judge_model="test-judge",
+                synopsis_windows=None, synopsis_length=None, retranscribe=False,
+                synopsis_source="tmdb", transcript_source="audio",
+                include_specials=False))
+        finally:
+            compute.full_transcript, compute.rank_candidates = orig_ft, orig_rc
+        self.assertTrue(all(r["confidence"] == 1.0 for r in res["synopsis"]))
+        self.assertEqual(review.resolve(self.conn)["proposed"], 3)
+
+    def test_unreachable_kev_default_fails_fast_before_transcribing(self):
+        import synopsis
+        state.upsert_episodes(self.conn, [ep(1, k, f"E{k}", 1320.0) for k in range(1, 4)])
+        did = self.add_disc([Title(id=k, duration=1320.0, chapters=[1320.0],
+                                   kind="episode-candidate") for k in range(1, 4)])
+        ripped = []
+        orig_ft, orig_url = compute.full_transcript, synopsis.KEV_URL
+        compute.full_transcript = lambda d, t, w: ripped.append(t.id) or "dialogue"
+        synopsis.KEV_URL = "http://127.0.0.1:1/v1/systemone"      # nothing listens
+        try:
+            args = auto_args(disc=did, title=None, all=False, judge_model=None,
+                             synopsis_windows=None, synopsis_length=None,
+                             retranscribe=False, synopsis_source="tmdb",
+                             transcript_source="audio", include_specials=False)
+            res = compute.run_synopsis(self.conn, args)
+            self.assertFalse(res["ok"])
+            self.assertEqual(res["error"], "judge-unreachable")
+            self.assertIn("--judge-model", res["message"])
+            self.assertEqual(ripped, [])                  # stopped before any extraction
+            args.transcribe_only = True                  # no judge needed → no check
+            self.assertTrue(compute.run_synopsis(self.conn, args)["ok"])
+        finally:
+            compute.full_transcript, synopsis.KEV_URL = orig_ft, orig_url
+
     def test_multi_episode_title_is_skipped_not_transcribed(self):
         # three ~22-min episodes + one ~44-min play-all, all episode-candidates.
         # The play-all holds two episodes' dialogue, so the synopsis path must
@@ -223,7 +270,7 @@ class SynopsisGuardTests(Base):
             transcribed.append(title.id) or f"dialogue {title.id}")
         compute.rank_candidates = lambda tr, pool, model, host: ([(pool[0], 6)], "ev")
         try:
-            args = auto_args(disc=did, title=None, all=False, judge_model=None,
+            args = auto_args(disc=did, title=None, all=False, judge_model="test-judge",
                              synopsis_windows=None, synopsis_length=None,
                              retranscribe=False, synopsis_source="tmdb",
                              transcript_source="audio", include_specials=False)
@@ -255,7 +302,7 @@ class SynopsisGuardTests(Base):
         compute.rank_candidates = lambda tr, pool, model, host: ([(pool[0], 6)], "ev")
         try:
             compute.run_synopsis(self.conn, auto_args(
-                disc=did, title=None, all=False, judge_model=None,
+                disc=did, title=None, all=False, judge_model="test-judge",
                 synopsis_windows=None, synopsis_length=None, retranscribe=False,
                 synopsis_source="tmdb", transcript_source="audio",
                 include_specials=False))
@@ -333,7 +380,7 @@ class SpecialsDedupTests(Base):
             [(next(e for e in pool if e.season == 0), 6)], "ev")   # both pick the special
         try:
             compute.run_synopsis(self.conn, auto_args(
-                all=True, title=None, disc=None, judge_model=None,
+                all=True, title=None, disc=None, judge_model="test-judge",
                 synopsis_windows=None, synopsis_length=None, retranscribe=False,
                 synopsis_source="tmdb", transcript_source="audio",
                 include_specials=True))
@@ -1148,6 +1195,36 @@ class JevJudgeTests(unittest.TestCase):
                          [{"transcript": "aaaa"}, {"transcript": "bbbb"}])
         self.assertEqual([(e.number, round(p, 2)) for e, p in ranked],
                          [(1, 0.6), (2, 0.4)])
+
+    def test_kev_ignores_a_minority_none_but_jev_abstains(self):
+        # kev's flat probabilities: "none" on top at 0.30 is NOT an abstention
+        probs = {"S01E01 Ep1": 0.25, "S01E02 Ep2": 0.28, "S01E03 Ep3": 0.17,
+                 self.syn.JEV_NONE: 0.30}
+        self._mock([probs])
+        ranked, _, _ = self.syn.jev_rank("words", self.pool)          # Jev rule
+        self.assertEqual(ranked, [])
+        self._mock([probs])
+        ranked, ev, _ = self.syn.jev_rank("words", self.pool, "kev",
+                                          none_wins=self.syn.KEV_NONE_WINS)
+        self.assertEqual([e.number for e, _ in ranked], [2, 1, 3])
+        self.assertIn("none p=0.30", ev)
+        self._mock([{"S01E01 Ep1": 0.1, "S01E02 Ep2": 0.1, "S01E03 Ep3": 0.1,
+                     self.syn.JEV_NONE: 0.7}])                          # clear majority
+        ranked, _, _ = self.syn.jev_rank("words", self.pool, "kev",
+                                         none_wins=self.syn.KEV_NONE_WINS)
+        self.assertEqual(ranked, [])
+
+    def test_kev_routes_to_the_local_server_without_a_key(self):
+        import os
+        old = os.environ.pop("TYPESAFE_API_KEY", None)
+        try:
+            url, auth, wire = self.syn._system_one_backend("kev")
+            self.assertEqual((url, auth, wire), (self.syn.KEV_URL, {}, "kev-latest"))
+            with self.assertRaises(RuntimeError):          # Jev still needs its key
+                self.syn._system_one_backend("jev-latest")
+        finally:
+            if old is not None:
+                os.environ["TYPESAFE_API_KEY"] = old
 
     def test_chunks_never_split_words(self):
         parts = self.syn._chunks("alpha beta gamma delta", 11)

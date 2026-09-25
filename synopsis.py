@@ -62,10 +62,16 @@ SAMPLE_WINDOWS = 3
 SAMPLE_FRACTIONS = spread_fractions(SAMPLE_WINDOWS)
 SAMPLE_LENGTH = 40.0
 
-# A NON-thinking instruct model: a thinking judge (e.g. gemma4) spends its token
-# budget reasoning and can return empty content on long synopsis prompts, which
-# reads as an abstention. qwen2.5:14b answers directly with the JSON verdict.
-JUDGE_MODEL = "qwen2.5:14b-instruct"
+# The default judge is OPEN-WEIGHT and local: Kev-4B (a Jev-like decision model,
+# Apache-2.0) behind its own server — see KEV_URL below. Benchmarked on two full
+# series it scored 50/60 (The Expanse) and 79/81 (Venture Bros), against 20/60
+# and 59/81 for the previous default, qwen2.5:14b-instruct (Ollama). The server
+# must be running: `run synopsis` checks up front (judge_unreachable) and stops
+# with instructions rather than silently falling back to a weaker judge. Any
+# Ollama model still works via --judge-model; pick a NON-thinking one — a
+# thinking judge (gemma4) spends its budget reasoning and returns empty content.
+JUDGE_MODEL = "kev"
+OLLAMA_JUDGE = "qwen2.5:14b-instruct"      # the previous default, still a valid --judge-model
 
 
 def _load_whisper(model_size: str = WHISPER_MODEL):
@@ -549,6 +555,11 @@ def rank_candidates(transcript: str, candidates: list[Episode],
     if model.startswith("jev"):      # TypeSafe System One: typed Choice, not text
         ranked, evidence, _meta = jev_rank(transcript, pool, model)
         return ranked, evidence
+    if model.startswith("kev"):      # local open-weight Kev, same API (chunked)
+        ranked, evidence, _meta = jev_rank(transcript, pool, model,
+                                           chunk_chars=JEV_CHUNK_CHARS,
+                                           none_wins=KEV_NONE_WINS)
+        return ranked, evidence
     reply = _ollama_text(model, rank_prompt(transcript, pool, top_k), host)
     return parse_ranking(reply, pool, top_k)
 
@@ -597,22 +608,62 @@ JEV_MIN_P = 0.02          # options below this don't enter the assignment
 # chunked mode asks the same Choice of ~1.5k-token slices and averages.
 JEV_CHUNK_CHARS = 6000
 
+# Kev (github.com/jaredpalmer/kev): an open-weight (Apache-2.0) Jev-like decision
+# model on Qwen3.5, served locally with the SAME /v1/systemone API — so the Jev
+# judge runs against it unchanged, with two differences measured on this task:
+#  * always chunked: it trained on ≤384-token states and the server caps a state
+#    at 8,192 tokens, so a whole-episode transcript is too long for it;
+#  * "none of these" only abstains when it's the clear majority (≥ KEV_NONE_WINS).
+#    Kev's calibrated probabilities are flat on dialogue excerpts, and averaged
+#    over chunks the abstain option (~0.15-0.20) edges out the spread-out
+#    episodes: first-pick accuracy on a 12-title probe went 8/12 → 10/12 (= Jev).
+KEV_URL = os.environ.get("VJ_KEV_URL", "http://127.0.0.1:8009/v1/systemone")
+KEV_NONE_WINS = 0.5
+
+
+def judge_unreachable(model: str) -> Optional[str]:
+    """None if `model`'s judge can take requests now, else a message saying why
+    and how to fix it. Only local servers are probed (Kev); API judges and
+    Ollama fail per call with their own errors and retries."""
+    if not model.startswith("kev"):
+        return None
+    base = KEV_URL.split("/v1/")[0]
+    try:
+        with urllib.request.urlopen(f"{base}/v1/models", timeout=10) as resp:
+            resp.read()
+        return None
+    except (urllib.error.URLError, OSError) as e:
+        return (f"the synopsis judge is Kev, but no Kev server answers at {base} "
+                f"({e}). Start it (see README: Synopsis identification), point "
+                "VJ_KEV_URL at it, or pass --judge-model (e.g. "
+                f"{OLLAMA_JUDGE} or claude-opus-5-5).")
+
+
+def _system_one_backend(model: str) -> tuple[str, dict, str]:
+    """(url, auth headers, request model id) for a System One judge id: a
+    `kev*` id → the local Kev server (key optional); otherwise TypeSafe's Jev."""
+    if model.startswith("kev"):
+        key = os.environ.get("KEV_API_KEY")
+        return (KEV_URL, {"Authorization": f"Bearer {key}"} if key else {},
+                "kev-latest")
+    key = os.environ.get("TYPESAFE_API_KEY")
+    if not key:
+        raise RuntimeError("TYPESAFE_API_KEY not set (needed for a jev judge)")
+    return TYPESAFE_URL, {"Authorization": f"Bearer {key}"}, model
+
 
 def typesafe_system_one(state, questions: dict, model: str = JEV_MODEL,
                         retries: int = 4) -> dict:
     """POST one System One evaluation; returns the response JSON (`answers`,
     `model` = the versioned id that answered, `usage`). Retries 429/529/5xx with
-    backoff, honouring `retry-after`. Needs TYPESAFE_API_KEY."""
-    key = os.environ.get("TYPESAFE_API_KEY")
-    if not key:
-        raise RuntimeError("TYPESAFE_API_KEY not set (needed for a jev judge)")
-    body = json.dumps({"state": state, "model": model,
+    backoff, honouring `retry-after`. Jev needs TYPESAFE_API_KEY; a `kev*`
+    model goes to the local Kev server instead (see _system_one_backend)."""
+    url, auth, wire_model = _system_one_backend(model)
+    body = json.dumps({"state": state, "model": wire_model,
                        "questions": questions}).encode()
     for attempt in range(retries + 1):
         req = urllib.request.Request(
-            TYPESAFE_URL, data=body,
-            headers={"Content-Type": "application/json",
-                     "Authorization": f"Bearer {key}"})
+            url, data=body, headers={"Content-Type": "application/json", **auth})
         try:
             with urllib.request.urlopen(req, timeout=300) as resp:
                 return json.loads(resp.read())
@@ -673,12 +724,15 @@ def _chunks(text: str, size: int) -> list[str]:
 
 
 def jev_rank(transcript: str, candidates: list[Episode], model: str = JEV_MODEL,
-             show: str = "", chunk_chars: int = 0) -> tuple[list, str, dict]:
+             show: str = "", chunk_chars: int = 0,
+             none_wins: float = 0.0) -> tuple[list, str, dict]:
     """Jev's answer to "which episode is this dialogue?" → ([(episode, p)] best
     first, evidence, meta). `p` is Jev's probability (averaged over slices when
     `chunk_chars` > 0); only options ≥ JEV_MIN_P are returned, and ([], …) when
-    "none" is the most probable answer. meta = {input_tokens, output_tokens,
-    requests, model} for costing."""
+    "none" is the most probable answer AND ≥ `none_wins` (0 = whenever it's on
+    top — Jev's rule; Kev uses KEV_NONE_WINS). meta = {input_tokens,
+    output_tokens, requests, model} for costing. A `kev*` model runs the same
+    question against the local Kev server."""
     pool = [e for e in candidates if e.synopsis]
     meta = {"input_tokens": 0, "output_tokens": 0, "requests": 0, "model": model}
     if not transcript:
@@ -701,10 +755,12 @@ def jev_rank(transcript: str, candidates: list[Episode], model: str = JEV_MODEL,
             total[k] = total.get(k, 0.0) + p / len(slices)
     order = sorted(total.items(), key=lambda kv: -kv[1])
     top_key, top_p = order[0]
-    runner = next((f"{k} p={p:.2f}" for k, p in order[1:] if k != JEV_NONE), "")
-    evidence = f"{top_key} p={top_p:.2f}; next {runner}"
-    if top_key == JEV_NONE:
-        return [], f"jev: none of these p={top_p:.2f}", meta
+    if top_key == JEV_NONE and top_p >= none_wins:
+        return [], f"{model}: none of these p={top_p:.2f}", meta
+    eps = [(k, p) for k, p in order if k != JEV_NONE]
+    runner = f"{eps[1][0]} p={eps[1][1]:.2f}" if len(eps) > 1 else ""
+    evidence = (f"{eps[0][0]} p={eps[0][1]:.2f}; next {runner}; "
+                f"none p={total.get(JEV_NONE, 0.0):.2f}")
     ranked = [(opts[k], p) for k, p in order if k in opts and p >= JEV_MIN_P]
     return ranked, evidence, meta
 
