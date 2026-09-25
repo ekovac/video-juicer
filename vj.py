@@ -147,7 +147,7 @@ def cmd_enrich(args) -> int:
         conn.close()
         return fail(args, "snapshot-error", str(e))
 
-    by_key = {k: text for k, (_name, text) in summaries.items()}
+    by_key = wiki.match_summaries(summaries, state.load_episodes(conn))
     n = state.set_wiki_overviews(conn, by_key)
     state.set_project(conn, wikipedia_page=page)   # remember for re-runs
     total = len(state.load_episodes(conn))

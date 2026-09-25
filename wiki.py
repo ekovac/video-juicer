@@ -212,3 +212,53 @@ def episode_summaries(snapshot: MultistreamSnapshot, page_title: str
     if wt is None:
         raise SnapshotError(f"page not found in dump: {page_title!r}")
     return parse_episode_summaries(wt)
+
+
+# ---------------------------------------------------------------------------
+# mapping summaries onto the project's episodes
+# ---------------------------------------------------------------------------
+
+_PART = re.compile(r"\s*\((?:part\s*)?(\d+|one|two|i{1,3})\)\s*$", re.IGNORECASE)
+
+
+def _title_key(title: str) -> str:
+    """Comparable form of an episode title: accents folded, '&'→'and',
+    lowercased, punctuation/whitespace dropped (so "Are You There God, It's Me,
+    Dean" == "Are You There, God? It's Me, Dean")."""
+    import unicodedata
+    t = unicodedata.normalize("NFKD", title).encode("ascii", "ignore").decode()
+    t = t.replace("&", " and ").lower()
+    return re.sub(r"[^a-z0-9]", "", t)
+
+
+def match_summaries(summaries: dict, episodes) -> dict:
+    """{(season, number): summary} for the project's `episodes`, matched by
+    TITLE first — Wikipedia's per-season numbering can differ from TMDB's
+    (Venture Bros S1 lists 7 episodes in a different order, and folds specials
+    into seasons), so matching on the number alone files summaries under the
+    wrong episode. A combined two-part entry ("Showdown at Cremation Creek")
+    covers every "(1)"/"(2)" part TMDB splits it into. A summary whose title
+    matches nothing falls back to its (season, number) slot, only if that slot
+    exists and wasn't already filled by a title match."""
+    by_key: dict = {}
+    for e in episodes:
+        by_key.setdefault(_title_key(e.name), []).append((e.season, e.number))
+        base = _PART.sub("", e.name)
+        if base != e.name:                       # "(1)" part → its base title
+            by_key.setdefault("base:" + _title_key(base), []).append(
+                (e.season, e.number))
+    slots = {(e.season, e.number) for e in episodes}
+    out: dict = {}
+    unmatched = []
+    for (season, number), (title, text) in summaries.items():
+        k = _title_key(title)
+        hits = (by_key.get(k) or by_key.get("base:" + k)) if k else None
+        if hits:
+            for slot in hits:
+                out[slot] = text
+        else:
+            unmatched.append(((season, number), text))
+    for slot, text in unmatched:
+        if slot in slots and slot not in out:
+            out[slot] = text
+    return out

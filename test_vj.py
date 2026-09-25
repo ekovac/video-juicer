@@ -861,6 +861,43 @@ class WikiReaderTests(unittest.TestCase):
         self.assertEqual(len(s), 3)
 
 
+class WikiMatchTests(unittest.TestCase):
+    """wiki.match_summaries: title-first, so a Wikipedia list numbered
+    differently from TMDB still files each summary under the right episode."""
+
+    def test_title_beats_number_and_parts_share_a_combined_entry(self):
+        import wiki
+        eps = [ep(1, 3, "Home Insecurity", None), ep(1, 8, "Mid-Life Chrysalis", None),
+               ep(1, 9, "Are You There, God? It's Me, Dean", None),
+               ep(2, 12, "Showdown at Cremation Creek (1)", None),
+               ep(2, 13, "Showdown at Cremation Creek (2)", None),
+               ep(7, 1, "The Venture Bros. and the Curse of the Haunted Problem", None),
+               ep(3, 5, "No Title Match", None)]
+        summaries = {(1, 3): ("Mid-life Chrysalis", "chrysalis plot"),
+                     (1, 7): ("Home Insecurity", "insecurity plot"),
+                     (1, 10): ("Are You There God, It's Me, Dean", "dean plot"),
+                     (2, 12): ("Showdown at Cremation Creek", "showdown plot"),
+                     (7, 1): ("The Venture Bros. & The Curse of the Haunted Problem",
+                              "haunted plot"),
+                     (3, 5): ("Retitled On Wikipedia", "fallback plot"),
+                     (9, 9): ("Nowhere", "dropped")}
+        m = wiki.match_summaries(summaries, eps)
+        self.assertEqual(m[(1, 3)], "insecurity plot")      # NOT chrysalis (number)
+        self.assertEqual(m[(1, 8)], "chrysalis plot")
+        self.assertEqual(m[(1, 9)], "dean plot")
+        self.assertEqual((m[(2, 12)], m[(2, 13)]), ("showdown plot", "showdown plot"))
+        self.assertEqual(m[(7, 1)], "haunted plot")         # & == and
+        self.assertEqual(m[(3, 5)], "fallback plot")        # number fallback
+        self.assertNotIn((9, 9), m)
+
+    def test_number_fallback_never_overwrites_a_title_match(self):
+        import wiki
+        eps = [ep(1, 1, "Alpha", None), ep(1, 2, "Beta", None)]
+        m = wiki.match_summaries({(1, 1): ("Beta", "beta plot"),
+                                  (1, 2): ("Gamma", "gamma plot")}, eps)
+        self.assertEqual(m, {(1, 2): "beta plot"})
+
+
 class EnrichTests(Base):
     def _run_enrich(self, **kw):
         data, index = _build_snapshot(self.tmp.name)

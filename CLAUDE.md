@@ -555,6 +555,13 @@ LLM judge matches it against each candidate's plot synopsis.
   seek → decompress ONE stream → pull the `<page>`. Index and data MUST be from
   the same dump run (offsets are file-specific) — a mismatch raises, not silent
   garbage. Fully offline, pure `bz2` (no deps).
+  **Summaries are matched to episodes by TITLE, not number**
+  (`wiki.match_summaries`): Wikipedia's per-season numbering can differ from the
+  project's — Venture Bros S1 lists 7 episodes in production/DVD order and folds
+  specials into seasons, so number-keyed matching filed 10 summaries under the
+  wrong episode. Titles are normalized (accents, `&`=and, punctuation); a
+  combined two-part entry covers both TMDB "(1)"/"(2)" parts (so the judge can't
+  split those — expected); a title-less match falls back to its number slot.
 - **Use a NON-thinking judge model** (default `qwen2.5:14b-instruct`, overridable
   with `--judge-model`). A thinking model (gemma4) spends its `num_predict`
   budget reasoning and returns empty `content` on the long Wikipedia prompt —
